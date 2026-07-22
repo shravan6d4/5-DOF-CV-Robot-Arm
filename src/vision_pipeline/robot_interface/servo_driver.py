@@ -21,6 +21,7 @@ servo, read back, confirm within tolerance) and must be done on the real bus.
 
 import json
 import logging
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -54,9 +55,12 @@ class ServoBus:
     # STS3215 register addresses
     ADDR_GOAL_POSITION = 0x2A       # 42, 2 bytes little-endian
     ADDR_PRESENT_POSITION = 0x38    # 56, 2 bytes little-endian
+    ADDR_ID = 0x05                  # 5, 1 byte, servo bus ID (0..253), EEPROM
+    ADDR_LOCK = 0x37                # 55, 1 byte, EEPROM write-protect (0=unlocked, 1=locked)
 
     TICK_MIN = 0
     TICK_MAX = 4095                 # STS3215 is 12-bit (0..4095)
+    EEPROM_SETTLE_S = 0.02          # let an EEPROM write commit before the next command
 
     def __init__(self, port: str, baud: int = 1000000, calibration_path: Optional[str] = None):
         """Initialize the servo bus.
@@ -238,6 +242,77 @@ class ServoBus:
         if data is None:
             raise RuntimeError(f"No response reading position from servo {servo_id}")
         return data[0] | (data[1] << 8)  # little-endian
+
+    def ping(self, servo_id: int) -> bool:
+        """Return True if a servo answers at this ID (reads its ID register).
+
+        Unlike read_position/move_and_verify this ignores calibration, so it works
+        on any raw ID — including a factory-default servo you haven't set up yet.
+        """
+        data = self._read_register(servo_id, self.ADDR_ID, 1)
+        return data is not None and len(data) >= 1
+
+    def scan_ids(self, id_range=range(0, 21)) -> list[int]:
+        """Return the IDs currently answering on the bus (pings each in id_range).
+
+        Handy for finding a servo's current ID before reassigning it. Absent IDs
+        each cost one serial timeout, so a wide range is slow — the default 0..20
+        covers factory defaults plus our J1..J6 with margin.
+        """
+        return [i for i in id_range if self.ping(i)]
+
+    def write_servo_id(self, old_id: int, new_id: int, verify: bool = True) -> bool:
+        """Permanently change a servo's bus ID (an EEPROM write).
+
+        !!! ONLY ONE SERVO MAY BE ON THE BUS when you call this. Every servo
+        currently at `old_id` gets reprogrammed, and factory servos usually all
+        ship at the SAME default ID — so set IDs one servo at a time, before
+        wiring the whole chain together, or they'll collide.
+
+        Feetech EEPROM sequence: unlock (LOCK=0) -> write ID -> re-lock (LOCK=1).
+        The re-lock is addressed to the NEW id, because the servo starts answering
+        to it the instant the ID register is written.
+
+        Args:
+            old_id: the servo's current ID (use scan_ids/ping to find it).
+            new_id: the desired ID (0..253; this project uses 1..6 for J1..J6).
+            verify: if True, ping the new ID afterwards and only return True if it answers.
+
+        Returns:
+            True on success (verified if verify=True), False if any step failed.
+
+        Raises:
+            ValueError: if old_id or new_id is outside 0..253.
+        """
+        for label, value in (("old_id", old_id), ("new_id", new_id)):
+            if not 0 <= value <= 253:
+                raise ValueError(f"{label} must be 0..253, got {value}")
+
+        # Unlock EEPROM on the current ID.
+        if not self._write_register(old_id, self.ADDR_LOCK, bytes([0])):
+            logger.error(f"Failed to unlock EEPROM on servo {old_id}")
+            return False
+        time.sleep(self.EEPROM_SETTLE_S)
+
+        # Write the new ID; the servo answers to new_id from here on.
+        if not self._write_register(old_id, self.ADDR_ID, bytes([new_id])):
+            logger.error(f"Failed to write new ID {new_id} to servo {old_id}")
+            return False
+        time.sleep(self.EEPROM_SETTLE_S)
+
+        # Re-lock EEPROM, now addressing the NEW id.
+        if not self._write_register(new_id, self.ADDR_LOCK, bytes([1])):
+            logger.error(f"Wrote ID {new_id} but failed to re-lock EEPROM")
+            return False
+        time.sleep(self.EEPROM_SETTLE_S)
+
+        if verify and not self.ping(new_id):
+            logger.error(f"Servo did not answer at new ID {new_id} after the write")
+            return False
+
+        logger.info(f"Servo ID changed {old_id} -> {new_id}"
+                    f"{' (verified)' if verify else ''}.")
+        return True
 
     def move_and_verify(self, servo_id: int, target_ticks: int, tolerance_ticks: int = None) -> int:
         """Command a servo to a position and verify it actually moved there.

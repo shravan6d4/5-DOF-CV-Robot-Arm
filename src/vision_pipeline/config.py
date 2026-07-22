@@ -218,22 +218,43 @@ SERVO_GRIPPER_OPEN_RAD = 0.0    # home position = fully open
 SERVO_GRIPPER_CLOSE_RAD = 0.2   # ~11.5 deg of claw rotation to close
 
 
-# --- Calibration target (chessboard) geometry ------------------------------
+# --- Calibration target (ChArUco board) geometry ----------------------------
 #
-# Used by scripts/calibrate_camera_intrinsics.py and scripts/calibrate_hand_eye.py.
-# Print a chessboard, mount it FLAT and rigid (tape to cardboard/acrylic), then set
-# these to match YOUR printout exactly:
-#   * COLS/ROWS count INTERNAL corners (where 4 squares meet), NOT squares. A board
-#     with 10x7 squares has 9x6 internal corners. findChessboardCorners needs this
-#     exact — a wrong count means zero detections.
-#   * SQUARE_SIZE_M is the real, ruler-measured edge length of one square on the
-#     PRINTED board (measure several squares and divide — printers rescale). The
-#     value here is only a plausible default; measure yours.
-CALIB_CHESSBOARD_COLS = 9        # internal corners across
-CALIB_CHESSBOARD_ROWS = 6        # internal corners down
-CALIB_SQUARE_SIZE_M = 0.025      # 25 mm — MEASURE your actual printout, don't trust this
-CALIB_INTRINSICS_MIN_SAMPLES = 15  # min chessboard captures before intrinsics calibration
-CALIB_HAND_EYE_MIN_SAMPLES = 12    # min pose/board captures before hand-eye calibration
+# Used by scripts/generate_charuco_board.py (prints it) and by
+# scripts/calibrate_camera_intrinsics.py / scripts/calibrate_hand_eye.py (detect it).
+# ChArUco = chessboard + a unique ArUco marker in every other square. Unlike a plain
+# chessboard, every corner is individually identified by its neighboring marker IDs,
+# so detection works from PARTIAL / angled views — important here because the
+# eye-in-hand camera's view of the board changes constantly as the arm moves.
+#
+# ALWAYS regenerate the printable board from generate_charuco_board.py after
+# changing anything below — it reads these same values, so "what got printed" and
+# "what the detector expects" can never drift apart. Do NOT substitute a board from
+# anywhere else (e.g. a random image found online): a mismatched dictionary or
+# geometry doesn't just fail to detect, it can silently feed WRONG 3D coordinates
+# into solvePnP/calibrateCamera and produce a confidently wrong calibration.
+#
+#   * SQUARES_X/Y count SQUARES (not corners — different from the old plain-
+#     chessboard convention, which counted internal corners).
+#   * SQUARE_SIZE_M/MARKER_SIZE_M are the real, ruler-measured edge lengths on the
+#     PRINTED board (measure a run of several squares and divide — printers
+#     rescale). Print at 100% / "actual size", NEVER "fit to page", then measure
+#     and correct these if they don't match the nominal values.
+#   * Mount the print FLAT and rigid (tape to cardboard/acrylic) — a wavy board
+#     corrupts corner positions.
+#   * If you build a bigger board tiled across multiple printed sheets, the sheets
+#     must be assembled with sub-mm precision (any seam misalignment silently
+#     corrupts the samples that touch it) — for now, one single-sheet board is
+#     the simplest and safest, and ChArUco's partial-view tolerance means it
+#     doesn't need to be physically large to work across many arm poses.
+CALIB_ARUCO_DICT = "DICT_5X5_100"   # cv2.aruco.DICT_5X5_100 — 100 unique markers
+CALIB_CHARUCO_SQUARES_X = 10        # squares across (NOT internal corners)
+CALIB_CHARUCO_SQUARES_Y = 6         # squares down
+CALIB_SQUARE_SIZE_M = 0.0267        # 26.7 mm — MEASURED off the actual printout (nominal was 25mm)
+CALIB_MARKER_SIZE_M = 0.0192        # 19.2 mm — scaled by the same print factor (kept at 18/25 of square size)
+CALIB_CHARUCO_MIN_CORNERS = 6       # min detected corners in a frame to accept it (>=4 needed for solvePnP)
+CALIB_INTRINSICS_MIN_SAMPLES = 15   # min board captures before intrinsics calibration
+CALIB_HAND_EYE_MIN_SAMPLES = 12     # min pose/board captures before hand-eye calibration
 
 
 # --- Two-view (moving-camera stereo) depth ---------------------------------
