@@ -55,11 +55,20 @@ HSV_UPPER_2 = (179, 255, 255)   # high-hue red range, upper bound
 
 # Minimum contour area (in pixels) to count as a real detection, not noise.
 # Raise this if you're picking up small speckles; lower it if a real brick
-# far from the camera is being filtered out.
-MIN_CONTOUR_AREA = 500
+# far from the camera is being filtered out. Must stay well above single-
+# digit-pixel JPEG/lighting noise specks: those tiny blobs are pixel-grid-
+# quantized near-rectangles almost by accident, so they can score deceptively
+# high on shape_detector.score_shape below if allowed through as candidates.
+# 350 was picked against real photos: it's comfortably above the ~30-300px
+# noise speckles found in real sample images, and comfortably below a real
+# brick's area even at the farthest distance tested (~740px).
+MIN_CONTOUR_AREA = 350
 
 # Kernel size (pixels) for morphological cleanup of the color mask. Larger
-# values remove more noise but can erode small/thin brick features.
+# values remove more noise but can erode small/thin brick features. Must be
+# >1 to do anything at all: a 1x1 structuring element is a no-op for both
+# MORPH_OPEN and MORPH_CLOSE, so a specular-highlight hole punched into the
+# middle of the red mask (see SPECULAR_* below) never gets closed back up.
 MORPH_KERNEL_SIZE = 5
 
 
@@ -74,21 +83,122 @@ MORPH_KERNEL_SIZE = 5
 # These parameters were tuned against real photos of red bricks vs. a red cup.
 # See stud_detector.py for what each one means.
 
-# Minimum number of studs (circles) a red region must contain to count as a
-# Lego brick. A standard 2x4 brick has 8 studs; a 2x2 has 4. Requiring 3 gives
-# margin above noise while accepting most bricks. Lower to 2 if you use small
-# 1x2 bricks; raise it if smooth red objects are being misclassified.
-MIN_STUDS = 2
-
 # Hough Circle Transform parameters (see cv2.HoughCircles docs):
 STUD_HOUGH_DP = 1.2          # inverse accumulator resolution; ~1-2 is typical
 STUD_HOUGH_PARAM1 = 100      # upper Canny edge threshold used internally
 STUD_HOUGH_PARAM2 = 20       # accumulator threshold: LOWER = more (but falser) circles
+
+# A more permissive accumulator threshold used ONLY for the same small/far
+# ROIs that trigger the upscale below (see STUD_ROI_REFERENCE_PX) — a
+# genuinely far/small brick's stud pattern is already degraded by the time it
+# reaches Hough, so it gets the benefit of the doubt there. Deliberately NOT
+# a global relaxation: normal-sized candidates (a hand, a cup) keep the
+# strict default above and don't inherit this leniency. Confirmed against
+# real photos: loosening this globally recovers far-away studs but also
+# fabricates several false "studs" on a hand at native resolution; scoping it
+# to only the upscaled path avoids that regression.
+STUD_HOUGH_PARAM2_UPSCALED = 12
 # Stud radius and spacing are expressed as a fraction of the brick's smaller
 # bounding-box dimension, so detection scales with how big the brick appears.
 STUD_MIN_RADIUS_FRAC = 0.05
 STUD_MAX_RADIUS_FRAC = 0.28
-STUD_MIN_DIST_FRAC = 0.15    # minimum center-to-center spacing between studs
+STUD_MIN_DIST_FRAC = 0.15
+
+# The fractions above are clamped to a hardcoded floor inside count_studs
+# (3px radius, 8px spacing) so they don't collapse to nothing on a tiny ROI —
+# but that floor only makes sense at a "normal" ROI scale. Once the brick is
+# far from the camera, its bounding box shrinks below that scale and the
+# fixed medianBlur(5) + floors crush the stud pattern before Hough ever runs.
+# Fix: if the ROI's smaller side is below this reference, upscale it (see
+# stud_detector.count_studs) so the frac math + floors operate at a
+# consistent effective resolution regardless of true distance.
+#
+# Deliberately narrow: upscaling isn't free. cv2.resize's cubic interpolation
+# smooths whatever texture is in the ROI, and on an organic, non-brick
+# texture (skin, cloth) that smoothing can manufacture false circular edges
+# that Hough then miscounts as studs — confirmed against the real hand/cup
+# regression photo, where a value of 220 upscaled its ~120px-wide hand region
+# and fabricated several spurious "studs" that weren't there at native
+# resolution. 90 only kicks in for ROIs meaningfully smaller than that.
+STUD_ROI_REFERENCE_PX = 90     # ROI smaller-side the frac math/floors/blur assume
+STUD_ROI_MAX_UPSCALE = 6.0     # cap — beyond this, interpolation can't invent
+                                # stud detail the camera never captured; that's
+                                # what the shape-confidence fallback is for
+
+# color_detector.close_contour_gaps kernel sizing: a specular highlight on a
+# glossy stud can dip below the HSV saturation floor, punching a hole through
+# the middle of an otherwise-solid red contour, which corrupts both stud
+# counting and shape scoring downstream (confirmed against real photos — a
+# brick pinched between two fingers showed a visibly fragmented, notched
+# contour where highlights broke up the mask). Sized as a fraction of the
+# contour's own smaller dimension, so it scales with distance like the stud
+# fractions above, and clamped so it can't grow large enough to merge in a
+# genuinely separate blob.
+STUD_REGION_CLOSE_FRAC = 0.3
+STUD_REGION_CLOSE_MIN_PX = 3
+STUD_REGION_CLOSE_MAX_PX = 41
+
+# num_studs at/above which the weighted-confidence stud_score below saturates
+# to 1.0. A standard 2x2 brick has 4 studs; a 2x4 has 8. Deliberately lower
+# than "the whole brick's stud count" so a partial read (some studs
+# glare-corrupted, or only half the brick's studs resolvable at distance)
+# still earns full stud credit.
+STUD_FULL_CREDIT_COUNT = 4
+
+# --- Specular highlight suppression -----------------------------------------
+#
+# The raised, convex studs are glossy plastic and catch a near-white glare
+# under typical lighting when facing the camera/light. That glare (a) gets
+# excluded by the HSV mask's high-saturation floor above, punching a hole in
+# the red blob, and (b) breaks the clean circular edge cv2.HoughCircles needs
+# to find a stud, causing missed detections specifically in the orientation
+# where the real studs are actually visible. Detected as "very bright, barely
+# saturated" and repaired with cv2.inpaint before stud detection runs.
+SPECULAR_V_MIN = 245           # HSV V floor for "blown-out glare," not just "well lit"
+SPECULAR_S_MAX = 60            # HSV S ceiling for glare
+SPECULAR_INPAINT_RADIUS = 3    # cv2.inpaint neighborhood, px — small, local fill
+
+
+# --- Shape/geometry confidence (independent of studs) -----------------------
+#
+# Studs can be legitimately unresolvable (too far away, or glare-corrupted
+# even after suppression above). This is a second, independent signal —
+# "is this red blob shaped like a rectangular brick?" — that lets a
+# detection be confirmed by shape evidence when stud evidence is weak.
+
+# contourArea / minAreaRect area, i.e. how completely the contour fills its
+# own oriented bounding rectangle. Any circle/ellipse is mathematically
+# capped at pi/4 (~0.785) no matter its size or elongation — a real
+# photographed rectangular brick realistically reaches ~0.85-1.0 — so this
+# range is a deliberate, justified boxy-vs-round separation, not a guess.
+SHAPE_RECT_SCORE_LOW = 0.85    # at/below this fill ratio -> rectangularity score 0.0
+SHAPE_RECT_SCORE_HIGH = 0.95   # at/above this fill ratio -> rectangularity score 1.0
+
+# Plausible long:short side ratio (from minAreaRect) for a Lego brick
+# footprint: 1.0 covers square bricks (2x2, 4x4...), up to a generous ceiling
+# covering an elongated 1x6/1x8 brick. Score decays linearly outside this band
+# rather than a hard cutoff.
+SHAPE_ASPECT_MIN = 1.0
+SHAPE_ASPECT_MAX = 6.0
+
+# score_shape() multiplies rectangularity by aspect-ratio plausibility rather
+# than averaging/weighting them: a hand or arm silhouette can easily land
+# inside a "plausible brick" aspect-ratio band by chance (confirmed against
+# the real hand/cup regression photo), so aspect ratio must never contribute
+# credit on its own — it can only narrow down a candidate that rectangularity
+# has already judged to actually be boxy in the first place.
+
+
+# --- Weighted brick confidence (studs + shape) ------------------------------
+#
+# Replaces the old hard "num_studs >= MIN_STUDS" gate. Studs remain the
+# stronger, more specific signal when actually resolved; shape is
+# corroborating evidence, especially valuable exactly when studs aren't
+# resolvable (far away / glare). A candidate is accepted if the blended score
+# clears DETECTION_CONFIDENCE_THRESHOLD.
+STUD_WEIGHT = 0.6
+SHAPE_WEIGHT = 0.4
+DETECTION_CONFIDENCE_THRESHOLD = 0.30    # minimum center-to-center spacing between studs
 
 
 # --- Camera intrinsics (Phase 2) -------------------------------------------
@@ -216,6 +326,22 @@ SERVO_READ_VERIFY_TOLERANCE_TICKS = 100  # Tolerance for read-back verification 
 # calibration as the arm joints. Tune to your claw's actual open/closed spread.
 SERVO_GRIPPER_OPEN_RAD = 0.0    # home position = fully open
 SERVO_GRIPPER_CLOSE_RAD = 0.2   # ~11.5 deg of claw rotation to close
+
+# Total servos on the bus: J1..J5 (arm) + J6 (gripper).
+NUM_JOINTS = 6
+
+
+# --- Arm observation / jog web UI -------------------------------------------
+#
+# Settings for scripts/run_arm_ui.py, the Flask dashboard used to watch the
+# live camera feed and jog individual joints during bring-up/testing. Jog
+# buttons move a joint by a step size (in raw ticks) that a per-joint slider
+# controls, bounded by these two.
+JOG_DEFAULT_STEP_TICKS = 20   # ~0.5 deg @ J1..J5 fallback calibration
+JOG_MAX_STEP_TICKS = 500
+
+WEBUI_HOST = "127.0.0.1"
+WEBUI_PORT = 5000
 
 
 # --- Calibration target (ChArUco board) geometry ----------------------------

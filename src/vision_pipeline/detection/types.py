@@ -31,8 +31,14 @@ class Detection:
             summary fields above provide.
         num_studs: How many Lego studs (circular bumps) were detected inside
             this region. 0 for a plain color detection; populated by
-            LegoBrickDetector. Used to distinguish a real brick from other
-            red objects.
+            LegoBrickDetector.
+        shape_score: How "brick-shaped" (rectangular, plausible aspect ratio)
+            this region is, in [0, 1], independent of stud detection. 0.0 for
+            a plain color detection; populated by LegoBrickDetector.
+        confidence: Blended stud + shape score in [0, 1] that LegoBrickDetector
+            gated this detection on. Informational for downstream code/
+            debugging, like num_studs and shape_score — never consulted by
+            the pick pipeline.
     """
 
     centroid_px: tuple[float, float]
@@ -41,3 +47,5 @@ class Detection:
     angle_deg: float
     contour: np.ndarray
     num_studs: int = 0
+    shape_score: float = 0.0
+    confidence: float = 0.0
