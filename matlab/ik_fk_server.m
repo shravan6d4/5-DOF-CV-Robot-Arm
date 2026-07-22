@@ -52,8 +52,12 @@ while true
 
         while true
             lineJava = in.readLine();
-            if isempty(lineJava)
-                break;  % client closed the connection (readLine returns Java null at EOF)
+            % EOF is a Java null, which arrives as []. A BLANK line arrives as a
+            % zero-length java.lang.String, which is also isempty() -- so test for
+            % null specifically, or a stray blank line would drop the connection
+            % instead of being skipped by the strlength guard below.
+            if isempty(lineJava) && ~ischar(lineJava) && ~isa(lineJava, 'java.lang.String')
+                break;  % client closed the connection
             end
             line = char(lineJava);
             if strlength(line) == 0

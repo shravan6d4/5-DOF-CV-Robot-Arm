@@ -195,21 +195,65 @@ SERVO_CALIBRATION_PATH = "data/servo_calibration.json"
 
 # Fallback calibration (used if the JSON file is absent). Each servo (J1..J6)
 # needs a dict with keys: 'home_tick' (present position at home), 'ticks_per_rad',
-# 'dir_sign' (+1 or -1 to flip direction if physical servo is inverted).
+# 'dir_sign' (+1 or -1 to flip direction if physical servo is inverted), and
+# 'home_angle_rad' (the MATLAB joint angle the arm is in when the servo sits at
+# home_tick).
 # Keys are STRINGS ("1".."6") to match the JSON file format that ServoBus loads
 # (JSON object keys are always strings) — so the same str(servo_id) lookup works
 # whether calibration came from the file or from this fallback.
+#
+# WHY home_angle_rad IS ZERO, and when it would not be:
+# MATLAB (ik_fk_server.m) works in ABSOLUTE joint angles, while a servo at its
+# calibrated home_tick naturally reads 0. Those two zeros only coincide if the
+# imported robot's HomePosition is itself 0 — and it is: importrobot bakes the
+# CAD assembly pose (smiData.RevoluteJoint(n).Rz.Pos in Robomainassem_DataFile.m)
+# into the LINK TRANSFORMS, not into HomePosition. Do not mistake those Rz.Pos
+# values for the home configuration; feeding them in as joint angles produces a
+# pose the arm is never in.
+# Verified on hardware 2026-07-22: with all servos at their home ticks, FK of
+# [0,0,0,0,0] puts the wrist at [91, 12, 2] mm and the claw ~90 mm in front of
+# the base, matching a physical measurement. FK of the Rz.Pos angles instead
+# claims [-6, -31, -187] mm — the arm hanging below its own mount.
+# If the model is ever re-imported with non-zero HomePosition, set these to the
+# new home angles; the mechanism is here so that stays a data change, not a
+# code change.
 # PLACEHOLDER VALUES — measure your arm and fill in real numbers.
 SERVO_CALIBRATION_FALLBACK = {
-    "1": {"home_tick": 2048, "ticks_per_rad": 651.89, "dir_sign": 1},     # J1
-    "2": {"home_tick": 1365, "ticks_per_rad": 651.89, "dir_sign": 1},     # J2
-    "3": {"home_tick": 2048, "ticks_per_rad": 651.89, "dir_sign": 1},     # J3
-    "4": {"home_tick": 2048, "ticks_per_rad": 651.89, "dir_sign": 1},     # J4
-    "5": {"home_tick": 2048, "ticks_per_rad": 651.89, "dir_sign": 1},     # J5
-    "6": {"home_tick": 2048, "ticks_per_rad": 325.95, "dir_sign": 1},     # J6 (gripper)
+    "1": {"home_tick": 2048, "ticks_per_rad": 651.89, "dir_sign": 1,
+          "home_angle_rad": 0.0},                                          # J1
+    "2": {"home_tick": 1365, "ticks_per_rad": 651.89, "dir_sign": 1,
+          "home_angle_rad": 0.0},                                          # J2
+    "3": {"home_tick": 2048, "ticks_per_rad": 651.89, "dir_sign": 1,
+          "home_angle_rad": 0.0},                                          # J3
+    "4": {"home_tick": 2048, "ticks_per_rad": 651.89, "dir_sign": 1,
+          "home_angle_rad": 0.0},                                          # J4
+    "5": {"home_tick": 2048, "ticks_per_rad": 651.89, "dir_sign": 1,
+          "home_angle_rad": 0.0},                                          # J5
+    "6": {"home_tick": 2048, "ticks_per_rad": 325.95, "dir_sign": 1,
+          "home_angle_rad": 0.0},                                          # J6 (gripper)
 }
 
 SERVO_READ_VERIFY_TOLERANCE_TICKS = 100  # Tolerance for read-back verification (100 ticks ~ ±2.8 deg @ J1..J5)
+
+# --- Move safety + settling -------------------------------------------------
+# A servo does NOT arrive instantly. Reading present position immediately after
+# writing a goal returns the position it was still travelling through, so
+# move_and_verify polls until the servo settles rather than reading once.
+SERVO_MOVE_SETTLE_TIMEOUT_S = 3.0    # give up waiting for arrival after this long
+SERVO_MOVE_POLL_INTERVAL_S = 0.05    # how often to re-read present position while waiting
+SERVO_MOVE_STALL_POLLS = 6           # consecutive ~unchanged reads that mean "stopped moving"
+SERVO_MOVE_STALL_EPSILON_TICKS = 3   # movement below this per poll counts as not moving
+
+# Hard cap on how far a single commanded move may travel from the servo's CURRENT
+# position. Exists because of the J1 encoder wrap-seam runaway during bring-up: a
+# home tick parked near the 0/4095 seam read as 17 instead of 4086 after a power
+# cycle, and a blind "return to home" tried to travel ~358 deg the long way round
+# rather than the ~2 deg it actually needed. In single-turn position mode the servo
+# cannot cross the seam, so a large delta is nearly always a wrap artifact or a bad
+# solve — never a legitimate request. Refuse instead of executing.
+# 400 ticks ~ 35 deg at J1..J5: comfortably more than any pick-sequence step,
+# far less than a wrap-around.
+SERVO_MAX_MOVE_DELTA_TICKS = 400
 
 # Gripper (J6) open/closed positions, expressed as an angle offset (radians) from
 # the servo's calibrated home. Converted to ticks through the same per-servo

@@ -10,7 +10,7 @@ from vision_pipeline import config
 from vision_pipeline.calibration import geometry
 from vision_pipeline.robot_interface.base import Pose, RobotInterface
 from vision_pipeline.robot_interface.matlab_client import IKUnreachableError, MatlabIKClient
-from vision_pipeline.robot_interface.servo_driver import ServoBus
+from vision_pipeline.robot_interface.servo_driver import ServoBus, ServoSafetyError
 
 logger = logging.getLogger(__name__)
 
@@ -130,9 +130,41 @@ class HardwareRobot(RobotInterface):
             logger.info(f"Servos moved and verified. New state: {[f'{a:.3f}' for a in self._last_angles_rad]}")
             return True
 
+        except ServoSafetyError as e:
+            logger.error(f"Servo move refused as unsafe: {e}")
+            self._resync_state_after_partial_move()
+            return False
+
         except Exception as e:
             logger.error(f"Servo move failed: {e}")
+            self._resync_state_after_partial_move()
             return False
+
+    def _resync_state_after_partial_move(self) -> None:
+        """Re-read every joint after a move aborts partway through.
+
+        The joints are commanded one at a time, so a refusal or failure on J3
+        leaves J1-J2 already moved while `_last_angles_rad` still describes the
+        pre-move pose. Left stale, the next get_end_effector_pose() would report
+        a camera pose the arm is not actually in — and the vision pipeline would
+        back-project through it without any indication anything was wrong.
+        Re-reading costs one bus round-trip per joint and keeps state honest.
+        """
+        try:
+            self._last_angles_rad = self._read_servo_state()
+            logger.warning(
+                f"Re-synced joint state after aborted move: "
+                f"{[f'{a:.3f}' for a in self._last_angles_rad]}"
+            )
+        except Exception as e:
+            # Read-back is itself failing (bus down, servo unpowered). State is
+            # now untrustworthy and we cannot repair it here, so say so loudly
+            # rather than leaving a plausible-looking stale pose in place.
+            logger.critical(
+                f"Could not re-read servo state after an aborted move: {e}. "
+                f"Joint state is STALE and end-effector poses derived from it "
+                f"are unreliable until the bus recovers."
+            )
 
     def set_gripper(self, closed: bool) -> bool:
         """Open or close the gripper (J6 servo).

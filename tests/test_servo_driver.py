@@ -9,6 +9,7 @@ ID-change sequence against the Feetech spec, which is the part we can't sanity-c
 on real hardware from here.
 """
 
+import json
 from pathlib import Path
 import sys
 
@@ -17,6 +18,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 import vision_pipeline.robot_interface.servo_driver as sd
+from vision_pipeline import config
 from vision_pipeline.robot_interface.servo_driver import ServoBus
 
 NO_CAL_FILE = "__nonexistent_servo_cal__.json"  # forces config fallback calibration
@@ -77,6 +79,46 @@ class FakeServoSerial:
         body = bytes([self.servo_id, len(data) + 2, 0x00]) + data  # id, len, error, data
         checksum = (~sum(body)) & 0xFF
         self._in += bytes([0xFF, 0xFF]) + body + bytes([checksum])
+
+
+class MovingFakeServo(FakeServoSerial):
+    """Fake servo that actually travels toward its goal, a step per position read.
+
+    The base fake holds `present_ticks` fixed, so a servo is always trivially
+    "already arrived" and the settle logic never runs. This one models travel:
+    each PRESENT_POSITION read advances it `step_ticks` toward the goal, so a
+    move takes a realistic number of polls to complete. `step_ticks=0` models a
+    servo that is stuck (obstructed, unpowered, or past a travel limit).
+    """
+
+    def __init__(self, servo_id=1, present_ticks=2048, step_ticks=50):
+        super().__init__(servo_id=servo_id, present_ticks=present_ticks)
+        self.step_ticks = step_ticks
+        self.goal_ticks = present_ticks
+
+    def _handle(self, pkt):
+        super()._handle(pkt)
+        if len(pkt) < 6:
+            return
+        pid, length, inst = pkt[2], pkt[3], pkt[4]
+        if pid != self.servo_id and pid != 0xFE:
+            return
+        params = pkt[5 : 5 + (length - 2)]
+        if inst == ServoBus.INST_WRITE and params and params[0] == ServoBus.ADDR_GOAL_POSITION:
+            values = params[1:]
+            if len(values) >= 2:
+                self.goal_ticks = values[0] | (values[1] << 8)
+
+    def _reg_bytes(self, addr, count):
+        data = super()._reg_bytes(addr, count)
+        if addr == ServoBus.ADDR_PRESENT_POSITION:
+            # Advance AFTER serving this read, so the first read is the position
+            # at the moment the goal was issued.
+            remaining = self.goal_ticks - self.present_ticks
+            if remaining:
+                move = min(abs(remaining), self.step_ticks)
+                self.present_ticks += move if remaining > 0 else -move
+        return data
 
 
 def _bus(monkeypatch, fake) -> ServoBus:
@@ -167,7 +209,133 @@ def test_write_servo_id_rejects_out_of_range(monkeypatch):
 
 def test_tick_rad_roundtrip(monkeypatch):
     bus = _bus(monkeypatch, FakeServoSerial())
-    # J6 fallback: home 2048, 325.95 ticks/rad, dir +1.
+    # J6 fallback: home 2048, 325.95 ticks/rad, dir +1, home_angle_rad 0.0 —
+    # the gripper stays on offset-from-home semantics.
     ticks = bus.rad_to_ticks(6, 0.2)
     assert ticks == round(2048 + 0.2 * 325.95)
     assert bus.ticks_to_rad(6, ticks) == pytest.approx(0.2, abs=1e-3)
+
+
+def test_servo_at_home_maps_to_matlab_home_config(monkeypatch):
+    """A servo at home_tick must report the MATLAB angle the arm is actually in.
+
+    MATLAB works in absolute joint angles; a servo at its home tick reads 0.
+    Those coincide only because importrobot leaves HomePosition at 0 (it bakes
+    the CAD assembly pose into the link transforms instead) — confirmed on
+    hardware, where FK of [0,0,0,0,0] reproduced the measured physical pose and
+    FK of the smiData Rz.Pos angles did not.
+
+    This pins the mapping in both directions: if someone re-imports the model
+    with a non-zero HomePosition, or resurrects the Rz.Pos values as joint
+    angles, the reported pose silently stops matching the arm — so assert the
+    conversion agrees with whatever home_angle_rad claims.
+    """
+    bus = _bus(monkeypatch, FakeServoSerial())
+    for j in range(1, 6):  # J1..J5, the IK-driven joints
+        cal = bus._cal(j)
+        assert bus.ticks_to_rad(j, cal["home_tick"]) == pytest.approx(
+            cal["home_angle_rad"], abs=1e-9
+        ), f"J{j}: servo at home_tick must report exactly home_angle_rad"
+
+
+def test_rad_ticks_roundtrip_is_exact_across_joints(monkeypatch):
+    """rad_to_ticks and ticks_to_rad must invert each other on the IK joints."""
+    bus = _bus(monkeypatch, FakeServoSerial())
+    for j in range(1, 6):
+        home_angle = bus._cal(j)["home_angle_rad"]
+        for delta in (-0.4, -0.05, 0.0, 0.05, 0.4):
+            angle = home_angle + delta
+            recovered = bus.ticks_to_rad(j, bus.rad_to_ticks(j, angle))
+            # One tick is ~1/651.89 rad, so rounding bounds the error.
+            assert recovered == pytest.approx(angle, abs=2e-3)
+
+
+# --- move safety + settling ---------------------------------------------
+
+def _goal_writes(fake):
+    """Every GOAL_POSITION write the host sent to `fake`, decoded."""
+    return [
+        p for p in _parse_packets(bytes(fake.written))
+        if p["inst"] == ServoBus.INST_WRITE and p["addr"] == ServoBus.ADDR_GOAL_POSITION
+    ]
+
+
+@pytest.fixture
+def _fast_polls(monkeypatch):
+    """Strip the poll delay so settle tests run at full speed."""
+    monkeypatch.setattr(config, "SERVO_MOVE_POLL_INTERVAL_S", 0.0)
+
+
+def test_move_waits_for_servo_to_arrive(monkeypatch, _fast_polls):
+    """The returned position must be where the servo ENDED, not where it started.
+
+    Reading immediately after the write catches the servo mid-travel; that stale
+    value used to flow into HardwareRobot._last_angles_rad and become the camera
+    pose the vision pipeline back-projected through.
+    """
+    fake = MovingFakeServo(servo_id=1, present_ticks=2048, step_ticks=20)
+    bus = _bus(monkeypatch, fake)
+
+    target = 2248  # 200 ticks away: ~10 polls at 20 ticks each
+    arrived = bus.move_and_verify(1, target, tolerance_ticks=5)
+
+    assert abs(arrived - target) <= 5, "returned a position the servo had not reached"
+    assert arrived != 2048, "returned the pre-move position"
+
+
+def test_move_refuses_travel_beyond_safety_cap(monkeypatch):
+    """A too-large move must raise and write NOTHING to the bus.
+
+    This is the J1 wrap-seam runaway guard: a home tick near the 0/4095 seam
+    reads as ~17 instead of ~4086 after a power cycle, and a blind return-to-home
+    would drive ~358 deg the long way round.
+    """
+    fake = MovingFakeServo(servo_id=1, present_ticks=17, step_ticks=20)
+    bus = _bus(monkeypatch, fake)
+    fake.written.clear()
+
+    with pytest.raises(sd.ServoSafetyError, match="Refusing to move"):
+        bus.move_and_verify(1, 4086)  # the runaway that actually happened
+
+    assert _goal_writes(fake) == [], "a refused move must not command the servo"
+    assert fake.present_ticks == 17, "servo moved despite the refusal"
+
+
+def test_move_within_cap_is_allowed(monkeypatch, _fast_polls):
+    """The same wrap-seam correction is fine once expressed as a short move."""
+    fake = MovingFakeServo(servo_id=1, present_ticks=17, step_ticks=10)
+    bus = _bus(monkeypatch, fake)
+    fake.written.clear()
+
+    arrived = bus.move_and_verify(1, 40, tolerance_ticks=5)  # the ~2 deg it really needed
+
+    assert abs(arrived - 40) <= 5
+    # Proves _goal_writes actually detects commands, so the refusal test above
+    # is asserting on a working detector rather than passing vacuously.
+    assert _goal_writes(fake), "expected a goal-position write for a permitted move"
+
+
+def test_stalled_servo_returns_early_instead_of_hanging(monkeypatch, _fast_polls):
+    """An obstructed servo must be reported, not held against the obstruction.
+
+    Mirrors the J3/table near-miss: the joint cannot reach its target, so waiting
+    the full timeout achieves nothing while the arm strains.
+    """
+    fake = MovingFakeServo(servo_id=1, present_ticks=2048, step_ticks=0)  # stuck
+    bus = _bus(monkeypatch, fake)
+
+    arrived = bus.move_and_verify(1, 2148, tolerance_ticks=5)
+
+    assert arrived == 2048, "should report where the servo actually is"
+
+
+def test_calibration_missing_home_angle_is_rejected(monkeypatch, tmp_path):
+    """A pre-offset calibration file must fail loudly, not default to zero."""
+    stale = tmp_path / "servo_cal.json"
+    stale.write_text(json.dumps({
+        str(j): {"home_tick": 2048, "ticks_per_rad": 651.89, "dir_sign": 1}
+        for j in range(1, 7)
+    }))
+    monkeypatch.setattr(sd.serial, "Serial", lambda *a, **k: FakeServoSerial())
+    with pytest.raises(sd.ServoCalibrationError, match="home_angle_rad"):
+        ServoBus("COM_FAKE", calibration_path=str(stale))

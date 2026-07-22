@@ -37,6 +37,16 @@ class ServoCalibrationError(Exception):
     pass
 
 
+class ServoSafetyError(Exception):
+    """Raised when a commanded move is refused as unsafe before being sent.
+
+    Distinct from a comms failure: nothing was written to the bus, the arm has
+    not moved, and retrying the identical command will fail identically. The
+    caller must decide (re-plan, or have an operator reposition the arm).
+    """
+    pass
+
+
 class ServoBus:
     """Interface to a Feetech STS3215 servo bus over a serial port.
 
@@ -97,9 +107,15 @@ class ServoBus:
 
         JSON format (keys are strings, matching config.SERVO_CALIBRATION_FALLBACK):
             {
-                "1": {"home_tick": 2048, "ticks_per_rad": 651.89, "dir_sign": 1},
+                "1": {"home_tick": 2048, "ticks_per_rad": 651.89, "dir_sign": 1,
+                      "home_angle_rad": 1.629019},
                 ...
             }
+
+        'home_angle_rad' is required rather than defaulted: a file written before
+        it existed would otherwise silently fall back to 0 and reintroduce the
+        MATLAB-absolute vs servo-relative zero mismatch, which produces confident
+        wrong poses instead of an error.
         """
         calibration_path = Path(path)
         if calibration_path.exists():
@@ -119,9 +135,18 @@ class ServoBus:
             if str(j) not in self._calibration:
                 raise ServoCalibrationError(f"Servo J{j} missing from calibration")
             cal = self._calibration[str(j)]
-            for key in ("home_tick", "ticks_per_rad", "dir_sign"):
+            for key in ("home_tick", "ticks_per_rad", "dir_sign", "home_angle_rad"):
                 if key not in cal:
-                    raise ServoCalibrationError(f"Servo J{j} missing key '{key}'")
+                    raise ServoCalibrationError(
+                        f"Servo J{j} missing key '{key}'"
+                        + (
+                            " — calibration files written before the MATLAB home"
+                            " offset was introduced lack it; add it from"
+                            " config.MATLAB_HOME_DEG (J6 uses 0.0)."
+                            if key == "home_angle_rad"
+                            else ""
+                        )
+                    )
 
     def _cal(self, servo_id: int) -> dict:
         """Return the calibration dict for a servo, or raise if uncalibrated."""
@@ -130,14 +155,26 @@ class ServoBus:
         return self._calibration[str(servo_id)]
 
     def rad_to_ticks(self, servo_id: int, angle_rad: float) -> int:
-        """Convert a joint angle (radians, relative to home) to a raw tick target."""
+        """Convert a MATLAB joint angle (radians, absolute) to a raw tick target.
+
+        `angle_rad` is in the MATLAB model's frame — the same absolute convention
+        ik_fk_server.m solves and reports in, where a joint at home reads its
+        `home_angle_rad` rather than 0. Subtracting that offset is what puts the
+        two halves of the system on a common zero.
+        """
         cal = self._cal(servo_id)
-        return int(round(cal["home_tick"] + cal["dir_sign"] * angle_rad * cal["ticks_per_rad"]))
+        offset_rad = angle_rad - cal["home_angle_rad"]
+        return int(round(cal["home_tick"] + cal["dir_sign"] * offset_rad * cal["ticks_per_rad"]))
 
     def ticks_to_rad(self, servo_id: int, ticks: int) -> float:
-        """Convert a raw present-position tick reading to a joint angle (radians)."""
+        """Convert a raw present-position tick reading to a MATLAB joint angle.
+
+        Inverse of rad_to_ticks: returns the ABSOLUTE angle in the MATLAB model's
+        frame, so the result can be handed straight to request_fk/request_ik.
+        """
         cal = self._cal(servo_id)
-        return cal["dir_sign"] * (ticks - cal["home_tick"]) / cal["ticks_per_rad"]
+        offset_rad = cal["dir_sign"] * (ticks - cal["home_tick"]) / cal["ticks_per_rad"]
+        return cal["home_angle_rad"] + offset_rad
 
     # --- low-level packet protocol ---------------------------------------
 
@@ -314,34 +351,64 @@ class ServoBus:
                     f"{' (verified)' if verify else ''}.")
         return True
 
-    def move_and_verify(self, servo_id: int, target_ticks: int, tolerance_ticks: int = None) -> int:
-        """Command a servo to a position and verify it actually moved there.
+    def move_and_verify(
+        self,
+        servo_id: int,
+        target_ticks: int,
+        tolerance_ticks: int = None,
+        max_delta_ticks: int = None,
+    ) -> int:
+        """Command a servo to a position and verify it actually arrived there.
+
+        Reads the current position first and refuses the move outright if the
+        travel exceeds `max_delta_ticks`, then waits for the servo to physically
+        settle before reading back — a read taken immediately after the write
+        catches the servo mid-travel and reports a stale position, which callers
+        would store as the arm's true state.
 
         Args:
             servo_id: servo ID (1-6).
             target_ticks: goal position in raw ticks (clamped to 0..4095).
             tolerance_ticks: max acceptable error in ticks (default from config).
+            max_delta_ticks: refuse moves travelling further than this from the
+                current position (default from config). Pass a larger value to
+                deliberately override for a known-safe long move.
 
         Returns:
-            Actual present position (ticks) read back after the move.
+            Actual present position (ticks) read back after the servo settled.
 
         Raises:
             ServoCalibrationError: if servo_id is not calibrated.
+            ServoSafetyError: if the move exceeds max_delta_ticks (nothing sent).
             RuntimeError: if the command or read-back fails.
         """
         if tolerance_ticks is None:
             tolerance_ticks = config.SERVO_READ_VERIFY_TOLERANCE_TICKS
+        if max_delta_ticks is None:
+            max_delta_ticks = config.SERVO_MAX_MOVE_DELTA_TICKS
 
         self._cal(servo_id)  # raises ServoCalibrationError if uncalibrated
 
         target_ticks = max(self.TICK_MIN, min(self.TICK_MAX, int(target_ticks)))
+
+        # --- safety gate: refuse before writing anything to the bus ---------
+        start_ticks = self.read_position(servo_id)
+        delta = abs(target_ticks - start_ticks)
+        if delta > max_delta_ticks:
+            raise ServoSafetyError(
+                f"Refusing to move servo {servo_id}: {start_ticks} -> {target_ticks} "
+                f"is {delta} ticks (cap {max_delta_ticks}). Nothing was commanded. "
+                f"A delta this large is usually an encoder wrap-seam artifact or a bad "
+                f"solve, not a real target — verify the servo's position by hand before "
+                f"overriding with max_delta_ticks."
+            )
 
         goal_lo = target_ticks & 0xFF
         goal_hi = (target_ticks >> 8) & 0xFF
         if not self._write_register(servo_id, self.ADDR_GOAL_POSITION, bytes([goal_lo, goal_hi])):
             raise RuntimeError(f"Failed to command servo {servo_id}")
 
-        present_ticks = self.read_position(servo_id)
+        present_ticks = self._wait_for_settle(servo_id, target_ticks, tolerance_ticks)
 
         error_ticks = abs(present_ticks - target_ticks)
         if error_ticks > tolerance_ticks:
@@ -355,6 +422,52 @@ class ServoBus:
                 f"Servo {servo_id}: cmd {target_ticks} -> read {present_ticks} "
                 f"(err {error_ticks}/{tolerance_ticks} ticks)"
             )
+        return present_ticks
+
+    def _wait_for_settle(self, servo_id: int, target_ticks: int, tolerance_ticks: int) -> int:
+        """Poll present position until the servo arrives, stalls, or times out.
+
+        Polling rather than a fixed sleep: a 5-tick nudge and a 300-tick sweep take
+        very different times, and a blind delay is either wastefully slow or too
+        short. Returns as soon as the servo is within tolerance of the target.
+
+        Stall detection matters as much as arrival — a servo blocked by the table
+        (see the J3 near-miss during bring-up) will never reach tolerance, and
+        without this it would hold against the obstruction for the full timeout.
+        Returning early lets the tolerance check above report the mismatch.
+
+        Returns:
+            The last present position read (ticks).
+        """
+        deadline = time.monotonic() + config.SERVO_MOVE_SETTLE_TIMEOUT_S
+        present_ticks = self.read_position(servo_id)
+        stalled_polls = 0
+
+        while time.monotonic() < deadline:
+            if abs(present_ticks - target_ticks) <= tolerance_ticks:
+                return present_ticks
+
+            time.sleep(config.SERVO_MOVE_POLL_INTERVAL_S)
+            previous = present_ticks
+            present_ticks = self.read_position(servo_id)
+
+            if abs(present_ticks - previous) <= config.SERVO_MOVE_STALL_EPSILON_TICKS:
+                stalled_polls += 1
+                if stalled_polls >= config.SERVO_MOVE_STALL_POLLS:
+                    logger.warning(
+                        f"Servo {servo_id} stopped moving at {present_ticks} while "
+                        f"travelling to {target_ticks} — obstructed, torque-limited, "
+                        f"or past its travel limit."
+                    )
+                    return present_ticks
+            else:
+                stalled_polls = 0
+
+        logger.warning(
+            f"Servo {servo_id} did not settle within "
+            f"{config.SERVO_MOVE_SETTLE_TIMEOUT_S}s (last read {present_ticks}, "
+            f"target {target_ticks})."
+        )
         return present_ticks
 
     def close(self):
