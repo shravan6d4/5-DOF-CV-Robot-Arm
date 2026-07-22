@@ -1,0 +1,8 @@
+{
+  "permissions": {
+    "allow": [
+      "PowerShell(pip show feetech-servo-sdk 2>$null)",
+      "PowerShell(if \\($?\\) { \"Found feetech-servo-sdk\" } else { \"feetech-servo-sdk not installed\" })"
+    ]
+  }
+}
