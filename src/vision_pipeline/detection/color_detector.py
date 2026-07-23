@@ -143,3 +143,41 @@ class ColorDetector:
                 2,
             )
         return overlay
+
+
+def close_contour_gaps(frame_shape: tuple[int, int], contour: np.ndarray) -> np.ndarray:
+    """Repair small internal gaps in a contour caused by specular dropout.
+
+    A glossy, curved surface (e.g. a Lego stud) can reflect a near-white
+    highlight that dips below the HSV saturation floor, punching a hole
+    through the middle of an otherwise-solid red contour. That hole
+    fragments the contour's true silhouette, which corrupts both stud
+    detection (stud_detector.count_studs relies on the region inside the
+    contour) and shape scoring (shape_detector.score_shape relies on the
+    contour's own fill ratio and aspect ratio) downstream.
+
+    Closes gaps with a kernel sized as a fraction of the contour's own
+    smaller dimension — proportional, so it scales with distance, and
+    bounded so it can't grow large enough to merge in a genuinely separate,
+    unrelated blob — then returns the single largest contour of the result.
+    LegoBrickDetector calls this once per color-stage candidate before
+    handing it to the stud and shape stages; it does not touch the
+    centroid/area/bbox ColorDetector already reported, which stay based on
+    the true (uncorrected) detection.
+    """
+    x, y, w, h = cv2.boundingRect(contour)
+    smaller_side = min(w, h)
+    kernel_size = int(smaller_side * config.STUD_REGION_CLOSE_FRAC)
+    kernel_size = max(config.STUD_REGION_CLOSE_MIN_PX, min(config.STUD_REGION_CLOSE_MAX_PX, kernel_size))
+    if kernel_size % 2 == 0:
+        kernel_size += 1
+
+    mask = np.zeros(frame_shape, dtype=np.uint8)
+    cv2.drawContours(mask, [contour], -1, color=255, thickness=-1)
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
+    closed = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+
+    contours, _ = cv2.findContours(closed, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return contour
+    return max(contours, key=cv2.contourArea)
