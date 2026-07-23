@@ -490,7 +490,12 @@ NUM_JOINTS = 6
 # buttons move a joint by a step size (in raw ticks) that a per-joint slider
 # controls, bounded by these two.
 JOG_DEFAULT_STEP_TICKS = 20   # ~0.5 deg @ J1..J5 fallback calibration
-JOG_MAX_STEP_TICKS = 500
+# Capped at SERVO_MAX_MOVE_DELTA_TICKS (not above it): ServoBus.move_and_verify
+# refuses any single move travelling farther than that from the servo's current
+# position (see the encoder-wrap-seam incident note above SERVO_MAX_MOVE_DELTA_TICKS),
+# so a slider max above that cap would let the dashboard offer a step size the
+# hardware always rejects.
+JOG_MAX_STEP_TICKS = SERVO_MAX_MOVE_DELTA_TICKS
 
 WEBUI_HOST = "127.0.0.1"
 WEBUI_PORT = 5000

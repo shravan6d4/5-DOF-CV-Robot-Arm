@@ -21,6 +21,7 @@ from vision_pipeline.robot_interface.joint_controller import (
     JointState,
 )
 from vision_pipeline.robot_interface.servo_calibration import ServoCalibrationError
+from vision_pipeline.robot_interface.servo_driver import ServoSafetyError
 from vision_pipeline.webui.camera_stream import CameraStreamer
 
 logger = logging.getLogger(__name__)
@@ -103,6 +104,14 @@ def create_app(
             with controller_lock:
                 state = controller.jog(joint_id, delta_ticks)
             return jsonify(_joint_state_json(state))
+        except ServoSafetyError as e:
+            # A deliberate refusal, not a hardware fault: ServoBus.move_and_verify
+            # caps how far a single move may travel from the servo's current
+            # position (see config.SERVO_MAX_MOVE_DELTA_TICKS) and nothing was
+            # sent to the bus. 400, not 502 -- the request itself is what's
+            # rejected, distinct from a flaky read/write.
+            logger.warning(f"jog(J{joint_id}, {delta_ticks}) refused: {e}")
+            return jsonify({"error": str(e)}), 400
         except _CONTROLLER_ERRORS as e:
             logger.error(f"jog(J{joint_id}, {delta_ticks}) failed: {e}")
             return jsonify({"error": str(e)}), 502
@@ -118,6 +127,9 @@ def create_app(
             with controller_lock:
                 state = controller.set_gripper(closed)
             return jsonify(_joint_state_json(state))
+        except ServoSafetyError as e:
+            logger.warning(f"set_gripper({closed}) refused: {e}")
+            return jsonify({"error": str(e)}), 400
         except _CONTROLLER_ERRORS as e:
             logger.error(f"set_gripper({closed}) failed: {e}")
             return jsonify({"error": str(e)}), 502

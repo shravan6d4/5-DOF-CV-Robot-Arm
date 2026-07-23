@@ -15,6 +15,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 from vision_pipeline import config
 from vision_pipeline.robot_interface.joint_controller import GRIPPER_JOINT_ID, NUM_JOINTS, MockJointController
+from vision_pipeline.robot_interface.servo_driver import ServoSafetyError
 from vision_pipeline.webui.app import create_app
 
 NO_CAL_FILE = "__nonexistent_servo_cal__.json"  # forces config fallback calibration
@@ -92,3 +93,38 @@ def test_gripper_close_and_open(client):
 def test_gripper_rejects_non_boolean_closed(client):
     resp = client.post("/api/gripper", json={"closed": "yes"})
     assert resp.status_code == 400
+
+
+class _UnsafeMoveController(MockJointController):
+    """A controller that always refuses, standing in for a real ServoBus
+    whose move_and_verify raised ServoSafetyError (see
+    config.SERVO_MAX_MOVE_DELTA_TICKS) -- the case being tested is app.py's
+    error mapping, not the refusal logic itself, so a plain override is enough.
+    """
+
+    def jog(self, joint_id, delta_ticks):
+        raise ServoSafetyError("refusing to move: delta exceeds cap")
+
+    def set_gripper(self, closed):
+        raise ServoSafetyError("refusing to move: delta exceeds cap")
+
+
+@pytest.fixture
+def unsafe_client():
+    controller = _UnsafeMoveController(calibration_path=NO_CAL_FILE)
+    app = create_app(controller, camera_index=None, enable_overlay=False)
+    app.testing = True
+    with app.test_client() as c:
+        yield c
+
+
+def test_jog_joint_reports_safety_refusal_as_400_not_500(unsafe_client):
+    resp = unsafe_client.post("/api/joints/1/jog", json={"delta_ticks": 1000})
+    assert resp.status_code == 400
+    assert "error" in resp.get_json()
+
+
+def test_gripper_reports_safety_refusal_as_400_not_500(unsafe_client):
+    resp = unsafe_client.post("/api/gripper", json={"closed": True})
+    assert resp.status_code == 400
+    assert "error" in resp.get_json()
