@@ -473,18 +473,21 @@ def test_stalled_servo_returns_early_instead_of_hanging(monkeypatch, _fast_polls
 
 
 def test_j5_dir_sign_nominal_positive_direction_unconfirmed(monkeypatch):
-    """J5 dir_sign is +1 NOMINALLY — its physical direction is unconfirmed.
+    """J5 dir_sign is +1 NOMINALLY — physical direction still UNCONFIRMED.
 
     The one jog "confirmation" (operator matched a predicted "~7 deg CCW from
     above") was against a MODEL-frame description; under the now-documented
     frame flip that same rotation is physically CW from above, so the
-    observation can't distinguish the two signs.
+    observation cannot distinguish the two signs.
 
-    Deliberately left at +1 rather than chased: the claw tip sits on J5's
-    rotation axis (a J5-only jog moves the wrist 0.0mm and the tip barely
-    more), so this sign has almost no effect on position-only IK — it changes
-    claw ROLL orientation only, which the 5-DOF pipeline drops anyway. This
-    test pins the nominal value so a change is a deliberate act, not drift.
+    This was previously dismissed as unimportant on the grounds that "the tip
+    sits on J5's rotation axis". That reasoning was wrong: it confused the
+    WRIST (which J5 barely moves, ~0.0mm) with the TIP, which hangs CLAW_LEN
+    (70mm) out on the lever and swings 12.6mm for 30 deg / 38.5mm for 104 deg.
+    J5 is a major positional contributor and IK leans on it for lateral
+    targets, so a wrong sign moves the claw tens of mm the wrong way.
+
+    This test pins the nominal value; it is NOT evidence the value is right.
     """
     bus = _bus(monkeypatch, FakeServoSerial())
     assert bus._cal(5)["dir_sign"] == 1

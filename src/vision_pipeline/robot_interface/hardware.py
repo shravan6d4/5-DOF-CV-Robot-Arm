@@ -105,9 +105,14 @@ class HardwareRobot(RobotInterface):
                 f"({config.PICK_ROLL_DEG}°, {config.PICK_PITCH_DEG}°)."
             )
 
-        # Solve IK for position only
+        # Solve IK for position only, seeded from the arm's current angles so
+        # the solver returns the NEAREST solution. Unseeded it can return a
+        # valid posture ~180 deg away, which ServoBus would then refuse move
+        # by move (see MatlabIKClient.request_ik).
         try:
-            angles_rad, err_mm = self.matlab_client.request_ik(pose.x, pose.y, pose.z)
+            angles_rad, err_mm = self.matlab_client.request_ik(
+                pose.x, pose.y, pose.z, seed_rad=self._last_angles_rad
+            )
             logger.info(f"IK solved: {err_mm:.1f} mm error. Angles: {[f'{a:.3f}' for a in angles_rad]}")
         except IKUnreachableError as e:
             logger.error(f"IK failed for target ({pose.x}, {pose.y}, {pose.z}): {e}")

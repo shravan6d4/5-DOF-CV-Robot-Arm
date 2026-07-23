@@ -60,13 +60,21 @@ LIFT_MM = 45.0
 # The accuracy probes, as (label, dx, dy, dz) in mm, applied from the LIFTED
 # pose. Deliberately modest: this is a measurement, not a workspace sweep, and
 # every mm of travel is a mm the safety cap has to allow.
+#
+# Sized down from 25mm after a dry run: the arm currently works close in
+# (tip x ~75mm), where the kinematics are poorly conditioned — the tip is near
+# the J1 rotation axis, so small Cartesian moves demand large J1/J5 swings.
+# A 25mm "back" probe wanted J1 -79 deg and J5 -104 deg and was refused by the
+# tick cap. 15mm keeps the probes inside the cap while staying comfortably
+# measurable with a ruler. If a probe is still refused, that is the arm telling
+# you the target is near a singularity, not a driver problem.
 PROBES = [
-    ("forward", 25.0, 0.0, 0.0),
-    ("back", -25.0, 0.0, 0.0),
-    ("left", 0.0, 25.0, 0.0),
-    ("right", 0.0, -25.0, 0.0),
-    ("down", 0.0, 0.0, -20.0),
-    ("up", 0.0, 0.0, 20.0),
+    ("forward", 15.0, 0.0, 0.0),
+    ("back", -15.0, 0.0, 0.0),
+    ("left", 0.0, 15.0, 0.0),
+    ("right", 0.0, -15.0, 0.0),
+    ("down", 0.0, 0.0, -15.0),
+    ("up", 0.0, 0.0, 15.0),
 ]
 
 
@@ -87,7 +95,11 @@ def preview_move(bus, client, target_mm, current_angles):
     Returns (angles_rad, err_mm, tick_deltas) or None if IK can't reach it.
     """
     try:
-        angles_rad, err_mm = client.request_ik(*(target_mm / 1000.0))
+        # Seed from where the arm actually is, so the solver returns the
+        # nearest solution rather than any legal posture.
+        angles_rad, err_mm = client.request_ik(
+            *(target_mm / 1000.0), seed_rad=current_angles
+        )
     except IKUnreachableError as e:
         print(f"    IK could not reach this target: {e}")
         return None
@@ -136,11 +148,24 @@ def attempt(bus, client, label, target_mm, floor_z, args, results):
     print(f"  IK residual:   {err_mm:.2f} mm (solver's own error against the target)")
     deltas = "  ".join(f"J{j}{d:+5d}" for j, d in tick_deltas.items())
     print(f"  joint moves:   {deltas}  ticks")
+    # ticks_per_rad is per-servo calibration, not a global constant — read each
+    # joint's own value rather than assuming they match.
+    deg_of = {j: float(np.rad2deg(d / bus._cal(j)["ticks_per_rad"]))
+              for j, d in tick_deltas.items()}
+    degs = "  ".join(f"J{j}{deg_of[j]:+6.1f}" for j in tick_deltas)
+    print(f"                 {degs}  deg")
 
     biggest = max(abs(d) for d in tick_deltas.values())
+    biggest_deg = max(abs(v) for v in deg_of.values())
+
+    if biggest_deg >= config.SERVO_WATCH_POWER_MOVE_DEG:
+        print(f"\n  *** STAND BY THE POWER CUT — largest joint move is "
+              f"{biggest_deg:.0f} deg ***")
+
     if biggest > config.SERVO_MAX_MOVE_DELTA_TICKS:
-        print(f"  NOTE: largest move {biggest} ticks exceeds the "
-              f"{config.SERVO_MAX_MOVE_DELTA_TICKS}-tick cap; the driver will refuse it.")
+        print(f"  NOTE: largest move {biggest} ticks ({biggest_deg:.0f} deg) exceeds "
+              f"the {config.SERVO_MAX_MOVE_DELTA_TICKS}-tick cap; the driver will "
+              f"refuse it.")
 
     if args.dry_run:
         print("  --dry-run: not commanded.")

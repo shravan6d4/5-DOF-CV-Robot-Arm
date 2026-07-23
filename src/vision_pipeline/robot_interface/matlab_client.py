@@ -91,13 +91,25 @@ class MatlabIKClient:
 
         return response
 
-    def request_ik(self, x: float, y: float, z: float) -> tuple[list[float], float]:
+    def request_ik(
+        self,
+        x: float,
+        y: float,
+        z: float,
+        seed_rad: list[float] | None = None,
+    ) -> tuple[list[float], float]:
         """Request inverse kinematics for a position.
 
         Args:
             x, y, z: target position in meters, PHYSICAL base frame (+Z up,
                 table below the origin). Converted to the solver's model frame
                 (y and z negated) on the wire — see the module docstring.
+            seed_rad: the arm's CURRENT J1..J5 angles, strongly recommended for
+                any real move. Without it the solver seeds from the model's
+                home configuration and can return a valid solution in a wholly
+                different posture — a 45mm target once came back demanding
+                ~2600 ticks (~227 deg) of base rotation. Angles are
+                frame-independent, so no conversion applies to them.
 
         Returns:
             (angles_rad, err_mm): J1..J5 angles in radians, and IK error in mm.
@@ -108,6 +120,8 @@ class MatlabIKClient:
             IKUnreachableError: if target is outside workspace or IK tolerance.
         """
         req = {"cmd": "ik", "x": x, "y": -y, "z": -z}
+        if seed_rad is not None:
+            req["seed_rad"] = list(seed_rad)
         resp = self._send_request(req)
         angles_rad = resp["angles_rad"]  # list of 5 floats
         err_mm = resp["err_mm"]  # float

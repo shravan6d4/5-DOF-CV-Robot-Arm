@@ -145,7 +145,7 @@ Final values, physical frame throughout, **all confirmed by physical jog except 
 | J2 | **−1** | confirmed by jog ×2 | **derivation said +1 and was wrong** |
 | J3 | **−1** | derivation only | anchored by the table-strike incident (`+ticks` physically drove the claw *down* into the table) |
 | J4 | **−1** | confirmed by jog | derivation agreed; first jog attempt was void (see below) |
-| J5 | +1 | **unconfirmed** | position-irrelevant: the tip sits on J5's axis, so its sign affects claw *roll* only, which the 5-DOF position-only pipeline drops |
+| J5 | +1 | **unconfirmed — blocks IK moves** | see below; **not** position-irrelevant |
 
 **J2 is the cautionary one.** The desk derivation concluded `+1` — MATLAB's `+angle` moves the
 wrist physically up, and the bring-up log recorded `+ticks` = shoulder tilts up. Two independent
@@ -153,6 +153,15 @@ physical jogs both showed the arm moving *down*. Either the bring-up note was ta
 different vantage, or the derivation chain has an error not yet isolated. Physical evidence won;
 the wrong derivation is recorded rather than quietly deleted, because it's the one that would
 otherwise be re-derived the same way next time.
+
+**J5 is unconfirmed and that blocks IK-driven motion.** Its one "confirmation" was read against a
+model-frame prediction, so the frame flip invalidates it. It was then dismissed as unimportant on
+the grounds that the tip sits on J5's rotation axis — **wrong, and measurably so.** That confused
+the *wrist* (which J5 barely moves, ~0.0 mm) with the *tip*, which hangs `CLAW_LEN` = 70 mm out on
+the lever: measured **12.6 mm of tip travel for 30°, 38.5 mm for 104°**. J5 is a major positional
+contributor and the IK solver leans on it heavily for lateral targets, so a wrong sign moves the
+claw tens of mm the wrong way. Confirm it with a jog (the tip motion is large and easy to see)
+before Stage D.
 
 **J4's first confirm jog was void by construction**, worth knowing before trusting any future jog:
 `jog_joint.py` predicted **wrist** motion while the operator naturally watched the **claw**. For

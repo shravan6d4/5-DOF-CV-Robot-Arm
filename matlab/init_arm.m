@@ -63,7 +63,26 @@ for i = 1:robot.NumBodies
 end
 assert(~any(cellfun(@isempty, realMotors)), 'Mapping failed - check block names.');
 
-%% ===== PART 1: FREEZE IDLER-DISK JOINTS + LIMITS AROUND TRUE HOME =====
+%% ===== PART 1: FREEZE IDLER-DISK JOINTS + LIMITS AROUND THE ARM'S REAL ZERO =====
+%
+% The motor joints' limits are centred on ANGLE ZERO, not on the imported
+% model's HomePosition, and their HomePosition is reset to 0 to match.
+%
+% Why (found 2026-07-22, on hardware): the physical arm operates around MATLAB
+% angle ~0 — verified by FK, which at [0 0 0 0 0] puts the claw tip ~70mm in
+% front of the base hanging below the wrist, matching the real arm. But the
+% imported model's HomePosition sits near [180, 165, 0, 170, 176] deg, so the
+% old `h + rangeDeg` centred each +/-90deg band on THAT pose. The arm's actual
+% working position then fell OUTSIDE its own joint limits on J1/J2/J4/J5, and
+% the IK solver — correctly obeying those limits — could never return a
+% solution near where the arm really was. It returned the nearest legal
+% posture instead, ~180deg away: a 45mm lift came back wanting ~2600 ticks
+% (~227deg) of base rotation. ServoBus's move cap refused them, which is the
+% only reason this surfaced as a refusal rather than a wild swing.
+%
+% Resetting HomePosition (a default configuration value, NOT geometry — the
+% link transforms are untouched, so FK at any given angle is unchanged) keeps
+% homeConfiguration inside the new limits, so it remains a valid IK seed.
 eps_ = 1e-6;
 homeAngles = zeros(1,6);
 rangeDeg = [ -90  90;    % J1 base yaw
@@ -77,10 +96,12 @@ for i = 1:robot.NumBodies
     h = jnt.HomePosition;
     k = find(motorIdx == i, 1);
     if isempty(k)
-        jnt.PositionLimits = [h - eps_, h + eps_];   % frozen idler disk
+        jnt.PositionLimits = [h - eps_, h + eps_];   % frozen idler disk (unchanged)
     else
-        homeAngles(k) = h;
-        jnt.PositionLimits = h + deg2rad(rangeDeg(k,:));
+        % Motor joint: re-zero to the arm's real operating point.
+        jnt.PositionLimits = deg2rad(rangeDeg(k,:));
+        jnt.HomePosition   = 0;
+        homeAngles(k)      = 0;
     end
 end
 

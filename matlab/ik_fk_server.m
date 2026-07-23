@@ -67,7 +67,14 @@ while true
             try
                 req = jsondecode(line);
                 if strcmp(req.cmd, 'ik')
-                    resp = handle_ik_request(req.x, req.y, req.z);
+                    % Optional seed_rad = the arm's CURRENT joint angles, so the
+                    % solver returns the nearest solution rather than any legal
+                    % one. Absent -> fall back to homeConfiguration.
+                    if isfield(req, 'seed_rad')
+                        resp = handle_ik_request(req.x, req.y, req.z, req.seed_rad);
+                    else
+                        resp = handle_ik_request(req.x, req.y, req.z, []);
+                    end
                 elseif strcmp(req.cmd, 'fk')
                     resp = handle_fk_request(req.angles_rad);
                 else
@@ -95,7 +102,7 @@ while true
     end
 end
 
-function resp = handle_ik_request(x, y, z)
+function resp = handle_ik_request(x, y, z, seed_rad)
     global robot ik motorIdx homeAngles endEffector maxReach IK_TOL
 
     p_robot = [x; y; z];
@@ -108,9 +115,19 @@ function resp = handle_ik_request(x, y, z)
         return;
     end
 
-    % Multi-restart IK (same as IKtrials_v2 Part 3/4)
+    % Multi-restart IK (same as IKtrials_v2 Part 3/4), but seeded from the
+    % arm's CURRENT joint angles when the caller supplies them. A solver
+    % seeded elsewhere can return a perfectly valid solution in a completely
+    % different posture — for a 45mm move that showed up as ~2600 ticks
+    % (~227deg) of commanded base rotation. Seeding from where the arm
+    % actually is makes the nearest solution the one it converges on.
     targetPose = trvec2tform(p_robot');
     seed = homeConfiguration(robot);
+    if ~isempty(seed_rad)
+        for k = 1:5
+            seed(motorIdx(k)) = seed_rad(k);
+        end
+    end
     weights = [0 0 0 1 1 1];  % position only
     bestSol = []; bestErr = inf;
     for attempt = 1:10

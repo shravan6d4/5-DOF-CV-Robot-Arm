@@ -267,10 +267,14 @@ HAND_EYE_PATH = "data/hand_eye.json"
 # robot stands on, the plane motor 1 (J1) sits on. The base origin is ~73mm
 # above it, so this value is NEGATIVE.
 #
-# ESTIMATE, not a measurement — good to maybe +/-5mm, replace it with a real
-# one. Derived 2026-07-22: FK (frame-corrected) puts the claw tip at
-# z = -62.9mm near home, and the operator measured ~10mm of clearance beneath
-# it -> tabletop ~ -73mm.
+# ESTIMATE, not a measurement — good to maybe +/-3mm, replace it with a real
+# one. Derived 2026-07-22 (second pass): FK (frame-corrected) put the claw tip
+# at z = -70.7mm with the operator observing ~5mm of clearance beneath it ->
+# tabletop ~ -75.7mm. Supersedes a -73mm figure taken earlier the same session
+# from a different arm pose (tip at -62.9mm, ~10mm gap); the confirm jogs had
+# walked the claw ~8mm closer to the table in between, which is exactly why
+# this value must be re-derived whenever the arm has moved, not carried
+# forward.
 #
 # This value has been wrong three times; each failure mode is documented in
 # CLAUDE.md's frame section (0.0 placeholder; -0.084 from assuming the tip
@@ -284,7 +288,7 @@ HAND_EYE_PATH = "data/hand_eye.json"
 # request_fk_tip — the tip's z at that instant IS this value. Depends on
 # ticks_to_rad, i.e. on dir_sign being right; J2's confirm jog should happen
 # first (see SERVO_CALIBRATION_FALLBACK notes).
-TABLE_Z_IN_BASE = -0.073
+TABLE_Z_IN_BASE = -0.076
 
 # Where the gripper should end up to grasp, relative to the table surface.
 # Slightly above the table so the fingers close around the brick body rather
@@ -381,12 +385,16 @@ SERVO_CALIBRATION_PATH = "data/servo_calibration.json"
 #       about model +Y = a physically RIGHT-pointing axis, which viewed from
 #       the operator's vantage (the LEFT side) appears CW, against the
 #       bring-up log's +ticks = CCW from the left.
-#   J5 = +1 (nominal, direction UNCONFIRMED): the one jog "confirmation" was
-#       against a model-frame description, so its physical sense is
-#       contaminated. Deliberately deprioritized: the claw tip sits on J5's
-#       rotation axis (a J5 jog moves the wrist 0.0mm), so its sign barely
-#       affects position-only IK — it changes claw ROLL orientation only, which
-#       the 5-DOF pipeline drops anyway.
+#   J5 = +1 (nominal, direction UNCONFIRMED — MUST be resolved before IK moves).
+#       The one jog "confirmation" was against a model-frame description, so
+#       its physical sense is contaminated by the frame flip.
+#       An earlier note here claimed J5 was position-irrelevant because "the
+#       tip sits on its rotation axis". THAT WAS WRONG, and measured wrong:
+#       a J5 jog moves the WRIST ~0.0mm, but the tip is CLAW_LEN (70mm) out on
+#       the lever, so it swings hard — measured 12.6mm for 30 deg, 38.5mm for
+#       104 deg. J5 is a major positional contributor and the IK solver uses it
+#       heavily to reach lateral targets. Its sign being wrong would send the
+#       claw tens of mm the wrong way.
 # home_tick VALUES BELOW ARE STILL PLACEHOLDERS — measure your arm and fill in
 # real numbers (dir_sign and home_tick are independent facts).
 # home_tick VALUES BELOW ARE STILL PLACEHOLDERS — measure your arm and fill in
@@ -436,6 +444,14 @@ SERVO_MOVE_READ_RETRIES = 3          # transient serial read failures to absorb 
 # 400 ticks ~ 35 deg at J1..J5: comfortably more than any pick-sequence step,
 # far less than a wrap-around.
 SERVO_MAX_MOVE_DELTA_TICKS = 400
+
+# Any commanded joint move at or above this many DEGREES gets a loud
+# stand-by-the-power warning before it executes. Operator standing instruction
+# (2026-07-22): watch the power cut whenever a move this large is about to run.
+# Note the tick cap above already caps a single move at ~35 deg, so this only
+# fires if that cap is deliberately raised via move_and_verify(max_delta_ticks)
+# — which is exactly the case that most deserves a human watching.
+SERVO_WATCH_POWER_MOVE_DEG = 45.0
 
 # Gripper (J6) open/closed positions, expressed as an angle offset (radians) from
 # the servo's calibrated home. Converted to ticks through the same per-servo
