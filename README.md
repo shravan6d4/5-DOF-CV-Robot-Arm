@@ -137,15 +137,15 @@ on). `physical (x,y,z) = model (x,−y,−z)`. `MatlabIKClient` now converts at 
 Python-side code and scripts speak the physical frame; MATLAB-side code (and the historical
 target names in `test_ik_fk.m` — its "low" is physically high) stay in the model frame.
 
-Final values, physical frame throughout, **all confirmed by physical jog except J5**:
+Final values, physical frame throughout, **all five now confirmed by physical jog**:
 
 | Joint | `dir_sign` | Status | Notes |
 |---|---|---|---|
 | J1 | **+1** | confirmed by jog | derivation agreed |
 | J2 | **−1** | confirmed by jog ×2 | **derivation said +1 and was wrong** |
-| J3 | **−1** | derivation only | anchored by the table-strike incident (`+ticks` physically drove the claw *down* into the table) |
+| J3 | **−1** | confirmed by Stage D | derivation anchored by the table-strike incident (`+ticks` physically drove the claw *down*); the 45 mm lift then moved the arm *up* with J3 doing most of the work, which a wrong sign would have inverted |
 | J4 | **−1** | confirmed by jog | derivation agreed; first jog attempt was void (see below) |
-| J5 | +1 | **unconfirmed — blocks IK moves** | see below; **not** position-irrelevant |
+| J5 | **+1** | confirmed by jog | 300-tick jog; **not** position-irrelevant (see below) |
 
 **J2 is the cautionary one.** The desk derivation concluded `+1` — MATLAB's `+angle` moves the
 wrist physically up, and the bring-up log recorded `+ticks` = shoulder tilts up. Two independent
@@ -154,14 +154,15 @@ different vantage, or the derivation chain has an error not yet isolated. Physic
 the wrong derivation is recorded rather than quietly deleted, because it's the one that would
 otherwise be re-derived the same way next time.
 
-**J5 is unconfirmed and that blocks IK-driven motion.** Its one "confirmation" was read against a
-model-frame prediction, so the frame flip invalidates it. It was then dismissed as unimportant on
+**J5 needed a re-confirm, and nearly got skipped.** Its original "confirmation" was read against a
+model-frame prediction, so the frame flip invalidated it. It was then dismissed as unimportant on
 the grounds that the tip sits on J5's rotation axis — **wrong, and measurably so.** That confused
 the *wrist* (which J5 barely moves, ~0.0 mm) with the *tip*, which hangs `CLAW_LEN` = 70 mm out on
 the lever: measured **12.6 mm of tip travel for 30°, 38.5 mm for 104°**. J5 is a major positional
 contributor and the IK solver leans on it heavily for lateral targets, so a wrong sign moves the
-claw tens of mm the wrong way. Confirm it with a jog (the tip motion is large and easy to see)
-before Stage D.
+claw tens of mm the wrong way. Re-confirmed with a **300-tick** jog — sized up from the usual 80
+because at 80 ticks the tip moves only ~3 mm, which is likely why the original reading was
+unreliable in the first place.
 
 **J4's first confirm jog was void by construction**, worth knowing before trusting any future jog:
 `jog_joint.py` predicted **wrist** motion while the operator naturally watched the **claw**. For
@@ -182,14 +183,46 @@ now predicts **claw-tip** motion and flags when wrist and claw diverge; the re-r
   otherwise-successful move. The goal write happens *before* polling, so the servo is already
   driving toward its target regardless of whether our verification read succeeds.
 
+## Stage D — IK round-trip validation (2026-07-22): vertical axis PASSED
+
+The first stage where IK commands the arm, and the first that validates *magnitude* rather than
+direction. `scripts/validate_ik_roundtrip.py` lifts first, probes ±15 mm per axis from the raised
+pose, then descends to the real pick height, previewing every move's per-joint tick/degree deltas
+and waiting for confirmation.
+
+**Read its output carefully — the printed FK-vs-IK error proves less than it looks.** `rad_to_ticks`
+and `ticks_to_rad` apply the same per-servo calibration on the way out and back, so `dir_sign` and
+`ticks_per_rad` **cancel** in that round trip; it reports ~0 mm even with a sign inverted. It
+confirms the software chain agrees with itself, nothing more. **A ruler against the physical arm is
+the only thing that closes the loop.**
+
+Doing that on the 45 mm lift:
+
+| | value |
+|---|---|
+| commanded lift | 45.0 mm |
+| FK-computed rise (from read-back positions) | 40.7 mm |
+| **ruler-measured rise** (gap under claw 5 mm → 44 mm) | **39 mm** |
+| implied tabletop, pre-lift (tip −70.7, gap 5) | −75.7 mm |
+| implied tabletop, post-lift (tip −30.0, gap 44) | −74.0 mm |
+
+The two tabletop figures were taken from poses **40 mm apart vertically** and agree to **1.7 mm** —
+a wrong vertical scale would have made them diverge, so this is a real check and not a tautology.
+Conclusion: the vertical kinematic chain (`ticks_per_rad` × link lengths, through the frame
+conversion) is good to ~2 mm over a 40 mm move. `config.TABLE_Z_IN_BASE` set to **−0.074**.
+
+The 45 → 40.7 mm gap is *not* model error: the servos settled 15–47 ticks short of goal, i.e. about
+**4 mm of real open-loop positioning error**. FK tracked it correctly because it reads back actual
+positions rather than assuming the commanded ones were reached.
+
 **Outstanding before the MATLAB-driven pipeline (`HardwareRobot`) drives the arm for real:**
-- **Stage D — IK round-trip validation.** `dir_sign` being correct only settles *direction*;
-  `ticks_per_rad`, backlash, and overall model fit are still unvalidated against physical reality.
-  Command a target → IK → move → read back → FK, and compare against a ruler.
-- `TABLE_Z_IN_BASE = -0.073` is an estimate (frame-corrected FK tip at z = −63mm + the operator's
-  ~10mm measured clearance). Replace with a touch-probe measurement: hand-position the claw to
-  touch the table, read the servos, run the angles through `request_fk_tip`.
+- **Stage D lateral probes** (`forward`/`left`/`right`). Vertical barely exercises J1/J5, so a sign
+  or scale error there would not have shown up above. The `back` probe is *expected* to be refused
+  by the tick cap — the arm works close in (tip x ≈ 75 mm) where the tip sits near the J1 axis, so
+  a 15 mm Cartesian move demands a ~60° J1/J5 swing. That refusal is the safety system working.
 - J6 (gripper) direction is confirmed but its open/closed tick range (vs. `config.SERVO_GRIPPER_OPEN_RAD`
   / `SERVO_GRIPPER_CLOSE_RAD`) has not been calibrated against the physical claw's actual travel.
 - Camera intrinsics and hand-eye calibration have not been run against the real camera/arm. Note
-  hand-eye **drives a full IK-commanded workspace sweep**, so it wants Stage D passing first.
+  hand-eye **drives a full IK-commanded workspace sweep**, so it wants Stage D fully passing first.
+- `TABLE_Z_IN_BASE` is still ruler-to-eye derived (±2 mm). A touch-probe would remove that, but the
+  payoff is now small enough that it is not worth a deliberate descent into the tabletop.

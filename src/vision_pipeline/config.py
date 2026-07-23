@@ -267,14 +267,24 @@ HAND_EYE_PATH = "data/hand_eye.json"
 # robot stands on, the plane motor 1 (J1) sits on. The base origin is ~73mm
 # above it, so this value is NEGATIVE.
 #
-# ESTIMATE, not a measurement — good to maybe +/-3mm, replace it with a real
-# one. Derived 2026-07-22 (second pass): FK (frame-corrected) put the claw tip
-# at z = -70.7mm with the operator observing ~5mm of clearance beneath it ->
-# tabletop ~ -75.7mm. Supersedes a -73mm figure taken earlier the same session
-# from a different arm pose (tip at -62.9mm, ~10mm gap); the confirm jogs had
-# walked the claw ~8mm closer to the table in between, which is exactly why
-# this value must be re-derived whenever the arm has moved, not carried
-# forward.
+# CORROBORATED 2026-07-22 (Stage D) by two clearance readings taken at poses
+# 40.7mm apart vertically, which is a much stronger check than either reading
+# alone — a wrong vertical scale would make them disagree:
+#     pre-lift:   FK tip z = -70.7mm, operator measured ~5mm  -> table -75.7mm
+#     post-lift:  FK tip z = -30.0mm, operator measured  44mm -> table -74.0mm
+# They agree to 1.7mm. Equivalently: FK said the lift moved the tip 40.7mm, the
+# ruler said 39mm. So the model's vertical scale (ticks_per_rad x link lengths,
+# through the frame conversion) is good to ~2mm over a 40mm move, and the table
+# is at about -74mm. Taking the post-lift figure: the 44mm reading was measured
+# deliberately, the 5mm was an eyeball estimate, and -74.0 is the conservative
+# choice of the two (it assumes the tabletop is HIGHER, so a commanded pick
+# height ends up slightly above the surface rather than slightly into it).
+#
+# Still an estimate to maybe +/-2mm, since both inputs are ruler-to-eye gaps
+# under the claw. A touch-probe (below) would remove that, but the payoff is
+# now small. Re-derive whenever the arm has moved: an earlier -73mm figure came
+# from a different pose (tip at -62.9mm, ~10mm gap) and the confirm jogs walked
+# the claw ~8mm closer to the table in between.
 #
 # This value has been wrong three times; each failure mode is documented in
 # CLAUDE.md's frame section (0.0 placeholder; -0.084 from assuming the tip
@@ -288,7 +298,7 @@ HAND_EYE_PATH = "data/hand_eye.json"
 # request_fk_tip — the tip's z at that instant IS this value. Depends on
 # ticks_to_rad, i.e. on dir_sign being right; J2's confirm jog should happen
 # first (see SERVO_CALIBRATION_FALLBACK notes).
-TABLE_Z_IN_BASE = -0.076
+TABLE_Z_IN_BASE = -0.074
 
 # Where the gripper should end up to grasp, relative to the table surface.
 # Slightly above the table so the fingers close around the brick body rather
