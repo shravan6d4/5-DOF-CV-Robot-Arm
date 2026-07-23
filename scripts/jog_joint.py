@@ -12,10 +12,10 @@ the FK prediction below is computed THROUGH the current dir_sign. If the arm
 moves the way the prediction says, that joint's dir_sign is right. If it moves
 the opposite way, it is inverted and must be flipped.
 
-The base frame was pinned empirically during Stage B: with the arm at home, FK
-puts the wrist at x=+91 mm and the claw is physically ~90 mm IN FRONT of the
-base, so +X is forward; the claw tip sits above the tabletop at z=-71 mm, so +Z
-is up. +Y is then left, by right-handedness.
+All positions/predictions here are in the PHYSICAL frame (+X forward, +Y left,
++Z up) — MatlabIKClient converts to/from the imported model's flipped frame at
+the wire (model +Z is physically DOWN; see CLAUDE.md "COORDINATE FRAMES"), so
+this script's "up"/"left" language matches what the operator actually sees.
 
 SAFETY. This moves the arm. Before running:
   * claw clear of the table with a few cm underneath (J3 folding down is the

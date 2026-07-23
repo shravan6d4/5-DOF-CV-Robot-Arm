@@ -10,6 +10,59 @@ The full path is implemented end-to-end against a **simulated** robot: detect br
 
 See [README.md](README.md) for a quick project overview, setup, and the command list; this file goes deeper on architecture, the data flow, and the merge path onto real hardware.
 
+## COORDINATE FRAMES — the imported model is upside-down (read before touching kinematics)
+
+**The single most important fact about this system, stated by the operator and verified
+physically on 2026-07-22: the Simscape/`importrobot` model's base frame is FLIPPED relative to
+the physical robot.** In the model's own coordinates the arm reaches *upward* (claw tip at
+z = +63 mm above the base origin — as if picking objects off a ceiling). The physical arm does the
+opposite: the claw hangs *down* toward the table the robot stands on. Every past error in this
+area came from assuming the model frame is the physical frame.
+
+**The exact relationship** (a 180° rotation about the shared X axis; self-inverse, so the same
+formula converts both directions):
+
+```
+physical (x, y, z) = model (x, −y, −z)
+model +X = physical forward (unchanged) · model +Y = physical RIGHT · model +Z = physical DOWN
+```
+
+Definitions, so language stays unambiguous:
+- **"The table"** = the horizontal surface the robot stands on = the plane motor 1 (J1) sits on.
+- **Physical frame** = X forward (the way the claw points at home), Z up (against gravity),
+  Y left (right-handed). The base origin sits **~73 mm above the tabletop** (inside the base
+  column, near shoulder height). `TABLE_Z_IN_BASE ≈ −0.073` (physical; estimate ±5 mm).
+- At home, physically: wrist ~+4 mm above origin, claw tip ~63 mm **below** origin, ~10 mm above
+  the table. **The claw tip is always below the wrist in any sane pose** — if "physical" numbers
+  ever show the tip *above* the wrist, a frame conversion has been dropped somewhere.
+
+**Where the conversion lives — one seam only:**
+[`MatlabIKClient`](src/vision_pipeline/robot_interface/matlab_client.py) converts at the wire:
+`request_ik` negates y,z of the target on the way in; `request_fk`/`request_fk_tip` left-multiply
+returned transforms by `diag(1,−1,−1,1)` on the way out. Consequently **everything Python-side
+speaks the physical frame** (HardwareRobot, pipeline, planning, all scripts, all config
+geometry values), while **everything MATLAB-side speaks the model frame** (`ik_fk_server.m`, the
+raw TCP JSON protocol, `test_ik_fk.m`, `IKtrials_v2.m` — including their target names: the
+battery's "low" target is model-low, i.e. physically *high*). Never convert anywhere else;
+never convert twice. Joint *angles* are scalars and are NOT affected by this Cartesian flip —
+they pass through unchanged; only Cartesian poses/targets convert.
+
+**Past mistakes this section exists to prevent (do not reintroduce):**
+1. `TABLE_Z_IN_BASE = 0.0` — original placeholder, wrong by ~73 mm.
+2. `= −0.084` — assumed the tip hangs `CLAW_LEN` straight below the wrist *in the model frame*.
+3. `= +0.053` — used the model-frame tip z directly, concluding the tabletop is above the base
+   origin. It is not; the frame is flipped.
+4. Deriving joint `dir_sign` values by interpreting model-frame FK axes as physical directions
+   ("viewed from above", "the left side") without applying the flip — this silently inverts
+   every such conclusion. All dir_sign reasoning must be done in the physical frame (or, better,
+   confirmed by a physical jog through `scripts/jog_joint.py`, whose predictions are physical
+   now that the client converts).
+
+**60-second re-verification recipe** (arm powered, MATLAB server up):
+`python scripts/check_servo_health.py` → the B4 block must show the tip *below* the wrist
+(tip z ≈ −63 mm at home) and the tabletop estimate ≈ −73 mm; physically confirm the claw sits
+~10 mm above the table. If the signs disagree, the conversion seam has been broken.
+
 ## Commands
 
 ```powershell

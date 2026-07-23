@@ -291,62 +291,70 @@ def test_rad_ticks_roundtrip_is_exact_across_joints(monkeypatch):
             assert recovered == pytest.approx(angle, abs=2e-3)
 
 
-def test_j1_dir_sign_is_inverted_reconciled_2026_07_22(monkeypatch):
-    """J1's dir_sign must be -1, not the +1 placeholder every other unresolved
-    joint still carries.
+# --- dir_sign regressions ------------------------------------------------
+#
+# All five derivations below are in the PHYSICAL frame. The imported MATLAB
+# model's base frame is upside-down relative to the physical robot (model +Z
+# is physically DOWN, model +Y physically RIGHT — see CLAUDE.md "COORDINATE
+# FRAMES"). An earlier reconciliation pass interpreted model axes as physical
+# and settled on the exact opposite signs for J1-J4; these tests pin the
+# corrected set so neither the frame error nor the old values can drift back.
 
-    Reconciled by comparing the physical bring-up log (README: "+ticks =
-    counterclockwise viewed from above") against MATLAB's own convention
-    (right-hand rule on J1's FK rotation axis, -Z, gives clockwise from above
-    for +angle). Opposite senses -> dir_sign must flip the sign, or a
-    positive tick delta gets reported to MATLAB as a negative angle change
-    and vice versa -- silently commanding/interpreting the wrong direction.
-    Locking this in so it can't drift back to +1 by accident.
+def test_j1_dir_sign_positive_frame_corrected_2026_07_22(monkeypatch):
+    """J1 dir_sign is +1.
+
+    MATLAB's +angle rotates about model -Z = physically UP -> CCW seen from
+    above (right-hand rule). Bring-up log: +ticks = CCW from above. Same
+    sense -> +1. (An earlier -1 came from reading model -Z as physically
+    down.) J1 has never been physically jogged under this value — a cheap
+    confirm jog is recommended before the first IK-driven move.
     """
     bus = _bus(monkeypatch, FakeServoSerial())
-    assert bus._cal(1)["dir_sign"] == -1
+    assert bus._cal(1)["dir_sign"] == 1
 
 
-def test_j4_dir_sign_stays_positive_reconciled_2026_07_22(monkeypatch):
-    """J4's dir_sign is +1 -- confirmed correct, not merely untested.
+def test_j2_dir_sign_positive_frame_corrected_2026_07_22(monkeypatch):
+    """J2 dir_sign is +1.
 
-    J4 and J1 share the same reconciliation method (README bring-up log vs.
-    MATLAB's FK rotation axis) but land on opposite conclusions: J4's physical
-    "+ticks = ccw from the side" (confirmed vantage point: the left side, +Y)
-    matches MATLAB's own +Y-axis convention (also ccw viewed from the left),
-    so no flip is needed. Locking in the placeholder value here specifically
-    so a future accidental sign flip (e.g. someone "fixing" it to match J1) is
-    caught by a test failure, not a wrong-direction move on real hardware.
+    MATLAB's +angle moves the wrist model-down = physically UP; the bring-up
+    log's dedicated ~100-150-tick direction jog recorded +ticks = shoulder
+    tilts UP. Same sense -> +1.
+
+    Known conflict, resolved deliberately: a ~3.5mm jog this session read the
+    opposite direction. It was half the size, and the operator had been told
+    "should move up" beforehand (priming). The bring-up record + the desk
+    method (independently validated on J3 by the table-strike incident) win.
+    A larger, physically-worded confirm jog is REQUIRED before IK moves; if
+    it contradicts this, flip the value AND this test together with the
+    physical evidence in hand.
     """
     bus = _bus(monkeypatch, FakeServoSerial())
-    assert bus._cal(4)["dir_sign"] == 1
+    assert bus._cal(2)["dir_sign"] == 1
 
 
-def test_j2_dir_sign_is_inverted_reconciled_2026_07_22(monkeypatch):
-    """J2's dir_sign must be -1.
+def test_j3_dir_sign_negative_frame_corrected_2026_07_22(monkeypatch):
+    """J3 dir_sign is -1, anchored by the strongest physical evidence we have.
 
-    J2's physical description ("tilts up") doesn't state a viewing
-    convention, so this was reconciled differently from J1/J4: by directly
-    comparing which way the WRIST moves for a pure MATLAB +angle delta on J2
-    alone (the same observable a human watches during a single-joint jog).
-    MATLAB's +angle moves the wrist DOWN (~2.6mm for a 0.05 rad delta from
-    true home) -- opposite the physical "tilts up" -- so dir_sign must flip.
+    During bring-up, commanding J3 in the + direction physically drove the
+    claw DOWN into the table (the near-miss incident). MATLAB's +angle moves
+    the wrist model-down = physically UP. Opposite senses -> -1. The incident
+    record also validates the wrist-displacement desk method used for J2.
     """
     bus = _bus(monkeypatch, FakeServoSerial())
-    assert bus._cal(2)["dir_sign"] == -1
+    assert bus._cal(3)["dir_sign"] == -1
 
 
-def test_j3_dir_sign_stays_positive_reconciled_2026_07_22(monkeypatch):
-    """J3's dir_sign is +1 -- confirmed correct via the same wrist-displacement
-    method used for J2 (see test_j2_dir_sign_is_inverted_reconciled_2026_07_22).
+def test_j4_dir_sign_negative_frame_corrected_2026_07_22(monkeypatch):
+    """J4 dir_sign is -1.
 
-    MATLAB's +angle moves the wrist DOWN (~6.9mm for a 0.05 rad delta from
-    true home), matching the physical "folds down, toward the table" -- same
-    sense, no flip needed. Locked in so an accidental "fix" doesn't flip it
-    to match J2's sign by mistaken pattern-matching.
+    J4's axis is model +Y = a physically RIGHT-pointing axis. The operator
+    observed from the LEFT side (confirmed vantage), i.e. looking along that
+    axis — from there MATLAB's +angle appears CW. Bring-up: +ticks = CCW from
+    the left. Opposite senses -> -1. (The earlier +1 treated model +Y as
+    physically left.)
     """
     bus = _bus(monkeypatch, FakeServoSerial())
-    assert bus._cal(3)["dir_sign"] == 1
+    assert bus._cal(4)["dir_sign"] == -1
 
 
 # --- move safety + settling ---------------------------------------------
@@ -460,19 +468,19 @@ def test_stalled_servo_returns_early_instead_of_hanging(monkeypatch, _fast_polls
     assert arrived == 2048, "should report where the servo actually is"
 
 
-def test_j5_dir_sign_stays_positive_confirmed_by_jog_2026_07_22(monkeypatch):
-    """J5's dir_sign is +1 -- the only joint that needed an actual physical
-    jog rather than desk reconciliation (its FK rotation axis is only 73%
-    pure at the home pose, unlike the clean 100%-pure axes for J1-J4, so
-    neither the viewpoint method used for J1/J4 nor the wrist-displacement
-    method used for J2/J3 applied confidently).
+def test_j5_dir_sign_nominal_positive_direction_unconfirmed(monkeypatch):
+    """J5 dir_sign is +1 NOMINALLY — its physical direction is unconfirmed.
 
-    Confirmed via scripts/jog_joint.py: a +80 tick jog predicted the claw
-    would rotate ~7 deg counterclockwise seen from above; a second +80 jog
-    (total ~14 deg from the starting pose, chosen after the first jog's
-    result was inconclusive by eye) was reported by the operator as matching
-    the prediction. No flip applied -- this is the last of the six joints'
-    dir_sign values to be settled.
+    The one jog "confirmation" (operator matched a predicted "~7 deg CCW from
+    above") was against a MODEL-frame description; under the now-documented
+    frame flip that same rotation is physically CW from above, so the
+    observation can't distinguish the two signs.
+
+    Deliberately left at +1 rather than chased: the claw tip sits on J5's
+    rotation axis (a J5-only jog moves the wrist 0.0mm and the tip barely
+    more), so this sign has almost no effect on position-only IK — it changes
+    claw ROLL orientation only, which the 5-DOF pipeline drops anyway. This
+    test pins the nominal value so a change is a deliberate act, not drift.
     """
     bus = _bus(monkeypatch, FakeServoSerial())
     assert bus._cal(5)["dir_sign"] == 1

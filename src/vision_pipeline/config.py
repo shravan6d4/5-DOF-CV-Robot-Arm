@@ -262,26 +262,29 @@ HAND_EYE_PATH = "data/hand_eye.json"
 # so the pixel back-projection is intersected with z = TABLE_Z_IN_BASE to place
 # the brick in 3D from a single camera.
 #
-# ESTIMATE, not a measurement — good to maybe +/-5mm, replace it with a real one.
-# Derived 2026-07-22 from the FK server's ClawTip transform: with the arm near
-# home the tip reads z = +62.9mm, and the operator eyeballed ~10mm of clearance
-# beneath it, putting the tabletop around +53mm.
+# PHYSICAL frame (+Z up; MatlabIKClient converts to/from the flipped model
+# frame — see CLAUDE.md "COORDINATE FRAMES"). "The table" = the surface the
+# robot stands on, the plane motor 1 (J1) sits on. The base origin is ~73mm
+# above it, so this value is NEGATIVE.
 #
-# The tip sits ABOVE the base-frame origin here, which is not obvious: at this
-# arm's home pose the claw does NOT hang below the wrist. FK reports the wrist
-# at z = -4.1mm and the tip at z = +62.9mm — roughly 67mm HIGHER, and behind it.
-# An earlier value of -0.084 came from assuming "tip = wrist - CLAW_LEN" before
-# T_tip existed to check against; that was wrong by ~137mm and in the wrong
-# direction. Do not reintroduce that assumption — ask the server for T_tip.
-# (+Z is up, confirmed independently by matlab/test_ik_fk.m's target naming:
-# its "fwd-high" target is at z=0 while "low" is at z=-0.160.)
+# ESTIMATE, not a measurement — good to maybe +/-5mm, replace it with a real
+# one. Derived 2026-07-22: FK (frame-corrected) puts the claw tip at
+# z = -62.9mm near home, and the operator measured ~10mm of clearance beneath
+# it -> tabletop ~ -73mm.
 #
-# To measure it properly (no camera, no calibration needed): hand-position the
-# claw so it just touches the tabletop, read the servos, and run those angles
-# through FK's T_tip -- the tip's z at that moment IS this value. That path
-# depends on ticks_to_rad, so it is only trustworthy now that every joint's
-# dir_sign is settled.
-TABLE_Z_IN_BASE = 0.053
+# This value has been wrong three times; each failure mode is documented in
+# CLAUDE.md's frame section (0.0 placeholder; -0.084 from assuming the tip
+# hangs CLAW_LEN below the wrist IN THE MODEL FRAME; +0.053 from reading the
+# model-frame tip z as if it were physical). Ask request_fk_tip for the tip —
+# it returns physical coordinates — and remember the tip is BELOW the wrist
+# physically in any sane pose.
+#
+# To measure properly (no camera, no calibration): hand-position the claw to
+# just touch the tabletop, read the servos, run the angles through
+# request_fk_tip — the tip's z at that instant IS this value. Depends on
+# ticks_to_rad, i.e. on dir_sign being right; J2's confirm jog should happen
+# first (see SERVO_CALIBRATION_FALLBACK notes).
+TABLE_Z_IN_BASE = -0.073
 
 # Where the gripper should end up to grasp, relative to the table surface.
 # Slightly above the table so the fingers close around the brick body rather
@@ -347,42 +350,49 @@ SERVO_CALIBRATION_PATH = "data/servo_calibration.json"
 # If the model is ever re-imported with non-zero HomePosition, set these to the
 # new home angles; the mechanism is here so that stays a data change, not a
 # code change.
-# dir_sign for J1-J4 is NOT a placeholder — all four were reconciled
-# 2026-07-22 by comparing the physical +ticks direction recorded during
-# bring-up (README "Hardware bring-up log") against MATLAB's own
-# positive-rotation convention:
-#   J1: physical +ticks is CCW from above; MATLAB's +angle rotates about -Z
-#       (CW from above, right-hand rule on the FK rotation axis) -> opposite
-#       senses -> dir_sign -1.
-#   J4: physical +ticks is CCW from the left side (confirmed vantage point);
-#       MATLAB's +angle about +Y is also CCW from the left -> same sense ->
-#       +1, unchanged.
-#   J2/J3: physical descriptions ("tilts up" / "folds down toward the table")
-#       don't state a viewing convention, so instead of the axis/viewpoint
-#       method, these were resolved by directly comparing which way the
-#       WRIST moves for a pure +angle delta (same observable a human watches
-#       during a single-joint jog): MATLAB's +angle on J2 moves the wrist
-#       DOWN, opposite "tilts up" -> dir_sign -1. MATLAB's +angle on J3 also
-#       moves the wrist DOWN, matching "folds down toward the table" -> +1,
-#       unchanged.
-#   J5: the only joint needing an actual physical jog. Its FK rotation axis is
-#       only 73% pure at the home pose (wrist roll's axis depends on upstream
-#       joint angles, so it isn't a clean single-axis rotation in base-frame
-#       terms), meaning neither method above applied confidently. Confirmed by
-#       jog 2026-07-22: predicted ~7 deg CCW seen from above, operator observed
-#       a match -> +1, unchanged.
-# All six dir_sign values are now reconciled; none remain placeholders.
+# dir_sign reconciliation, REDONE 2026-07-22 after the operator identified that
+# the imported model's frame is upside-down relative to the physical robot
+# (see CLAUDE.md "COORDINATE FRAMES" — model +Z is physically DOWN, model +Y is
+# physically RIGHT). An earlier pass reconciled these while interpreting model
+# axes as physical ("viewed from above", etc.), which silently inverted every
+# frame-based conclusion. Corrected derivations, physical frame throughout:
+#   J1 = +1: MATLAB +angle rotates about model -Z = physically UP -> CCW seen
+#       from above. Bring-up log: +ticks = CCW from above. Same sense.
+#       (Previous -1 was the frame error. Never physically jogged — cheap
+#       confirm jog recommended before the first IK-driven move.)
+#   J2 = +1: MATLAB +angle moves the wrist model-down = physically UP.
+#       Bring-up log (dedicated ~100-150-tick direction jog): +ticks tilts the
+#       shoulder UP. Same sense. CONFLICT NOTE: a small (~3.5mm) jog this
+#       session read the opposite; it was primed ("should move up") and half
+#       the size of the bring-up motion, so the bring-up record + the desk
+#       method (validated on J3 by the incident, below) win. A larger confirm
+#       jog is REQUIRED before any IK-driven move.
+#   J3 = -1: MATLAB +angle moves the wrist model-down = physically UP. The
+#       bring-up table-strike incident is the anchor: commanding +ticks
+#       physically drove the claw DOWN into the table. Opposite senses.
+#   J4 = -1: MATLAB +angle rotates about model +Y = a physically RIGHT-pointing
+#       axis; viewed from the operator's confirmed vantage (the LEFT side,
+#       looking along that axis) +angle appears CW. Bring-up: +ticks = CCW from
+#       the left. Opposite senses.
+#   J5 = +1 (nominal, direction UNCONFIRMED): the one jog "confirmation" was
+#       against a model-frame description, so its physical sense is
+#       contaminated. Deliberately deprioritized: the claw tip sits on J5's
+#       rotation axis (a J5 jog moves the wrist 0.0mm), so its sign barely
+#       affects position-only IK — it changes claw ROLL orientation only, which
+#       the 5-DOF pipeline drops anyway.
+# home_tick VALUES BELOW ARE STILL PLACEHOLDERS — measure your arm and fill in
+# real numbers (dir_sign and home_tick are independent facts).
 # home_tick VALUES BELOW ARE STILL PLACEHOLDERS — measure your arm and fill in
 # real numbers (dir_sign and home_tick are independent facts; don't conflate
 # "dir_sign is known" with "this arm's home_tick is known").
 SERVO_CALIBRATION_FALLBACK = {
-    "1": {"home_tick": 2048, "ticks_per_rad": 651.89, "dir_sign": -1,
+    "1": {"home_tick": 2048, "ticks_per_rad": 651.89, "dir_sign": 1,
           "home_angle_rad": 0.0},                                          # J1
-    "2": {"home_tick": 1365, "ticks_per_rad": 651.89, "dir_sign": -1,
+    "2": {"home_tick": 1365, "ticks_per_rad": 651.89, "dir_sign": 1,
           "home_angle_rad": 0.0},                                          # J2
-    "3": {"home_tick": 2048, "ticks_per_rad": 651.89, "dir_sign": 1,
+    "3": {"home_tick": 2048, "ticks_per_rad": 651.89, "dir_sign": -1,
           "home_angle_rad": 0.0},                                          # J3
-    "4": {"home_tick": 2048, "ticks_per_rad": 651.89, "dir_sign": 1,
+    "4": {"home_tick": 2048, "ticks_per_rad": 651.89, "dir_sign": -1,
           "home_angle_rad": 0.0},                                          # J4
     "5": {"home_tick": 2048, "ticks_per_rad": 651.89, "dir_sign": 1,
           "home_angle_rad": 0.0},                                          # J5

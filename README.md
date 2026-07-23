@@ -122,36 +122,36 @@ the delta from current position to stored home for each, (3) refuse/skip any joi
 exceeds a small safety cap (a few hundred ticks) rather than executing it, (4) move only the joints
 within cap, one at a time, with someone watching.
 
-## `dir_sign` reconciliation — complete (2026-07-22, later session)
+## `dir_sign` reconciliation (2026-07-22, later session — REDONE after the frame flip was found)
 
 The physical `+ticks` directions in the table above describe what the arm *does*; MATLAB's IK/FK
-works in its own angle convention. `dir_sign` is what reconciles the two, and getting it wrong
-means a commanded angle drives the joint the wrong way with nothing to catch it. All six are now
-resolved.
+works in its own angle convention. `dir_sign` reconciles the two, and getting it wrong means a
+commanded angle drives a joint the wrong way with nothing to catch it.
 
-The missing prerequisite was knowing which physical direction is `+X/+Y/+Z` in the base frame.
-That was pinned empirically first: with the arm at home, FK reports the wrist ~91mm along `+X`
-and the operator measured the claw ~90mm **in front** of the base (so `+X` = forward), with the
-claw above the tabletop (so `+Z` = up), giving `+Y` = left by right-handedness.
+**A first reconciliation pass this session got J1–J4 exactly backwards**, because it interpreted
+the model's FK axes as physical directions. The operator then identified the root fact, now
+documented as the canonical frame section in `CLAUDE.md` ("COORDINATE FRAMES"): **the imported
+model's base frame is upside-down relative to the physical robot** — in the model the arm reaches
+*upward* off the base; physically the claw hangs down toward the table (the plane motor 1 sits
+on). `physical (x,y,z) = model (x,−y,−z)`. `MatlabIKClient` now converts at the wire, so all
+Python-side code and scripts speak the physical frame; MATLAB-side code (and the historical
+target names in `test_ik_fk.m` — its "low" is physically high) stay in the model frame.
 
-| Joint | Method | MATLAB `+angle` does | Physical `+ticks` does | `dir_sign` |
+Corrected reconciliation, physical frame throughout:
+
+| Joint | Anchor evidence | MATLAB `+angle`, physically | Physical `+ticks` | `dir_sign` |
 |---|---|---|---|---|
-| J1 | FK axis + right-hand rule | rotates about `−Z` (CW from above) | CCW from above | **−1** |
-| J2 | wrist displacement | moves wrist **down** | "tilts up" | **−1** |
-| J3 | wrist displacement | moves wrist **down** | "folds down toward table" | +1 |
-| J4 | FK axis + right-hand rule | CCW viewed from `+Y` (left) | "ccw from the side" (operator stood left) | +1 |
-| J5 | **physical jog** | ~7° CCW from above | matched | +1 |
+| J1 | bring-up log (whole-arm swing, unambiguous) | CCW from above (axis: model −Z = phys. up) | CCW from above | **+1** |
+| J2 | bring-up direction jog (~100–150 ticks) | wrist **up** | shoulder tilts up | **+1** ⚠ |
+| J3 | **table-strike incident** (+jog drove claw into table) | wrist **up** | folds **down** | **−1** |
+| J4 | bring-up jog, operator on the LEFT (looking along the phys.-right axis) | appears CW from the left | CCW from the left | **−1** |
+| J5 | none usable | (tip sits on J5's axis — position-irrelevant) | — | +1 nominal, unconfirmed |
 
-J1 and J4 were resolved from each joint's FK rotation axis plus the right-hand rule. J2 and J3
-needed a different approach — their descriptions ("tilts up", "folds down toward the table") don't
-state a viewing convention — so instead the *wrist's* displacement for a pure `+angle` delta was
-compared directly against what a human watching a single-joint jog would see. J5 was the only one
-requiring a real jog: its rotation axis is only 73% "pure" at the home pose (wrist roll's axis
-depends on upstream joint angles), so neither desk method applied confidently.
-
-Independent confirmation for J2: at the time of a later read-only check the joint happened to be
-sitting 42 ticks below home. With the old (wrong) sign, FK placed the wrist *above* home; with the
-corrected sign it places it *below* — matching the physical reality of a joint tilted down.
+⚠ J2 carries a known conflict: a small (~3.5 mm), primed jog later in the session read the
+opposite way. The larger dedicated bring-up jog + the desk method (validated on J3 by the
+incident) won, but **a fresh, larger, physically-worded confirm jog for J1/J2/J4 is required
+before the first IK-driven move.** J5 is deliberately left unconfirmed: the claw tip sits on its
+rotation axis, so its sign affects claw roll only — which the 5-DOF position-only pipeline drops.
 
 **Two driver bugs found and fixed during this work:**
 - `move_and_verify()` read back position *immediately* after commanding a move, catching the servo
@@ -166,13 +166,13 @@ corrected sign it places it *below* — matching the physical reality of a joint
   driving toward its target regardless of whether our verification read succeeds.
 
 **Outstanding before the MATLAB-driven pipeline (`HardwareRobot`) drives the arm for real:**
+- **Confirm jogs for J1/J2/J4** (`scripts/jog_joint.py`, predictions now physically worded), then
 - **Stage D — IK round-trip validation.** `dir_sign` being correct only settles *direction*;
   `ticks_per_rad`, backlash, and overall model fit are still unvalidated against physical reality.
   Command a target → IK → move → read back → FK, and compare against a ruler.
-- `TABLE_Z_IN_BASE` is still `0.0`, which is definitely wrong — the arm's home wrist sits at
-  z ≈ −1mm with the claw tip ~70mm below that, so the tabletop is nowhere near zero. Best measured
-  by hand-positioning the claw to touch the table and reading FK (needs `ik_fk_server.m` extended
-  to return `ClawTip`, which it currently doesn't — it only reports the wrist, Body08).
+- `TABLE_Z_IN_BASE = -0.073` is an estimate (frame-corrected FK tip at z = −63mm + the operator's
+  ~10mm measured clearance). Replace with a touch-probe measurement: hand-position the claw to
+  touch the table, read the servos, run the angles through `request_fk_tip`.
 - J6 (gripper) direction is confirmed but its open/closed tick range (vs. `config.SERVO_GRIPPER_OPEN_RAD`
   / `SERVO_GRIPPER_CLOSE_RAD`) has not been calibrated against the physical claw's actual travel.
 - Camera intrinsics and hand-eye calibration have not been run against the real camera/arm. Note

@@ -29,16 +29,23 @@ import numpy as np
 
 from vision_pipeline.robot_interface.matlab_client import IKUnreachableError, MatlabIKClient
 
-# The 8 named targets from IKtrials_v2.m Part 6 (meters, base frame).
+# The 8 targets from IKtrials_v2.m Part 6, expressed in the PHYSICAL frame.
+# MatlabIKClient now converts physical -> model on the wire (the imported
+# model's frame is upside-down; see CLAUDE.md "COORDINATE FRAMES"), so to keep
+# exercising the exact validated solver battery these are the model-frame
+# points with y and z negated — the client's conversion maps them back to the
+# original numbers before the solver sees them. The historical names describe
+# the MODEL frame: "low" is physically ~160mm ABOVE the base origin, and
+# left/right are physically mirrored.
 TARGETS = [
-    ("fwd-mid", (0.150, 0.000, -0.080)),
+    ("fwd-mid", (0.150, 0.000, 0.080)),
     ("fwd-high", (0.150, 0.000, 0.000)),
-    ("left", (0.000, 0.180, -0.060)),
-    ("right", (0.000, -0.180, -0.060)),
-    ("diag", (0.120, 0.120, -0.100)),
-    ("near", (0.080, 0.060, -0.040)),
-    ("low", (0.140, -0.060, -0.160)),
-    ("stretch", (0.220, 0.000, -0.060)),
+    ("left", (0.000, -0.180, 0.060)),
+    ("right", (0.000, 0.180, 0.060)),
+    ("diag", (0.120, -0.120, 0.100)),
+    ("near", (0.080, -0.060, 0.040)),
+    ("low", (0.140, 0.060, 0.160)),
+    ("stretch", (0.220, 0.000, 0.060)),
 ]
 
 IK_TOL_MM = 10.0

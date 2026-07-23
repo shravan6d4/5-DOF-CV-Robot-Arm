@@ -1,8 +1,29 @@
-"""TCP client for the MATLAB IK/FK server (ik_fk_server.m)."""
+"""TCP client for the MATLAB IK/FK server (ik_fk_server.m).
+
+FRAME CONVERSION SEAM — this module is the ONE place the model/physical frame
+flip is handled (see CLAUDE.md "COORDINATE FRAMES"). The Simscape import's base
+frame is upside-down relative to the physical robot: model +Z points physically
+DOWN, model +Y points physically RIGHT, model +X is forward. The relationship
+is a 180° rotation about X, self-inverse:
+
+    physical (x, y, z) = model (x, -y, -z)
+
+request_ik converts the physical target to model coordinates before sending;
+request_fk / request_fk_tip convert returned transforms to physical before
+returning. Everything above this client therefore works purely in the physical
+frame (+Z up, table below the base origin), while the wire protocol and all
+MATLAB-side code stay in the model frame. Joint ANGLES are unaffected by the
+Cartesian flip and pass through unchanged. Do not convert anywhere else.
+"""
 
 import json
 import socket
 import numpy as np
+
+# Homogeneous 180-degree rotation about X: maps model-frame poses to physical
+# and vice versa (it is its own inverse). Left-multiply transforms; for bare
+# points it is just (x, -y, -z).
+_F_PHYS_FROM_MODEL = np.diag([1.0, -1.0, -1.0, 1.0])
 
 
 class IKUnreachableError(Exception):
@@ -74,15 +95,19 @@ class MatlabIKClient:
         """Request inverse kinematics for a position.
 
         Args:
-            x, y, z: target position in meters (base frame).
+            x, y, z: target position in meters, PHYSICAL base frame (+Z up,
+                table below the origin). Converted to the solver's model frame
+                (y and z negated) on the wire — see the module docstring.
 
         Returns:
             (angles_rad, err_mm): J1..J5 angles in radians, and IK error in mm.
+            Angles are frame-independent scalars; err_mm is a norm, unchanged
+            by the rotation.
 
         Raises:
             IKUnreachableError: if target is outside workspace or IK tolerance.
         """
-        req = {"cmd": "ik", "x": x, "y": y, "z": z}
+        req = {"cmd": "ik", "x": x, "y": -y, "z": -z}
         resp = self._send_request(req)
         angles_rad = resp["angles_rad"]  # list of 5 floats
         err_mm = resp["err_mm"]  # float
@@ -95,16 +120,16 @@ class MatlabIKClient:
             angles_rad: list of 5 joint angles in radians (J1..J5).
 
         Returns:
-            4x4 numpy array (WRIST pose, Body08, in base frame). This is the
-            frame hand-eye calibration is solved against. For the claw tip —
-            what the IK solver targets — use request_fk_tip().
+            4x4 numpy array (WRIST pose, Body08) in the PHYSICAL base frame
+            (converted from the server's model frame — see module docstring).
+            This is the frame hand-eye calibration is solved against. For the
+            claw tip — what the IK solver targets — use request_fk_tip().
         """
         req = {"cmd": "fk", "angles_rad": angles_rad}
         resp = self._send_request(req)
-        # Response is 16 floats in row-major order
-        T_flat = resp["T"]
-        T = np.array(T_flat).reshape((4, 4), order="C")
-        return T
+        # Response is 16 floats in row-major order, model frame
+        T_model = np.array(resp["T"]).reshape((4, 4), order="C")
+        return _F_PHYS_FROM_MODEL @ T_model
 
     def request_fk_tip(self, angles_rad: list[float]) -> tuple[np.ndarray, np.ndarray]:
         """Forward kinematics returning BOTH the wrist and the claw tip.
@@ -119,7 +144,10 @@ class MatlabIKClient:
             angles_rad: list of 5 joint angles in radians (J1..J5).
 
         Returns:
-            (T_wrist, T_tip), each a 4x4 numpy array in the base frame.
+            (T_wrist, T_tip), each a 4x4 numpy array in the PHYSICAL base
+            frame (converted from the server's model frame). Physically the
+            tip hangs BELOW the wrist — if it ever comes back above, a frame
+            conversion has been dropped.
 
         Raises:
             RuntimeError: if the server predates the T_tip field — it must be
@@ -136,8 +164,8 @@ class MatlabIKClient:
                 "ClawTip transform."
             )
 
-        T_wrist = np.array(resp["T"]).reshape((4, 4), order="C")
-        T_tip = np.array(resp["T_tip"]).reshape((4, 4), order="C")
+        T_wrist = _F_PHYS_FROM_MODEL @ np.array(resp["T"]).reshape((4, 4), order="C")
+        T_tip = _F_PHYS_FROM_MODEL @ np.array(resp["T_tip"]).reshape((4, 4), order="C")
         return T_wrist, T_tip
 
     def close(self):
