@@ -13,7 +13,7 @@ import logging
 import threading
 import time
 
-from typing import Optional
+from typing import Callable, Optional
 
 import cv2
 import numpy as np
@@ -23,12 +23,22 @@ from vision_pipeline.detection.lego_detector import LegoBrickDetector
 
 logger = logging.getLogger(__name__)
 
+Overlay = Callable[[np.ndarray], np.ndarray]
+
 
 def _make_placeholder_frame(width: int = 640, height: int = 480, text: str = "camera unavailable") -> np.ndarray:
     """A plain frame with a status message, served when no real camera feed exists."""
     frame = np.zeros((height, width, 3), dtype=np.uint8)
     cv2.putText(frame, text, (20, height // 2), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2, cv2.LINE_AA)
     return frame
+
+
+def _brick_overlay(detector: LegoBrickDetector) -> "Overlay":
+    """Wrap a LegoBrickDetector as a frame->frame overlay (the pre-existing --overlay behaviour)."""
+    def _apply(frame: np.ndarray) -> np.ndarray:
+        detections = detector.detect(frame)
+        return detector.draw_debug_overlay(frame, detections)
+    return _apply
 
 
 class CameraStreamer:
@@ -41,10 +51,29 @@ class CameraStreamer:
     with no webcam at all).
     """
 
-    def __init__(self, camera_index: Optional[int], enable_overlay: bool = False):
+    def __init__(
+        self,
+        camera_index: Optional[int],
+        enable_overlay: bool = False,
+        overlay: Optional[Overlay] = None,
+    ):
+        """
+        Args:
+            enable_overlay: draw the brick-detection debug overlay (unchanged
+                default behaviour — see run_arm_ui.py --overlay).
+            overlay: an alternative frame -> frame callable (e.g. drawing
+                ChArUco corners for the calibration panel). Takes precedence
+                over enable_overlay when given, so a caller doesn't have to
+                also build a LegoBrickDetector it doesn't want.
+        """
         self.camera_index = camera_index
         self.enable_overlay = enable_overlay
-        self._detector = LegoBrickDetector() if enable_overlay else None
+        if overlay is not None:
+            self._overlay_fn: Optional[Overlay] = overlay
+        elif enable_overlay:
+            self._overlay_fn = _brick_overlay(LegoBrickDetector())
+        else:
+            self._overlay_fn = None
         self._lock = threading.Lock()
         self._frame: np.ndarray = _make_placeholder_frame()
         self._stop = threading.Event()
@@ -69,9 +98,8 @@ class CameraStreamer:
                 for frame in camera.frames():
                     if self._stop.is_set():
                         break
-                    if self._detector is not None:
-                        detections = self._detector.detect(frame)
-                        frame = self._detector.draw_debug_overlay(frame, detections)
+                    if self._overlay_fn is not None:
+                        frame = self._overlay_fn(frame)
                     with self._lock:
                         self._frame = frame
         except RuntimeError as e:

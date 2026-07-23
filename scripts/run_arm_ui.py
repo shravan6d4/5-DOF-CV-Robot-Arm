@@ -19,6 +19,11 @@ nudging one joint at a time without going through the xyz IK path.
     # Overlay red-brick detection on the camera feed
     python scripts/run_arm_ui.py --overlay
 
+    # Hand-eye calibration capture panel: needs the MATLAB IK/FK server
+    # running (matlab/ik_fk_server.m) for live FK, and replaces --overlay's
+    # brick-detection overlay with a ChArUco corner overlay on the feed.
+    python scripts/run_arm_ui.py --hardware --calibrate
+
 Then open http://127.0.0.1:5000 (or --host/--port) in a browser.
 """
 
@@ -33,6 +38,7 @@ from vision_pipeline.robot_interface.joint_controller import (
     MockJointController,
     ServoJointController,
 )
+from vision_pipeline.robot_interface.matlab_client import MatlabIKClient
 from vision_pipeline.robot_interface.servo_driver import ServoBus
 from vision_pipeline.webui.app import create_app
 
@@ -65,13 +71,38 @@ def main() -> None:
         help="Skip opening a camera; the feed panel shows a placeholder image.",
     )
     parser.add_argument("--overlay", action="store_true", help="Draw red-brick detection overlay on the camera feed.")
+    parser.add_argument(
+        "--calibrate", action="store_true",
+        help="Enable the hand-eye calibration capture panel (needs the MATLAB "
+             "IK/FK server; overrides --overlay with a ChArUco overlay instead).",
+    )
+    parser.add_argument(
+        "--matlab-host", default=config.MATLAB_SERVER_HOST,
+        help="MATLAB IK/FK server host for --calibrate (default: %(default)s).",
+    )
+    parser.add_argument(
+        "--matlab-port", type=int, default=config.MATLAB_SERVER_PORT,
+        help="MATLAB IK/FK server port for --calibrate (default: %(default)s).",
+    )
     parser.add_argument("--host", default=config.WEBUI_HOST, help="Host to bind (default: %(default)s).")
     parser.add_argument("--port", type=int, default=config.WEBUI_PORT, help="Port to bind (default: %(default)s).")
     args = parser.parse_args()
 
     controller = _build_controller(args)
     camera_index = None if args.no_camera else args.camera_index
-    app = create_app(controller, camera_index=camera_index, enable_overlay=args.overlay)
+
+    ik_client = None
+    if args.calibrate:
+        print(f"Connecting to MATLAB IK/FK server on {args.matlab_host}:{args.matlab_port}...")
+        try:
+            ik_client = MatlabIKClient(args.matlab_host, args.matlab_port)
+        except (ConnectionRefusedError, OSError) as e:
+            print(f"Could not connect to the MATLAB server: {e}")
+            print("Start it in MATLAB (matlab/ folder):  >> ik_fk_server")
+            sys.exit(1)
+        print("MATLAB IK/FK server connected. Calibration panel enabled.")
+
+    app = create_app(controller, camera_index=camera_index, enable_overlay=args.overlay, ik_client=ik_client)
 
     print(f"Dashboard at http://{args.host}:{args.port} (Ctrl+C to stop)")
     app.run(host=args.host, port=args.port, threaded=True)

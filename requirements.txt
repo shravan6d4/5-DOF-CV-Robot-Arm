@@ -1,4 +1,11 @@
-opencv-python>=4.8
+# >=4.8 for the modern ChArUco API (CharucoDetector, board.matchImagePoints —
+# see calibration/charuco.py). <5.0 because the 5.0.0.93 wheel on PyPI is
+# missing the cv2.calibrateHandEye Python binding entirely (the
+# CALIB_HAND_EYE_* enum constants are present, the function is not), which
+# calibrate_hand_eye.py and calibration/hand_eye.py both call. Confirmed
+# 4.10.0.84 has both APIs; re-check this bound if a newer 5.x wheel restores
+# the binding.
+opencv-python>=4.8,<5.0
 numpy>=1.24
 pytest>=7.4
 

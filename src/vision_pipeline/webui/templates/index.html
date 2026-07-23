@@ -111,6 +111,41 @@
     padding: 0.5rem 1.25rem;
     font-size: 0.85rem;
   }
+  .calib-panel {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 0.75rem 1rem;
+    flex: 1 1 420px;
+  }
+  .calib-panel h2 { font-size: 1rem; margin: 0 0 0.5rem; }
+  .calib-panel .hint { color: var(--muted); font-size: 0.8rem; margin-bottom: 0.75rem; }
+  .calib-counts {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.4rem;
+    margin-bottom: 0.75rem;
+    font-variant-numeric: tabular-nums;
+  }
+  .calib-counts .board-count {
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 0.2rem 0.5rem;
+    font-size: 0.8rem;
+  }
+  .calib-counts .board-count.solvable { border-color: var(--ok); color: var(--ok); }
+  .calib-actions { display: flex; gap: 0.5rem; margin-bottom: 0.75rem; }
+  .calib-result {
+    white-space: pre-wrap;
+    font-family: ui-monospace, monospace;
+    font-size: 0.78rem;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 0.5rem;
+    max-height: 220px;
+    overflow-y: auto;
+  }
 </style>
 </head>
 <body>
@@ -127,6 +162,22 @@
   <section class="joints-panel">
     <div id="joint-rows"></div>
   </section>
+
+  {% if calibrating %}
+  <section class="calib-panel">
+    <h2>Hand-eye calibration</h2>
+    <div class="hint">
+      Jog joints so a board is visible, then Record Sample. Need
+      {{ min_hand_eye_samples }}+ samples on one board before Solve &amp; Save.
+    </div>
+    <div class="calib-counts" id="calib-counts">no samples yet</div>
+    <div class="calib-actions">
+      <button class="primary" id="calib-record">Record Sample</button>
+      <button id="calib-solve">Solve &amp; Save</button>
+    </div>
+    <div class="calib-result" id="calib-result"></div>
+  </section>
+  {% endif %}
 </main>
 
 <script>
@@ -134,6 +185,8 @@ const NUM_JOINTS = {{ num_joints }};
 const GRIPPER_JOINT_ID = {{ gripper_joint_id }};
 const JOG_DEFAULT_STEP = {{ jog_default_step }};
 const JOG_MAX_STEP = {{ jog_max_step }};
+const CALIBRATING = {{ calibrating | tojson }};
+const MIN_HAND_EYE_SAMPLES = {{ min_hand_eye_samples }};
 // Per-joint calibration constant (degrees per raw tick), keyed by joint id.
 // Used only to preview a jog step's size in degrees - never to move anything.
 const DEGREES_PER_TICK = {{ degrees_per_tick | tojson }};
@@ -259,10 +312,67 @@ async function pollJoints() {
   }
 }
 
+function renderCalibCounts(counts, solvableBoards) {
+  const countsEl = document.getElementById("calib-counts");
+  const entries = Object.entries(counts);
+  if (entries.length === 0) { countsEl.textContent = "no samples yet"; return; }
+  countsEl.innerHTML = entries
+    .map(([idx, n]) => {
+      const solvable = solvableBoards.includes(parseInt(idx, 10));
+      return `<span class="board-count${solvable ? " solvable" : ""}">#${parseInt(idx, 10) + 1}: ${n}/${MIN_HAND_EYE_SAMPLES}</span>`;
+    })
+    .join("");
+}
+
+async function pollCalibSamples() {
+  try {
+    const res = await fetch("/api/calib/samples");
+    const data = await res.json();
+    if (res.ok) renderCalibCounts(data.counts, data.solvable_boards);
+  } catch (e) {
+    // Camera/calibration polling failure shouldn't blank the panel; leave the
+    // last known counts on screen and let the next poll retry.
+  }
+}
+
+async function recordCalibSample() {
+  const resultEl = document.getElementById("calib-result");
+  try {
+    const res = await fetch("/api/calib/sample", { method: "POST" });
+    const data = await res.json();
+    if (!res.ok) { showError(`Record sample failed: ${data.error}`); return; }
+    showError("");
+    resultEl.textContent = `recorded boards ${JSON.stringify(data.recorded_boards)} -> counts ${JSON.stringify(data.counts)}`;
+    pollCalibSamples();
+  } catch (e) {
+    showError(`Record sample request failed: ${e}`);
+  }
+}
+
+async function solveCalibAndSave() {
+  const resultEl = document.getElementById("calib-result");
+  try {
+    const res = await fetch("/api/calib/solve", { method: "POST" });
+    const data = await res.json();
+    if (!res.ok) { showError(`Solve failed: ${data.error}`); return; }
+    showError("");
+    resultEl.textContent = JSON.stringify(data, null, 2);
+  } catch (e) {
+    showError(`Solve request failed: ${e}`);
+  }
+}
+
 buildRows();
 wireControls();
 pollJoints();
 setInterval(pollJoints, 500);
+
+if (CALIBRATING) {
+  document.getElementById("calib-record").addEventListener("click", recordCalibSample);
+  document.getElementById("calib-solve").addEventListener("click", solveCalibAndSave);
+  pollCalibSamples();
+  setInterval(pollCalibSamples, 1000);
+}
 </script>
 </body>
 </html>
