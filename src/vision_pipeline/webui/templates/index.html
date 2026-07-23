@@ -1,0 +1,268 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Arm Observation &amp; Jog UI</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #f5f5f7;
+    --panel: #ffffff;
+    --text: #1a1a1a;
+    --muted: #666;
+    --border: #ddd;
+    --accent: #2563eb;
+    --accent-press: #1d4ed8;
+    --danger: #b91c1c;
+    --ok: #15803d;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #16181d;
+      --panel: #21242b;
+      --text: #eaeaea;
+      --muted: #9aa0a6;
+      --border: #333;
+      --accent: #3b82f6;
+      --accent-press: #2563eb;
+      --danger: #f87171;
+      --ok: #4ade80;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+  }
+  header {
+    padding: 0.75rem 1.25rem;
+    border-bottom: 1px solid var(--border);
+  }
+  header h1 { font-size: 1.1rem; margin: 0; }
+  header .status { font-size: 0.8rem; color: var(--muted); margin-top: 0.15rem; }
+  main {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 1.25rem;
+    padding: 1.25rem;
+    align-items: flex-start;
+  }
+  .camera-panel {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 0.75rem;
+    flex: 1 1 480px;
+    max-width: 100%;
+  }
+  .camera-panel img {
+    width: 100%;
+    max-width: 640px;
+    display: block;
+    border-radius: 6px;
+    background: #000;
+  }
+  .joints-panel {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 0.75rem 1rem;
+    flex: 1 1 420px;
+  }
+  .joint-row {
+    display: grid;
+    grid-template-columns: 3rem 1fr auto;
+    align-items: center;
+    gap: 0.6rem;
+    padding: 0.6rem 0;
+    border-bottom: 1px solid var(--border);
+  }
+  .joint-row:last-child { border-bottom: none; }
+  .joint-label { font-weight: 600; }
+  .joint-readout { font-variant-numeric: tabular-nums; }
+  .joint-readout .ticks { color: var(--muted); font-size: 0.85em; }
+  .jog-controls { display: flex; align-items: center; gap: 0.4rem; }
+  button {
+    font: inherit;
+    border: 1px solid var(--border);
+    background: var(--panel);
+    color: var(--text);
+    border-radius: 6px;
+    padding: 0.35rem 0.7rem;
+    cursor: pointer;
+  }
+  button.primary {
+    background: var(--accent);
+    border-color: var(--accent);
+    color: #fff;
+  }
+  button.primary:active { background: var(--accent-press); }
+  button:disabled { opacity: 0.5; cursor: not-allowed; }
+  .step-slider { display: flex; align-items: center; gap: 0.4rem; grid-column: 1 / -1; }
+  .step-slider input[type=range] { flex: 1; }
+  .step-slider .step-value { width: 3.5rem; text-align: right; font-variant-numeric: tabular-nums; color: var(--muted); }
+  .gripper-row .jog-controls button { min-width: 4.5rem; }
+  #error-banner {
+    display: none;
+    background: #7f1d1d;
+    color: #fff;
+    padding: 0.5rem 1.25rem;
+    font-size: 0.85rem;
+  }
+</style>
+</head>
+<body>
+<div id="error-banner"></div>
+<header>
+  <h1>Arm Observation &amp; Jog UI</h1>
+  <div class="status" id="conn-status">connecting…</div>
+</header>
+<main>
+  <section class="camera-panel">
+    <img src="/video_feed" alt="live camera feed">
+  </section>
+
+  <section class="joints-panel">
+    <div id="joint-rows"></div>
+  </section>
+</main>
+
+<script>
+const NUM_JOINTS = {{ num_joints }};
+const GRIPPER_JOINT_ID = {{ gripper_joint_id }};
+const JOG_DEFAULT_STEP = {{ jog_default_step }};
+const JOG_MAX_STEP = {{ jog_max_step }};
+// Per-joint calibration constant (degrees per raw tick), keyed by joint id.
+// Used only to preview a jog step's size in degrees - never to move anything.
+const DEGREES_PER_TICK = {{ degrees_per_tick | tojson }};
+
+const rowsEl = document.getElementById("joint-rows");
+const statusEl = document.getElementById("conn-status");
+const errorEl = document.getElementById("error-banner");
+
+function stepDegreesLabel(joint, stepTicksValue) {
+  const perTick = Math.abs(DEGREES_PER_TICK[joint] || 0);
+  return `${(perTick * stepTicksValue).toFixed(2)}°`;
+}
+
+// One jog step size (ticks) per joint, independently adjustable.
+const stepTicks = {};
+for (let j = 1; j <= NUM_JOINTS; j++) stepTicks[j] = JOG_DEFAULT_STEP;
+
+function buildRows() {
+  for (let j = 1; j <= NUM_JOINTS; j++) {
+    const isGripper = j === GRIPPER_JOINT_ID;
+    const row = document.createElement("div");
+    row.className = "joint-row" + (isGripper ? " gripper-row" : "");
+    row.id = `joint-row-${j}`;
+    row.innerHTML = `
+      <div class="joint-label">${isGripper ? "J" + j + " (grip)" : "J" + j}</div>
+      <div class="joint-readout" id="readout-${j}">-- &deg; <span class="ticks">(-- ticks)</span></div>
+      <div class="jog-controls">
+        ${isGripper
+          ? `<button data-action="open" data-joint="${j}">Open</button>
+             <button data-action="close" data-joint="${j}">Close</button>`
+          : `<button data-action="jog" data-joint="${j}" data-sign="-1">−</button>
+             <button data-action="jog" data-joint="${j}" data-sign="1">+</button>`
+        }
+      </div>
+      ${isGripper ? "" : `
+      <div class="step-slider">
+        <label for="step-${j}">step</label>
+        <input type="range" id="step-${j}" min="1" max="${JOG_MAX_STEP}" value="${JOG_DEFAULT_STEP}" data-joint="${j}">
+        <span class="step-value" id="step-value-${j}">${JOG_DEFAULT_STEP} ticks (${stepDegreesLabel(j, JOG_DEFAULT_STEP)})</span>
+      </div>`}
+    `;
+    rowsEl.appendChild(row);
+  }
+}
+
+function wireControls() {
+  rowsEl.addEventListener("click", (ev) => {
+    const btn = ev.target.closest("button[data-action]");
+    if (!btn) return;
+    const joint = parseInt(btn.dataset.joint, 10);
+    const action = btn.dataset.action;
+    if (action === "jog") {
+      const sign = parseInt(btn.dataset.sign, 10);
+      jogJoint(joint, sign * stepTicks[joint]);
+    } else if (action === "open") {
+      setGripper(false);
+    } else if (action === "close") {
+      setGripper(true);
+    }
+  });
+
+  rowsEl.addEventListener("input", (ev) => {
+    const slider = ev.target.closest("input[type=range]");
+    if (!slider) return;
+    const joint = parseInt(slider.dataset.joint, 10);
+    stepTicks[joint] = parseInt(slider.value, 10);
+    document.getElementById(`step-value-${joint}`).textContent =
+      `${slider.value} ticks (${stepDegreesLabel(joint, slider.value)})`;
+  });
+}
+
+function showError(msg) {
+  errorEl.textContent = msg;
+  errorEl.style.display = msg ? "block" : "none";
+}
+
+async function jogJoint(joint, deltaTicks) {
+  try {
+    const res = await fetch(`/api/joints/${joint}/jog`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ delta_ticks: deltaTicks }),
+    });
+    const data = await res.json();
+    if (!res.ok) { showError(`J${joint} jog failed: ${data.error}`); return; }
+    showError("");
+    updateRow(data);
+  } catch (e) {
+    showError(`J${joint} jog request failed: ${e}`);
+  }
+}
+
+async function setGripper(closed) {
+  try {
+    const res = await fetch("/api/gripper", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ closed }),
+    });
+    const data = await res.json();
+    if (!res.ok) { showError(`Gripper failed: ${data.error}`); return; }
+    showError("");
+    updateRow(data);
+  } catch (e) {
+    showError(`Gripper request failed: ${e}`);
+  }
+}
+
+function updateRow(state) {
+  const el = document.getElementById(`readout-${state.joint_id}`);
+  if (el) el.innerHTML = `${state.degrees.toFixed(1)}&deg; <span class="ticks">(${state.ticks} ticks)</span>`;
+}
+
+async function pollJoints() {
+  try {
+    const res = await fetch("/api/joints");
+    const data = await res.json();
+    if (!res.ok) { statusEl.textContent = `error: ${data.error}`; return; }
+    data.joints.forEach(updateRow);
+    statusEl.textContent = "connected";
+  } catch (e) {
+    statusEl.textContent = "disconnected — retrying…";
+  }
+}
+
+buildRows();
+wireControls();
+pollJoints();
+setInterval(pollJoints, 500);
+</script>
+</body>
+</html>

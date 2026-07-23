@@ -5,3 +5,6 @@ pytest>=7.4
 # Real-hardware backend (robot_interface/servo_driver.py). Not needed for the
 # vision pipeline or the pytest suite — only for driving the physical arm.
 pyserial>=3.5
+
+# Arm observation/jog web dashboard (scripts/run_arm_ui.py, webui/).
+flask>=3.0

@@ -1,12 +1,15 @@
-# Robotic Arm Vision
+# 5-DOF Robot Arm Vision
 
-Computer vision pipeline for a 6-DOF robotic arm to detect and pick up a single Lego brick.
+Computer vision pipeline (OpenCV, classical CV — no ML) for a **5-DOF** robotic arm that
+picks up a single red Lego brick from a table. The camera is **eye-in-hand** (mounted on
+the arm), so a detected pixel is turned into a robot-base-frame world point using the
+arm's live end-effector pose plus a fixed hand-eye calibration.
 
-Pipeline phases:
-1. **Phase 1** (current): Camera capture + HSV color thresholding + contour detection + centroid.
-2. **Phase 2**: Pixel -> robot world-coordinate calibration.
-3. **Phase 3**: Integration with the arm's control interface.
-4. **Phase 4** (stretch): ML-based detector.
+The full pipeline — detect brick → pixel-to-world → plan a top-down grasp → command the
+arm — runs end-to-end today against a **simulated** robot. What's still a placeholder:
+the camera/hand-eye calibration numbers and the real robot backend's calibration data.
+See [CLAUDE.md](CLAUDE.md) for the full architecture, the data flow, and the merge path
+onto real hardware.
 
 ## Setup
 
@@ -22,36 +25,64 @@ pip install -r requirements.txt
 python -c "import cv2, numpy; print(cv2.__version__)"
 ```
 
-## Project Layout
+There is no build step and no linter configured.
 
-- `src/vision_pipeline/capture/` — webcam frame capture
-- `src/vision_pipeline/detection/` — brick detection (Phase 1). Two stages:
-  `color_detector.py` finds red regions; `lego_detector.py` then verifies each
-  region has Lego *studs* (via `stud_detector.py`) so it only accepts real
-  bricks, not other red objects like a cup or a hand.
-- `src/vision_pipeline/calibration/` — pixel-to-world coordinate mapping (Phase 2, stub for now)
-- `src/vision_pipeline/robot_interface/` — abstract interface for the arm's control code (Phase 3, stub for now)
-- `scripts/` — runnable demos and tools (live detection viewer, HSV tuning tool)
-- `tests/` — unit-style tests, run against static images in `tests/sample_images/`
+## Project layout
+
+- `src/vision_pipeline/capture/` — webcam frame capture (`Camera`)
+- `src/vision_pipeline/detection/` — two-stage brick detection: `color_detector.py` finds
+  red regions; `lego_detector.py` then verifies each region has Lego *studs* (via
+  `stud_detector.py`), so it only accepts real bricks, not other red objects like a cup
+  or a hand
+- `src/vision_pipeline/calibration/` — pixel→world geometry: camera intrinsics, hand-eye
+  transform, ray/plane intersection, and two-view triangulation
+- `src/vision_pipeline/planning/` — turns a located brick into a hover→descend→close→lift
+  grasp sequence
+- `src/vision_pipeline/robot_interface/` — the arm-agnostic `RobotInterface` contract,
+  plus `SimRobot` (in-memory, for testing/demos) and `HardwareRobot` (MATLAB IK/FK +
+  Feetech servo bus, for the real arm)
+- `src/vision_pipeline/webui/` — Flask dashboard for watching the live camera feed and
+  jogging individual joints by hand (hardware bring-up tool)
+- `src/vision_pipeline/pipeline.py` — `PickPipeline`, the class that wires everything
+  above into one detect→locate→grasp flow
+- `scripts/` — runnable demos, calibration tools, and the jog dashboard launcher
+- `matlab/` — the MATLAB IK/FK bridge (`ik_fk_server.m`) for the real arm
+- `tests/` — pytest suite; runs with no camera, robot, or MATLAB server required
+- `data/` — calibration JSON (camera intrinsics, hand-eye, servo calibration); falls back
+  to placeholder values in `config.py` when a file is missing
 
 ## Running things
 
 ```powershell
-# Tune HSV thresholds interactively (needs a webcam or a sample image)
-python scripts/tune_hsv.py
+# Run the test suite (no camera or robot needed)
+pytest
 
-# Run live detection with a webcam
+# Full pick pipeline against the simulated robot
+python scripts/run_pick_demo.py
+python scripts/run_pick_demo.py --image "tests/sample_images/red lego brick 2.jpg"
+python scripts/run_pick_demo.py --camera          # one live frame, still a sim arm
+
+# Live detection viewer (needs a webcam)
 python scripts/run_live_detection.py
 
-# Run tests (works even without a camera, using tests/sample_images/)
-pytest
+# Tune HSV thresholds interactively
+python scripts/tune_hsv.py --image "tests/sample_images/red lego brick 2.jpg"
+
+# Step through tests/sample_images/ showing pass/fail
+python scripts/review_images.py
+
+# Arm observation / jog web dashboard: live camera + per-joint (J1-J6) controls
+python scripts/run_arm_ui.py                # mock joints, no hardware needed
+python scripts/run_arm_ui.py --hardware     # drives the real servo bus
+# then open http://127.0.0.1:5000
 ```
 
 ## Testing without a camera
 
-Drop a photo of a Lego brick on a plain background into `tests/sample_images/` (e.g. `brick1.jpg`)
-and `pytest` will pick it up automatically. Until an image is added there, the detection test is
-skipped with a clear message instead of failing.
+The detection tests are parametrized over photos in `tests/sample_images/`, keyed by the
+`SAMPLE_TRUTH` dict in the test files (`True` = must detect, `False` = must reject).
+Missing files are skipped, not failed, so `pytest` passes with no images present too —
+drop a photo in and add it to `SAMPLE_TRUTH` to add regression coverage.
 
 ## Hardware bring-up log — servo calibration (2026-07-22)
 
@@ -226,3 +257,9 @@ positions rather than assuming the commanded ones were reached.
   hand-eye **drives a full IK-commanded workspace sweep**, so it wants Stage D fully passing first.
 - `TABLE_Z_IN_BASE` is still ruler-to-eye derived (±2 mm). A touch-probe would remove that, but the
   payoff is now small enough that it is not worth a deliberate descent into the tabletop.
+
+## Further reading
+
+[CLAUDE.md](CLAUDE.md) covers the full architecture (the eye-in-hand pixel→world math,
+the robot seam, the MATLAB/servo hardware backend, config tuning) and the merge path for
+plugging in real calibration numbers and a real arm.
