@@ -260,8 +260,21 @@ HAND_EYE_PATH = "data/hand_eye.json"
 
 # Height of the table surface in the base frame. The brick sits on this plane,
 # so the pixel back-projection is intersected with z = TABLE_Z_IN_BASE to place
-# the brick in 3D from a single camera. Measure base-to-tabletop height.
-TABLE_Z_IN_BASE = 0.0
+# the brick in 3D from a single camera.
+#
+# ESTIMATE, not a measurement — good to maybe +/-5mm, replace it with a real one.
+# Derived 2026-07-22: with the arm at home, FK put the claw tip at z = -74.2mm
+# and the operator eyeballed ~10mm of clearance under it, so the tabletop is
+# around -84mm. The previous 0.0 placeholder was wrong by ~84mm, which put every
+# single-view back-projection far enough off that a pick would have closed on
+# empty air well above the brick.
+#
+# To measure it properly (no camera, no calibration needed): hand-position the
+# claw so it just touches the tabletop, read the servos, and run those angles
+# through FK's T_tip -- the tip's z at that moment IS this value. That path
+# depends on ticks_to_rad, so it is only trustworthy now that every joint's
+# dir_sign is settled.
+TABLE_Z_IN_BASE = -0.084
 
 # Where the gripper should end up to grasp, relative to the table surface.
 # Slightly above the table so the fingers close around the brick body rather

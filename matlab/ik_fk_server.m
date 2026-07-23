@@ -140,7 +140,7 @@ function resp = handle_ik_request(x, y, z)
 end
 
 function resp = handle_fk_request(angles_rad)
-    global robot motorIdx homeAngles wristBody
+    global robot motorIdx homeAngles wristBody endEffector
 
     % Build config: start from home, override J1..J5
     cfg = homeConfiguration(robot);
@@ -148,12 +148,21 @@ function resp = handle_fk_request(angles_rad)
         cfg(motorIdx(k)) = angles_rad(k);
     end
 
-    % Get transform of the wrist (Body08, not ClawTip)
-    % The Python side applies hand-eye calibration separately
+    % Two DIFFERENT frames, both needed, ~CLAW_LEN (70mm) apart:
+    %   T     = wrist (Body08) -- what hand-eye calibration is solved against,
+    %           so this is the one the vision pipeline composes with
+    %           T_gripper_camera. Must stay first/unchanged for compatibility.
+    %   T_tip = ClawTip -- what the IK solver actually targets. Round-trip
+    %           validation (command a target, move, read back, compare) has to
+    %           compare against THIS, or it measures a 70mm frame offset
+    %           instead of real positioning error. Estimating it as
+    %           "wrist minus 70mm down" only holds while the claw points
+    %           straight down, which stops being true as the arm tilts.
     T = getTransform(robot, cfg, wristBody);
+    T_tip = getTransform(robot, cfg, endEffector);
 
-    % Return as row-major 16-element array
-    T_flat = reshape(T', 1, 16);
-
-    resp = struct('ok', true, 'T', T_flat);
+    % Return as row-major 16-element arrays
+    resp = struct('ok', true, ...
+                  'T', reshape(T', 1, 16), ...
+                  'T_tip', reshape(T_tip', 1, 16));
 end
