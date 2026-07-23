@@ -137,21 +137,29 @@ on). `physical (x,y,z) = model (x,−y,−z)`. `MatlabIKClient` now converts at 
 Python-side code and scripts speak the physical frame; MATLAB-side code (and the historical
 target names in `test_ik_fk.m` — its "low" is physically high) stay in the model frame.
 
-Corrected reconciliation, physical frame throughout:
+Final values, physical frame throughout, **all confirmed by physical jog except J5**:
 
-| Joint | Anchor evidence | MATLAB `+angle`, physically | Physical `+ticks` | `dir_sign` |
-|---|---|---|---|---|
-| J1 | bring-up log (whole-arm swing, unambiguous) | CCW from above (axis: model −Z = phys. up) | CCW from above | **+1** |
-| J2 | bring-up direction jog (~100–150 ticks) | wrist **up** | shoulder tilts up | **+1** ⚠ |
-| J3 | **table-strike incident** (+jog drove claw into table) | wrist **up** | folds **down** | **−1** |
-| J4 | bring-up jog, operator on the LEFT (looking along the phys.-right axis) | appears CW from the left | CCW from the left | **−1** |
-| J5 | none usable | (tip sits on J5's axis — position-irrelevant) | — | +1 nominal, unconfirmed |
+| Joint | `dir_sign` | Status | Notes |
+|---|---|---|---|
+| J1 | **+1** | confirmed by jog | derivation agreed |
+| J2 | **−1** | confirmed by jog ×2 | **derivation said +1 and was wrong** |
+| J3 | **−1** | derivation only | anchored by the table-strike incident (`+ticks` physically drove the claw *down* into the table) |
+| J4 | **−1** | confirmed by jog | derivation agreed; first jog attempt was void (see below) |
+| J5 | +1 | **unconfirmed** | position-irrelevant: the tip sits on J5's axis, so its sign affects claw *roll* only, which the 5-DOF position-only pipeline drops |
 
-⚠ J2 carries a known conflict: a small (~3.5 mm), primed jog later in the session read the
-opposite way. The larger dedicated bring-up jog + the desk method (validated on J3 by the
-incident) won, but **a fresh, larger, physically-worded confirm jog for J1/J2/J4 is required
-before the first IK-driven move.** J5 is deliberately left unconfirmed: the claw tip sits on its
-rotation axis, so its sign affects claw roll only — which the 5-DOF position-only pipeline drops.
+**J2 is the cautionary one.** The desk derivation concluded `+1` — MATLAB's `+angle` moves the
+wrist physically up, and the bring-up log recorded `+ticks` = shoulder tilts up. Two independent
+physical jogs both showed the arm moving *down*. Either the bring-up note was taken from a
+different vantage, or the derivation chain has an error not yet isolated. Physical evidence won;
+the wrong derivation is recorded rather than quietly deleted, because it's the one that would
+otherwise be re-derived the same way next time.
+
+**J4's first confirm jog was void by construction**, worth knowing before trusting any future jog:
+`jog_joint.py` predicted **wrist** motion while the operator naturally watched the **claw**. For
+the big arm joints those move together, but J4 is wrist pitch — the wrist sits near its own
+rotation axis and barely translates (~4.5 mm, lateral) while the tip swings ~70 mm out on the
+lever (~8.5 mm, vertical). The prediction and the observation described different axes. The script
+now predicts **claw-tip** motion and flags when wrist and claw diverge; the re-run matched.
 
 **Two driver bugs found and fixed during this work:**
 - `move_and_verify()` read back position *immediately* after commanding a move, catching the servo
@@ -166,7 +174,6 @@ rotation axis, so its sign affects claw roll only — which the 5-DOF position-o
   driving toward its target regardless of whether our verification read succeeds.
 
 **Outstanding before the MATLAB-driven pipeline (`HardwareRobot`) drives the arm for real:**
-- **Confirm jogs for J1/J2/J4** (`scripts/jog_joint.py`, predictions now physically worded), then
 - **Stage D — IK round-trip validation.** `dir_sign` being correct only settles *direction*;
   `ticks_per_rad`, backlash, and overall model fit are still unvalidated against physical reality.
   Command a target → IK → move → read back → FK, and compare against a ruler.

@@ -111,16 +111,31 @@ def read_angles(bus) -> dict:
 
 
 def predict(client, state, joint, target_tick, bus):
-    """FK before/after the proposed jog. Returns (T0, T1, p0_mm, p1_mm, delta_mm)."""
+    """FK before/after the proposed jog, for BOTH the wrist and the claw tip.
+
+    Predicting the CLAW TIP matters: the operator watches the claw, which is
+    the visually salient part, but the wrist is what request_fk reports. For
+    the big arm joints (J1-J3) the two move together and it makes no
+    difference. For the WRIST joints they diverge badly -- J4 pitches the
+    wrist almost about its own axis, so the wrist barely translates while the
+    tip swings ~70mm out on the lever, and J5 rolls the wrist with the tip on
+    its axis. Comparing a wrist-based prediction against a claw observation
+    for those joints produces a mismatched comparison, not a result. (J4's
+    first confirm jog was wasted exactly this way.)
+
+    Returns (T0_wrist, T1_wrist, tip0_mm, tip1_mm, tip_delta_mm, wrist_delta_mm).
+    """
     angles_now = [state[j]["rad"] for j in IK_JOINTS]
     angles_after = list(angles_now)
     angles_after[joint - 1] = bus.ticks_to_rad(joint, target_tick)
 
-    T0 = client.request_fk(angles_now)
-    T1 = client.request_fk(angles_after)
-    p0 = 1000 * T0[:3, 3]
-    p1 = 1000 * T1[:3, 3]
-    return T0, T1, p0, p1, p1 - p0
+    T0, T0_tip = client.request_fk_tip(angles_now)
+    T1, T1_tip = client.request_fk_tip(angles_after)
+
+    tip0 = 1000 * T0_tip[:3, 3]
+    tip1 = 1000 * T1_tip[:3, 3]
+    wrist_delta = 1000 * (T1[:3, 3] - T0[:3, 3])
+    return T0, T1, tip0, tip1, tip1 - tip0, wrist_delta
 
 
 def apply_flip(joint: int) -> None:
@@ -182,24 +197,32 @@ def main() -> None:
             sys.exit(1)
 
         cal = bus._cal(joint)
-        T0, T1, p0, p1, d = predict(client, state, joint, target_tick, bus)
+        T0, T1, p0, p1, d, wrist_d = predict(client, state, joint, target_tick, bus)
         travel_mm = float(np.linalg.norm(d))
         rot_desc, rot_deg = describe_rotation(T0[:3, :3], T1[:3, :3])
 
         print(f"\nJ{joint} jog:  {start_tick} -> {target_tick} ticks "
               f"({args.ticks:+d}, dir_sign {cal['dir_sign']:+d})")
-        print(f"  wrist now:       ({p0[0]:+7.1f}, {p0[1]:+7.1f}, {p0[2]:+7.1f}) mm")
-        print(f"  wrist predicted: ({p1[0]:+7.1f}, {p1[1]:+7.1f}, {p1[2]:+7.1f}) mm")
+        print(f"  CLAW TIP now:       ({p0[0]:+7.1f}, {p0[1]:+7.1f}, {p0[2]:+7.1f}) mm")
+        print(f"  CLAW TIP predicted: ({p1[0]:+7.1f}, {p1[1]:+7.1f}, {p1[2]:+7.1f}) mm")
 
-        # A joint that only spins the wrist (J5) moves the origin ~nowhere, so
-        # fall back to describing the rotation the operator can actually see.
+        # A joint whose axis passes through the tip (J5 roll) barely moves it,
+        # so fall back to describing the rotation the operator can still see.
         watch_rotation = travel_mm < MIN_VISIBLE_MM
         if watch_rotation:
             prediction = f"the claw should ROTATE {rot_desc}"
         else:
-            prediction = f"the wrist should move {describe_motion(d)}"
+            prediction = f"the CLAW should move {describe_motion(d)}"
         print(f"\n  PREDICTION: {prediction}")
-        print(f"              (wrist travel {travel_mm:.1f} mm, rotation {rot_deg:.1f} deg)")
+        print(f"              (claw travel {travel_mm:.1f} mm, rotation {rot_deg:.1f} deg)")
+
+        # For the wrist joints the wrist and the claw genuinely go different
+        # ways; surface that rather than letting the operator reconcile a
+        # claw observation against a wrist number in their head.
+        wrist_travel = float(np.linalg.norm(wrist_d))
+        if wrist_travel >= 0.5 and describe_motion(wrist_d) != describe_motion(d):
+            print(f"  (the WRIST meanwhile moves {describe_motion(wrist_d)} — "
+                  f"watch the CLAW, not the wrist)")
 
         if travel_mm < MIN_VISIBLE_MM and rot_deg < MIN_VISIBLE_DEG:
             print(f"\n  Under {MIN_VISIBLE_MM} mm and {MIN_VISIBLE_DEG} deg — too small")
@@ -208,9 +231,10 @@ def main() -> None:
             sys.exit(1)
 
         # --- table clearance guard --------------------------------------
-        # The claw tip hangs ~CLAW_LEN below the wrist, so downward wrist
-        # motion eats the gap under the claw. J3 folding down into the table
-        # is the near-miss that already happened once during bring-up.
+        # `d` is CLAW TIP motion, which is what actually closes the gap to the
+        # table -- the tip is the lowest part and the thing that would strike.
+        # (J3 folding the claw down into the table is the near-miss that
+        # already happened once during bring-up.)
         descent_mm = -min(0.0, d[2])
         if descent_mm > 0:
             usable = args.clearance_mm - CLEARANCE_MARGIN_MM

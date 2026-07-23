@@ -356,24 +356,31 @@ SERVO_CALIBRATION_PATH = "data/servo_calibration.json"
 # physically RIGHT). An earlier pass reconciled these while interpreting model
 # axes as physical ("viewed from above", etc.), which silently inverted every
 # frame-based conclusion. Corrected derivations, physical frame throughout:
-#   J1 = +1: MATLAB +angle rotates about model -Z = physically UP -> CCW seen
-#       from above. Bring-up log: +ticks = CCW from above. Same sense.
-#       (Previous -1 was the frame error. Never physically jogged — cheap
-#       confirm jog recommended before the first IK-driven move.)
-#   J2 = +1: MATLAB +angle moves the wrist model-down = physically UP.
-#       Bring-up log (dedicated ~100-150-tick direction jog): +ticks tilts the
-#       shoulder UP. Same sense. CONFLICT NOTE: a small (~3.5mm) jog this
-#       session read the opposite; it was primed ("should move up") and half
-#       the size of the bring-up motion, so the bring-up record + the desk
-#       method (validated on J3 by the incident, below) win. A larger confirm
-#       jog is REQUIRED before any IK-driven move.
+#   J1 = +1: CONFIRMED BY JOG 2026-07-22. Derivation agreed: MATLAB +angle
+#       rotates about model -Z = physically UP -> CCW seen from above, matching
+#       the bring-up log's +ticks = CCW from above. (An earlier -1 came from
+#       the frame error, before the flip was understood.)
+#   J2 = -1: CONFIRMED BY JOG 2026-07-22. The desk derivation said +1 (MATLAB
+#       +angle moves the wrist physically UP, and the bring-up log recorded
+#       +ticks = shoulder tilts up), but two independent physical jogs both
+#       showed the arm moving DOWN for a predicted-up move. Physical evidence
+#       beats the derivation: either the bring-up log's "tilts up" was recorded
+#       from a different vantage, or the desk chain has an error we have not
+#       isolated. J2 is a shoulder joint, so wrist and claw swing together and
+#       the observation is unambiguous.
 #   J3 = -1: MATLAB +angle moves the wrist model-down = physically UP. The
 #       bring-up table-strike incident is the anchor: commanding +ticks
 #       physically drove the claw DOWN into the table. Opposite senses.
-#   J4 = -1: MATLAB +angle rotates about model +Y = a physically RIGHT-pointing
-#       axis; viewed from the operator's confirmed vantage (the LEFT side,
-#       looking along that axis) +angle appears CW. Bring-up: +ticks = CCW from
-#       the left. Opposite senses.
+#   J4 = -1: CONFIRMED BY JOG 2026-07-22, on the second attempt. The first
+#       confirm jog was inconclusive-by-construction: jog_joint.py predicted
+#       WRIST motion while the operator watched the CLAW, and J4 is wrist
+#       pitch — the wrist sits near its own rotation axis and barely
+#       translates while the tip swings ~70mm out on the lever, so the two
+#       describe different directions. The script now predicts claw-tip
+#       motion; the re-run matched. Derivation agreed: MATLAB +angle rotates
+#       about model +Y = a physically RIGHT-pointing axis, which viewed from
+#       the operator's vantage (the LEFT side) appears CW, against the
+#       bring-up log's +ticks = CCW from the left.
 #   J5 = +1 (nominal, direction UNCONFIRMED): the one jog "confirmation" was
 #       against a model-frame description, so its physical sense is
 #       contaminated. Deliberately deprioritized: the claw tip sits on J5's
@@ -388,7 +395,7 @@ SERVO_CALIBRATION_PATH = "data/servo_calibration.json"
 SERVO_CALIBRATION_FALLBACK = {
     "1": {"home_tick": 2048, "ticks_per_rad": 651.89, "dir_sign": 1,
           "home_angle_rad": 0.0},                                          # J1
-    "2": {"home_tick": 1365, "ticks_per_rad": 651.89, "dir_sign": 1,
+    "2": {"home_tick": 1365, "ticks_per_rad": 651.89, "dir_sign": -1,
           "home_angle_rad": 0.0},                                          # J2
     "3": {"home_tick": 2048, "ticks_per_rad": 651.89, "dir_sign": -1,
           "home_angle_rad": 0.0},                                          # J3

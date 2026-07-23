@@ -300,36 +300,34 @@ def test_rad_ticks_roundtrip_is_exact_across_joints(monkeypatch):
 # and settled on the exact opposite signs for J1-J4; these tests pin the
 # corrected set so neither the frame error nor the old values can drift back.
 
-def test_j1_dir_sign_positive_frame_corrected_2026_07_22(monkeypatch):
-    """J1 dir_sign is +1.
+def test_j1_dir_sign_positive_confirmed_by_jog_2026_07_22(monkeypatch):
+    """J1 dir_sign is +1, confirmed by physical jog.
 
-    MATLAB's +angle rotates about model -Z = physically UP -> CCW seen from
-    above (right-hand rule). Bring-up log: +ticks = CCW from above. Same
-    sense -> +1. (An earlier -1 came from reading model -Z as physically
-    down.) J1 has never been physically jogged under this value — a cheap
-    confirm jog is recommended before the first IK-driven move.
+    Derivation agreed: MATLAB's +angle rotates about model -Z = physically UP
+    -> CCW seen from above (right-hand rule), matching the bring-up log's
+    +ticks = CCW from above. An earlier -1 came from reading model -Z as
+    physically down, before the model/physical frame flip was understood.
     """
     bus = _bus(monkeypatch, FakeServoSerial())
     assert bus._cal(1)["dir_sign"] == 1
 
 
-def test_j2_dir_sign_positive_frame_corrected_2026_07_22(monkeypatch):
-    """J2 dir_sign is +1.
+def test_j2_dir_sign_negative_confirmed_by_jog_2026_07_22(monkeypatch):
+    """J2 dir_sign is -1, established by physical jog over a desk derivation.
 
-    MATLAB's +angle moves the wrist model-down = physically UP; the bring-up
-    log's dedicated ~100-150-tick direction jog recorded +ticks = shoulder
-    tilts UP. Same sense -> +1.
+    The derivation argued +1: MATLAB's +angle moves the wrist physically UP,
+    and the bring-up log recorded +ticks = shoulder tilts up. But TWO
+    independent jogs (a small one, then a deliberate 80-tick confirm) both
+    showed the arm moving DOWN when the script predicted up.
 
-    Known conflict, resolved deliberately: a ~3.5mm jog this session read the
-    opposite direction. It was half the size, and the operator had been told
-    "should move up" beforehand (priming). The bring-up record + the desk
-    method (independently validated on J3 by the table-strike incident) win.
-    A larger, physically-worded confirm jog is REQUIRED before IK moves; if
-    it contradicts this, flip the value AND this test together with the
-    physical evidence in hand.
+    Physical evidence wins. J2 is a shoulder joint, so the wrist and the claw
+    swing together -- unlike the wrist joints (J4/J5), where what the operator
+    watches and what the prediction describes can diverge -- which makes this
+    observation unambiguous. Either the bring-up "tilts up" was recorded from
+    a different vantage, or the desk chain has an error not yet isolated.
     """
     bus = _bus(monkeypatch, FakeServoSerial())
-    assert bus._cal(2)["dir_sign"] == 1
+    assert bus._cal(2)["dir_sign"] == -1
 
 
 def test_j3_dir_sign_negative_frame_corrected_2026_07_22(monkeypatch):
@@ -344,14 +342,20 @@ def test_j3_dir_sign_negative_frame_corrected_2026_07_22(monkeypatch):
     assert bus._cal(3)["dir_sign"] == -1
 
 
-def test_j4_dir_sign_negative_frame_corrected_2026_07_22(monkeypatch):
-    """J4 dir_sign is -1.
+def test_j4_dir_sign_negative_confirmed_by_jog_2026_07_22(monkeypatch):
+    """J4 dir_sign is -1, confirmed by physical jog on the second attempt.
 
-    J4's axis is model +Y = a physically RIGHT-pointing axis. The operator
-    observed from the LEFT side (confirmed vantage), i.e. looking along that
-    axis — from there MATLAB's +angle appears CW. Bring-up: +ticks = CCW from
-    the left. Opposite senses -> -1. (The earlier +1 treated model +Y as
-    physically left.)
+    The first confirm jog was inconclusive by construction: jog_joint.py
+    predicted WRIST motion while the operator watched the CLAW. J4 is wrist
+    pitch, so the wrist sits near its own rotation axis and barely translates
+    (~4.5mm, mostly lateral) while the tip swings ~70mm out on the lever
+    (~8.5mm, mostly vertical) — the two describe different axes, so the
+    comparison could not resolve anything. jog_joint.py now predicts claw-tip
+    motion and the re-run matched.
+
+    Derivation agreed: J4's axis is model +Y = a physically RIGHT-pointing
+    axis; from the operator's LEFT-side vantage MATLAB's +angle appears CW,
+    against the bring-up log's +ticks = CCW from the left.
     """
     bus = _bus(monkeypatch, FakeServoSerial())
     assert bus._cal(4)["dir_sign"] == -1
