@@ -44,7 +44,6 @@ from vision_pipeline.robot_interface.servo_driver import ServoBus
 JOINTS = range(1, 7)
 IK_JOINTS = range(1, 6)  # J1..J5; J6 is the gripper and never goes through MATLAB
 
-CLAW_LEN_MM = 70.06  # ClawTip offset from the wrist (Body08), from init_arm.m
 
 # A reading that swings more than this at rest is not sensor noise.
 STABLE_SPREAD_TICKS = 3
@@ -155,18 +154,24 @@ def check_fk(bus, medians) -> None:
         print("      Start it in MATLAB (matlab/ folder):  >> ik_fk_server")
         return
 
-    with client:
-        T = client.request_fk(angles_rad)
+    try:
+        with client:
+            T, T_tip = client.request_fk_tip(angles_rad)
+    except RuntimeError as e:
+        print(f"    SKIP: {e}")
+        return
 
     p = T[:3, 3]
+    tip = T_tip[:3, 3]
     print(f"      FK wrist position: "
           f"x={1000*p[0]:+7.1f}  y={1000*p[1]:+7.1f}  z={1000*p[2]:+7.1f}  mm")
-    # The claw tip sits CLAW_LEN beyond the wrist along a fixed local direction.
-    # At home the wrist frame is ~aligned with the base and the claw hangs down,
-    # so this is a good estimate of the part you can actually see and measure.
-    tip_z = 1000 * p[2] - CLAW_LEN_MM
-    print(f"      claw tip (est, claw hanging down): "
-          f"x={1000*p[0]:+7.1f}  y={1000*p[1]:+7.1f}  z={tip_z:+7.1f}  mm")
+    # Ask the server for the real ClawTip rather than assuming it hangs
+    # CLAW_LEN below the wrist. It does NOT: near home the tip sits ~67mm
+    # ABOVE the wrist and behind it. That bad assumption previously produced a
+    # table-height estimate wrong by ~137mm, in the wrong direction.
+    print(f"      FK claw tip:       "
+          f"x={1000*tip[0]:+7.1f}  y={1000*tip[1]:+7.1f}  z={1000*tip[2]:+7.1f}  mm")
+    tip_z = 1000 * tip[2]
     print()
     print("    ACTION: compare against the physical arm. The WRIST is Body08 —")
     print("      the joint J5 turns; the claw tip is ~70 mm beyond it.")

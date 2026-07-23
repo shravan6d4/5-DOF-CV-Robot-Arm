@@ -263,18 +263,25 @@ HAND_EYE_PATH = "data/hand_eye.json"
 # the brick in 3D from a single camera.
 #
 # ESTIMATE, not a measurement — good to maybe +/-5mm, replace it with a real one.
-# Derived 2026-07-22: with the arm at home, FK put the claw tip at z = -74.2mm
-# and the operator eyeballed ~10mm of clearance under it, so the tabletop is
-# around -84mm. The previous 0.0 placeholder was wrong by ~84mm, which put every
-# single-view back-projection far enough off that a pick would have closed on
-# empty air well above the brick.
+# Derived 2026-07-22 from the FK server's ClawTip transform: with the arm near
+# home the tip reads z = +62.9mm, and the operator eyeballed ~10mm of clearance
+# beneath it, putting the tabletop around +53mm.
+#
+# The tip sits ABOVE the base-frame origin here, which is not obvious: at this
+# arm's home pose the claw does NOT hang below the wrist. FK reports the wrist
+# at z = -4.1mm and the tip at z = +62.9mm — roughly 67mm HIGHER, and behind it.
+# An earlier value of -0.084 came from assuming "tip = wrist - CLAW_LEN" before
+# T_tip existed to check against; that was wrong by ~137mm and in the wrong
+# direction. Do not reintroduce that assumption — ask the server for T_tip.
+# (+Z is up, confirmed independently by matlab/test_ik_fk.m's target naming:
+# its "fwd-high" target is at z=0 while "low" is at z=-0.160.)
 #
 # To measure it properly (no camera, no calibration needed): hand-position the
 # claw so it just touches the tabletop, read the servos, and run those angles
 # through FK's T_tip -- the tip's z at that moment IS this value. That path
 # depends on ticks_to_rad, so it is only trustworthy now that every joint's
 # dir_sign is settled.
-TABLE_Z_IN_BASE = -0.084
+TABLE_Z_IN_BASE = 0.053
 
 # Where the gripper should end up to grasp, relative to the table surface.
 # Slightly above the table so the fingers close around the brick body rather
