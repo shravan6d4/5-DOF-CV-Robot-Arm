@@ -6,20 +6,21 @@ distortion), replacing the rough placeholders in config.py. Every world coordina
 downstream inherits this, and hand-eye calibration (step 2) needs it to already be
 accurate — so run this FIRST.
 
-No arm needed — just the camera. First generate the board (writes data/charuco_board.png
-using the geometry in config.py's CALIB_* constants):
+No arm needed — just the camera. First generate the boards (writes
+data/charuco_board_1.png .. _N.png using the geometry in config.py's CALIB_* constants):
 
     python scripts/generate_charuco_board.py
 
-Print it, mount it FLAT and rigid (tape to cardboard/acrylic), then:
+Print them, mount FLAT and rigid (tape to cardboard/acrylic), then:
 
     python scripts/calibrate_camera_intrinsics.py
 
-Hold the board at many angles/distances/positions filling the frame; the overlay turns
-on when corners are found. Because this is ChArUco (not a plain chessboard), the board
-does NOT need to be fully in frame — partial/angled views still contribute a valid
-sample, as long as at least CALIB_CHARUCO_MIN_CORNERS corners are seen. Press 'c' to
-capture that view (aim for 15-20 spread across the image, plus close-up/far/corner
+Every board is detected independently, so laying several in the frame at once banks
+several views per 'c' press. Hold them at many angles/distances/positions; the overlay
+turns on when corners are found. Because this is ChArUco (not a plain chessboard), a
+board does NOT need to be fully in frame — partial/angled views still contribute a
+valid sample, as long as at least CALIB_CHARUCO_MIN_CORNERS corners are seen. Press 'c'
+to capture (aim for 15-20 views spread across the image, plus close-up/far/corner
 positions), 'q' to finish and compute. A good result prints a reprojection error under
 ~1 px.
 """
@@ -34,25 +35,12 @@ import cv2
 import numpy as np
 
 from vision_pipeline import config
+from vision_pipeline.calibration import charuco
 from vision_pipeline.calibration.camera_model import CameraIntrinsics, save_intrinsics
 from vision_pipeline.capture.camera import Camera
 
 MIN_SAMPLES = config.CALIB_INTRINSICS_MIN_SAMPLES
 MIN_CORNERS = config.CALIB_CHARUCO_MIN_CORNERS
-
-
-def _build_board_and_detector():
-    """Build the ChArUco board + detector from config.py's geometry — the SAME
-    values scripts/generate_charuco_board.py used to render the printed board.
-    A mismatch here would silently miscalibrate, not just fail to detect."""
-    dictionary = cv2.aruco.getPredefinedDictionary(getattr(cv2.aruco, config.CALIB_ARUCO_DICT))
-    board = cv2.aruco.CharucoBoard(
-        (config.CALIB_CHARUCO_SQUARES_X, config.CALIB_CHARUCO_SQUARES_Y),
-        config.CALIB_SQUARE_SIZE_M,
-        config.CALIB_MARKER_SIZE_M,
-        dictionary,
-    )
-    return board, cv2.aruco.CharucoDetector(board)
 
 
 def main() -> None:
@@ -64,17 +52,20 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    board, detector = _build_board_and_detector()
+    detectors = charuco.build_detectors()
     obj_points: list[np.ndarray] = []
     img_points: list[np.ndarray] = []
     image_size: tuple[int, int] | None = None
 
     print(
-        f"ChArUco board: {config.CALIB_CHARUCO_SQUARES_X}x{config.CALIB_CHARUCO_SQUARES_Y} "
-        f"squares, {config.CALIB_SQUARE_SIZE_M*1000:.1f} mm squares "
-        f"({config.CALIB_ARUCO_DICT}). Partial views are OK — full board not required."
+        f"{config.CALIB_BOARD_COUNT} distinct ChArUco boards, "
+        f"{config.CALIB_CHARUCO_SQUARES_X}x{config.CALIB_CHARUCO_SQUARES_Y} squares @ "
+        f"{config.CALIB_SQUARE_SIZE_M*1000:.1f} mm ({config.CALIB_ARUCO_DICT}). "
+        f"Partial views are OK — full board not required."
     )
-    print("Fill the frame at varied angles/distances. 'c' = capture a view, 'q' = finish & compute.")
+    print("Every board visible in a frame contributes its OWN view, so one 'c' on a")
+    print("frame showing three boards banks three views.")
+    print("Vary angles/distances. 'c' = capture, 'q' = finish & compute.")
 
     with Camera(camera_index=args.camera_index) as camera:
         while True:
@@ -82,20 +73,40 @@ def main() -> None:
             gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
             image_size = (gray.shape[1], gray.shape[0])  # (width, height)
 
-            charuco_corners, charuco_ids, marker_corners, marker_ids = detector.detectBoard(gray)
-            n_corners = 0 if charuco_corners is None else len(charuco_corners)
-            usable = charuco_corners is not None and n_corners >= MIN_CORNERS
+            # Run every board's detector over the frame. Each board owns a
+            # disjoint slice of the dictionary, so a detector only ever matches
+            # its own board and several tiled boards can be resolved at once.
+            # Each detected board is an INDEPENDENT view for calibrateCamera:
+            # its object points are expressed in its own board frame, and the
+            # solver estimates a separate pose per view anyway, so nothing
+            # needs to know how the boards are laid out relative to each other.
+            # That is what makes tiling safe here — no sub-mm seam alignment
+            # between sheets is required.
+            found: list[tuple[int, np.ndarray, np.ndarray]] = []
+            for idx, _b, det in detectors:
+                corners, ids = charuco.detect(det, gray)
+                if corners is not None and len(corners) >= MIN_CORNERS:
+                    found.append((idx, corners, ids))
 
+            n_corners = sum(len(c) for _, c, _ in found)
+            usable = bool(found)
+
+            # The overlay is cosmetic, so it must never be able to end the
+            # session — losing 18 captured views to a drawing quirk on one
+            # blurry frame would be an absurd way to fail. Draw defensively
+            # and carry on; `usable` above is what actually gates capture.
             display = frame.copy()
-            if marker_ids is not None and len(marker_ids) > 0:
-                cv2.aruco.drawDetectedMarkers(display, marker_corners, marker_ids)
-            if charuco_corners is not None and len(charuco_corners) > 0:
-                cv2.aruco.drawDetectedCornersCharuco(display, charuco_corners, charuco_ids)
+            for _idx, corners, ids in found:
+                try:
+                    cv2.aruco.drawDetectedCornersCharuco(display, corners, ids)
+                except cv2.error:
+                    pass
+            labels = ",".join(f"#{i+1}" for i, _, _ in found) if found else "none"
             cv2.putText(
                 display,
-                f"corners: {n_corners} (need {MIN_CORNERS})  captured: {len(obj_points)}/{MIN_SAMPLES}"
-                "  (c=capture q=finish)",
-                (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6,
+                f"boards: {labels}  corners: {n_corners}  "
+                f"captured: {len(obj_points)}/{MIN_SAMPLES}  (c=capture q=finish)",
+                (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.55,
                 (0, 255, 0) if usable else (0, 0, 255), 2,
             )
             cv2.imshow("Intrinsics calibration", display)
@@ -103,12 +114,25 @@ def main() -> None:
             key = cv2.waitKey(1) & 0xFF
             if key == ord("c"):
                 if not usable:
-                    print(f"  only {n_corners} corners (< {MIN_CORNERS}) — not captured.")
+                    print(f"  no board with at least {MIN_CORNERS} corners — not captured.")
                 else:
-                    obj_pts, img_pts = board.matchImagePoints(charuco_corners, charuco_ids)
-                    obj_points.append(obj_pts)
-                    img_points.append(img_pts)
-                    print(f"  captured view {len(obj_points)} ({n_corners} corners).")
+                    for idx, corners, ids in found:
+                        # Append only if BOTH succeed. obj_points and img_points
+                        # are positionally paired — calibrateCamera reads index i
+                        # of each as the same view — so a half-completed append
+                        # would shift every later pair by one and misalign the
+                        # whole set.
+                        board = detectors[idx][1]
+                        try:
+                            obj_pts, img_pts = board.matchImagePoints(corners, ids)
+                        except cv2.error as e:
+                            print(f"  board #{idx+1} rejected: matchImagePoints "
+                                  f"failed ({e.err.strip()}).")
+                            continue
+                        obj_points.append(obj_pts)
+                        img_points.append(img_pts)
+                        print(f"  captured view {len(obj_points)} "
+                              f"from board #{idx+1} ({len(corners)} corners).")
             elif key == ord("q"):
                 break
 

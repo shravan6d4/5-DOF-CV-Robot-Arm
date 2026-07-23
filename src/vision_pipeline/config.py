@@ -9,9 +9,19 @@ touching any detection code.
 
 # --- Camera settings -------------------------------------------------------
 
-# Which camera OpenCV should open. 0 is usually the default/built-in webcam.
-# If you have multiple cameras plugged in, try 1, 2, etc.
-CAMERA_INDEX = 0
+# Which camera OpenCV should open. This machine enumerates THREE devices and
+# only one of them is the arm's eye-in-hand camera:
+#     0 = "EOS Webcam Utility"  (virtual; present even with no Canon attached)
+#     1 = "NexiGo N930AF"       <-- the real eye-in-hand camera
+#     2 = "OBS Virtual Camera"  (virtual)
+# The two virtual devices open successfully and return frames (a branded
+# placeholder image), so a wrong index does NOT fail loudly — it silently
+# calibrates or detects against a static graphic. If anything here behaves
+# strangely, confirm the index first.
+#
+# Indices can shift if USB devices are re-plugged. To re-identify, open each
+# index and look at the frame rather than trusting the number.
+CAMERA_INDEX = 1
 
 # Requested capture resolution. The camera may ignore this and use its own
 # default if the exact size isn't supported.
@@ -515,10 +525,35 @@ WEBUI_PORT = 5000
 #     corrupts the samples that touch it) — for now, one single-sheet board is
 #     the simplest and safest, and ChArUco's partial-view tolerance means it
 #     doesn't need to be physically large to work across many arm poses.
-CALIB_ARUCO_DICT = "DICT_5X5_100"   # cv2.aruco.DICT_5X5_100 — 100 unique markers
+# DICT_5X5_250, not _100, purely for marker budget: a 10x6 board consumes 30
+# markers and CALIB_BOARD_COUNT boards must not share any, so 6 boards need
+# 180. OpenCV's predefined dictionaries are nested by prefix — the first 100
+# markers of _250 ARE _100 — so board 0 renders byte-identical to a board made
+# against the old dictionary, and an existing printout of it stays valid.
+CALIB_ARUCO_DICT = "DICT_5X5_250"   # 250 unique markers; see charuco.check_dictionary_capacity
 CALIB_CHARUCO_SQUARES_X = 10        # squares across (NOT internal corners)
 CALIB_CHARUCO_SQUARES_Y = 6         # squares down
-CALIB_SQUARE_SIZE_M = 0.0267        # 26.7 mm — MEASURED off the actual printout (nominal was 25mm)
+
+# How many DISTINCT boards exist. Each takes its own slice of the dictionary
+# (board i uses IDs i*30..i*30+29) so several can be tiled in view at once and
+# still be told apart. Printing one board N times instead is a silent failure
+# mode, not a shortcut: duplicate IDs make a marker's board membership
+# ambiguous, and the detector answers with mismatched corner/ID arrays or with
+# nothing — neither of which says "you printed the wrong thing".
+CALIB_BOARD_COUNT = 6
+
+# TWO square sizes, and using the wrong one scales every distance the camera
+# reports:
+#   * _M is what physically exists — ruler-measured across a run of squares on
+#     the actual printout. Detection and pose solving use this.
+#   * _NOMINAL_M is what the generator ASKS the printer for. The printer adds
+#     its own scale factor (here ~6.8%: 25mm asked, 26.7mm delivered), so
+#     rendering at the measured size would apply that factor a SECOND time and
+#     the next print would come out at ~28.5mm while config still claimed 26.7.
+# Re-measure after any print and update _M; leave _NOMINAL_M alone unless you
+# deliberately want a different physical size.
+CALIB_SQUARE_SIZE_M = 0.0267        # 26.7 mm — MEASURED off the actual printout
+CALIB_SQUARE_SIZE_NOMINAL_M = 0.025  # 25 mm — what the renderer targets
 CALIB_MARKER_SIZE_M = 0.0192        # 19.2 mm — scaled by the same print factor (kept at 18/25 of square size)
 CALIB_CHARUCO_MIN_CORNERS = 6       # min detected corners in a frame to accept it (>=4 needed for solvePnP)
 CALIB_INTRINSICS_MIN_SAMPLES = 15   # min board captures before intrinsics calibration
