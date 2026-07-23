@@ -392,7 +392,9 @@ class ServoBus:
         target_ticks = max(self.TICK_MIN, min(self.TICK_MAX, int(target_ticks)))
 
         # --- safety gate: refuse before writing anything to the bus ---------
-        start_ticks = self.read_position(servo_id)
+        # Retrying here is free: nothing has been committed yet, so a transient
+        # read glitch shouldn't abort an otherwise-fine move attempt.
+        start_ticks = self._read_position_retrying(servo_id)
         delta = abs(target_ticks - start_ticks)
         if delta > max_delta_ticks:
             raise ServoSafetyError(
@@ -424,6 +426,23 @@ class ServoBus:
             )
         return present_ticks
 
+    def _read_position_retrying(self, servo_id: int) -> int:
+        """read_position, absorbing up to SERVO_MOVE_READ_RETRIES transient failures.
+
+        Only used while polling for settle — a move already in flight should not
+        be abandoned over one dropped byte on the read side.
+        """
+        last_error = None
+        for _ in range(config.SERVO_MOVE_READ_RETRIES):
+            try:
+                return self.read_position(servo_id)
+            except RuntimeError as e:
+                last_error = e
+        raise RuntimeError(
+            f"Servo {servo_id} did not respond after "
+            f"{config.SERVO_MOVE_READ_RETRIES} attempts: {last_error}"
+        )
+
     def _wait_for_settle(self, servo_id: int, target_ticks: int, tolerance_ticks: int) -> int:
         """Poll present position until the servo arrives, stalls, or times out.
 
@@ -436,11 +455,30 @@ class ServoBus:
         without this it would hold against the obstruction for the full timeout.
         Returning early lets the tolerance check above report the mismatch.
 
+        Stall-counting only starts after SERVO_MOVE_STALL_GRACE_S has elapsed —
+        a real servo has a command-processing / acceleration ramp-up before it
+        visibly starts moving, and without this grace period the stall check
+        false-triggers on that ramp instead of a genuine obstruction (caught on
+        hardware: an 80-tick move reported "stalled" near its start position,
+        but had actually fully arrived by the time a later read checked it).
+
+        The goal position was already written to the servo before this is called,
+        so the servo drives toward it via its own onboard control regardless of
+        whether OUR polling succeeds — a single dropped byte on the read side
+        should not abort verification of an otherwise-successful move. Each poll
+        retries a bounded number of times before treating the servo as actually
+        unresponsive.
+
         Returns:
             The last present position read (ticks).
+
+        Raises:
+            RuntimeError: if a read fails SERVO_MOVE_READ_RETRIES times in a row
+                (real communication loss, not a one-off glitch).
         """
-        deadline = time.monotonic() + config.SERVO_MOVE_SETTLE_TIMEOUT_S
-        present_ticks = self.read_position(servo_id)
+        start = time.monotonic()
+        deadline = start + config.SERVO_MOVE_SETTLE_TIMEOUT_S
+        present_ticks = self._read_position_retrying(servo_id)
         stalled_polls = 0
 
         while time.monotonic() < deadline:
@@ -449,7 +487,11 @@ class ServoBus:
 
             time.sleep(config.SERVO_MOVE_POLL_INTERVAL_S)
             previous = present_ticks
-            present_ticks = self.read_position(servo_id)
+            present_ticks = self._read_position_retrying(servo_id)
+
+            past_grace = (time.monotonic() - start) >= config.SERVO_MOVE_STALL_GRACE_S
+            if not past_grace:
+                continue  # still in the acceleration ramp-up window; don't judge yet
 
             if abs(present_ticks - previous) <= config.SERVO_MOVE_STALL_EPSILON_TICKS:
                 stalled_polls += 1

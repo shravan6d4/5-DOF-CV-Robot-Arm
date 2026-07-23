@@ -122,18 +122,58 @@ the delta from current position to stored home for each, (3) refuse/skip any joi
 exceeds a small safety cap (a few hundred ticks) rather than executing it, (4) move only the joints
 within cap, one at a time, with someone watching.
 
+## `dir_sign` reconciliation — complete (2026-07-22, later session)
+
+The physical `+ticks` directions in the table above describe what the arm *does*; MATLAB's IK/FK
+works in its own angle convention. `dir_sign` is what reconciles the two, and getting it wrong
+means a commanded angle drives the joint the wrong way with nothing to catch it. All six are now
+resolved.
+
+The missing prerequisite was knowing which physical direction is `+X/+Y/+Z` in the base frame.
+That was pinned empirically first: with the arm at home, FK reports the wrist ~91mm along `+X`
+and the operator measured the claw ~90mm **in front** of the base (so `+X` = forward), with the
+claw above the tabletop (so `+Z` = up), giving `+Y` = left by right-handedness.
+
+| Joint | Method | MATLAB `+angle` does | Physical `+ticks` does | `dir_sign` |
+|---|---|---|---|---|
+| J1 | FK axis + right-hand rule | rotates about `−Z` (CW from above) | CCW from above | **−1** |
+| J2 | wrist displacement | moves wrist **down** | "tilts up" | **−1** |
+| J3 | wrist displacement | moves wrist **down** | "folds down toward table" | +1 |
+| J4 | FK axis + right-hand rule | CCW viewed from `+Y` (left) | "ccw from the side" (operator stood left) | +1 |
+| J5 | **physical jog** | ~7° CCW from above | matched | +1 |
+
+J1 and J4 were resolved from each joint's FK rotation axis plus the right-hand rule. J2 and J3
+needed a different approach — their descriptions ("tilts up", "folds down toward the table") don't
+state a viewing convention — so instead the *wrist's* displacement for a pure `+angle` delta was
+compared directly against what a human watching a single-joint jog would see. J5 was the only one
+requiring a real jog: its rotation axis is only 73% "pure" at the home pose (wrist roll's axis
+depends on upstream joint angles), so neither desk method applied confidently.
+
+Independent confirmation for J2: at the time of a later read-only check the joint happened to be
+sitting 42 ticks below home. With the old (wrong) sign, FK placed the wrist *above* home; with the
+corrected sign it places it *below* — matching the physical reality of a joint tilted down.
+
+**Two driver bugs found and fixed during this work:**
+- `move_and_verify()` read back position *immediately* after commanding a move, catching the servo
+  mid-travel. Now polls until the servo settles, with a stall check so an obstructed joint is
+  reported rather than held against the obstruction.
+- The stall check then false-triggered on a servo's normal acceleration ramp-up (only 0.3s of
+  apparent stillness was enough). Caught on hardware: an 80-tick J5 move was reported as stalled
+  near its start position, but a later read-only check found it had fully arrived. Fixed with a
+  grace period before stall-counting begins.
+- Also added: a bounded read-retry, after a single dropped serial byte mid-poll crashed an
+  otherwise-successful move. The goal write happens *before* polling, so the servo is already
+  driving toward its target regardless of whether our verification read succeeds.
+
 **Outstanding before the MATLAB-driven pipeline (`HardwareRobot`) drives the arm for real:**
-- The safety cap and refuse-on-large-delta behavior above was only applied in throwaway bring-up
-  scripts, not in `ServoBus.move_and_verify()` itself (the actual method `HardwareRobot` calls).
-  This needs to land in the real driver before the first live IK-driven move, not just in scratch
-  scripts.
-- `move_and_verify()` currently reads back the servo's position *immediately* after commanding a
-  move, before it has physically arrived — this throws on essentially every real move today. Bring-up
-  scripts worked around it with a settle delay (~1.5s) before reading back; the real driver needs
-  the same fix.
-- `dir_sign` in `data/servo_calibration.json` is still the placeholder (`+1` for every joint). The
-  physical directions confirmed in the table above still need to be reconciled against MATLAB's own
-  positive-rotation convention (`matlab/init_arm.m`) before they can be trusted for real IK moves —
-  a desk exercise, not something that needs the arm powered.
+- **Stage D — IK round-trip validation.** `dir_sign` being correct only settles *direction*;
+  `ticks_per_rad`, backlash, and overall model fit are still unvalidated against physical reality.
+  Command a target → IK → move → read back → FK, and compare against a ruler.
+- `TABLE_Z_IN_BASE` is still `0.0`, which is definitely wrong — the arm's home wrist sits at
+  z ≈ −1mm with the claw tip ~70mm below that, so the tabletop is nowhere near zero. Best measured
+  by hand-positioning the claw to touch the table and reading FK (needs `ik_fk_server.m` extended
+  to return `ClawTip`, which it currently doesn't — it only reports the wrist, Body08).
 - J6 (gripper) direction is confirmed but its open/closed tick range (vs. `config.SERVO_GRIPPER_OPEN_RAD`
   / `SERVO_GRIPPER_CLOSE_RAD`) has not been calibrated against the physical claw's actual travel.
+- Camera intrinsics and hand-eye calibration have not been run against the real camera/arm. Note
+  hand-eye **drives a full IK-commanded workspace sweep**, so it wants Stage D passing first.

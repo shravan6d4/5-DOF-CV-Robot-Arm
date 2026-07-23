@@ -217,11 +217,38 @@ SERVO_CALIBRATION_PATH = "data/servo_calibration.json"
 # If the model is ever re-imported with non-zero HomePosition, set these to the
 # new home angles; the mechanism is here so that stays a data change, not a
 # code change.
-# PLACEHOLDER VALUES — measure your arm and fill in real numbers.
+# dir_sign for J1-J4 is NOT a placeholder — all four were reconciled
+# 2026-07-22 by comparing the physical +ticks direction recorded during
+# bring-up (README "Hardware bring-up log") against MATLAB's own
+# positive-rotation convention:
+#   J1: physical +ticks is CCW from above; MATLAB's +angle rotates about -Z
+#       (CW from above, right-hand rule on the FK rotation axis) -> opposite
+#       senses -> dir_sign -1.
+#   J4: physical +ticks is CCW from the left side (confirmed vantage point);
+#       MATLAB's +angle about +Y is also CCW from the left -> same sense ->
+#       +1, unchanged.
+#   J2/J3: physical descriptions ("tilts up" / "folds down toward the table")
+#       don't state a viewing convention, so instead of the axis/viewpoint
+#       method, these were resolved by directly comparing which way the
+#       WRIST moves for a pure +angle delta (same observable a human watches
+#       during a single-joint jog): MATLAB's +angle on J2 moves the wrist
+#       DOWN, opposite "tilts up" -> dir_sign -1. MATLAB's +angle on J3 also
+#       moves the wrist DOWN, matching "folds down toward the table" -> +1,
+#       unchanged.
+#   J5: the only joint needing an actual physical jog. Its FK rotation axis is
+#       only 73% pure at the home pose (wrist roll's axis depends on upstream
+#       joint angles, so it isn't a clean single-axis rotation in base-frame
+#       terms), meaning neither method above applied confidently. Confirmed by
+#       jog 2026-07-22: predicted ~7 deg CCW seen from above, operator observed
+#       a match -> +1, unchanged.
+# All six dir_sign values are now reconciled; none remain placeholders.
+# home_tick VALUES BELOW ARE STILL PLACEHOLDERS — measure your arm and fill in
+# real numbers (dir_sign and home_tick are independent facts; don't conflate
+# "dir_sign is known" with "this arm's home_tick is known").
 SERVO_CALIBRATION_FALLBACK = {
-    "1": {"home_tick": 2048, "ticks_per_rad": 651.89, "dir_sign": 1,
+    "1": {"home_tick": 2048, "ticks_per_rad": 651.89, "dir_sign": -1,
           "home_angle_rad": 0.0},                                          # J1
-    "2": {"home_tick": 1365, "ticks_per_rad": 651.89, "dir_sign": 1,
+    "2": {"home_tick": 1365, "ticks_per_rad": 651.89, "dir_sign": -1,
           "home_angle_rad": 0.0},                                          # J2
     "3": {"home_tick": 2048, "ticks_per_rad": 651.89, "dir_sign": 1,
           "home_angle_rad": 0.0},                                          # J3
@@ -243,6 +270,14 @@ SERVO_MOVE_SETTLE_TIMEOUT_S = 3.0    # give up waiting for arrival after this lo
 SERVO_MOVE_POLL_INTERVAL_S = 0.05    # how often to re-read present position while waiting
 SERVO_MOVE_STALL_POLLS = 6           # consecutive ~unchanged reads that mean "stopped moving"
 SERVO_MOVE_STALL_EPSILON_TICKS = 3   # movement below this per poll counts as not moving
+# Grace period before stall-counting starts. A real STS3215 has a command-
+# processing / acceleration ramp-up before it visibly starts moving; without
+# this, STALL_POLLS*POLL_INTERVAL_S (0.3s) alone false-triggers on that ramp,
+# not a real obstruction -- confirmed on hardware 2026-07-22: an 80-tick J5
+# move was reported "stalled" near its start position, but a later read-only
+# check found it had fully arrived (within 1 tick) all along.
+SERVO_MOVE_STALL_GRACE_S = 0.5
+SERVO_MOVE_READ_RETRIES = 3          # transient serial read failures to absorb per poll
 
 # Hard cap on how far a single commanded move may travel from the servo's CURRENT
 # position. Exists because of the J1 encoder wrap-seam runaway during bring-up: a

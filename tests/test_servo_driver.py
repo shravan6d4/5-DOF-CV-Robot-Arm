@@ -121,6 +121,47 @@ class MovingFakeServo(FakeServoSerial):
         return data
 
 
+class DelayedMovingFakeServo(MovingFakeServo):
+    """A servo that sits motionless for its first `delay_reads` position reads
+    before starting to move — models a real STS3215's command-processing /
+    acceleration ramp-up, where the servo hasn't started visibly moving yet
+    even though it received the goal write.
+    """
+
+    def __init__(self, servo_id=1, present_ticks=2048, step_ticks=50, delay_reads=0):
+        super().__init__(servo_id=servo_id, present_ticks=present_ticks, step_ticks=step_ticks)
+        self.delay_reads = delay_reads
+        self.position_reads = 0
+
+    def _reg_bytes(self, addr, count):
+        if addr == ServoBus.ADDR_PRESENT_POSITION:
+            self.position_reads += 1
+            if self.position_reads <= self.delay_reads:
+                return FakeServoSerial._reg_bytes(self, addr, count)  # no advance yet
+        return super()._reg_bytes(addr, count)
+
+
+class FlakyReadFakeServo(FakeServoSerial):
+    """A servo whose first `fail_reads` status responses time out.
+
+    Simulates a dropped/corrupted byte on the read side: the header read
+    returns empty (what pyserial gives back on a real timeout), which makes
+    _read_status bail out after a single read() call — matching how one
+    flaky attempt actually behaves on the wire, not just "read() raises".
+    """
+
+    def __init__(self, servo_id=1, present_ticks=2048, fail_reads=0):
+        super().__init__(servo_id=servo_id, present_ticks=present_ticks)
+        self.fail_reads = fail_reads
+        self.read_calls = 0
+
+    def read(self, n):
+        self.read_calls += 1
+        if self.read_calls <= self.fail_reads:
+            return b""
+        return super().read(n)
+
+
 def _bus(monkeypatch, fake) -> ServoBus:
     monkeypatch.setattr(sd.serial, "Serial", lambda *a, **k: fake)
     return ServoBus("COM_FAKE", calibration_path=NO_CAL_FILE)
@@ -250,6 +291,64 @@ def test_rad_ticks_roundtrip_is_exact_across_joints(monkeypatch):
             assert recovered == pytest.approx(angle, abs=2e-3)
 
 
+def test_j1_dir_sign_is_inverted_reconciled_2026_07_22(monkeypatch):
+    """J1's dir_sign must be -1, not the +1 placeholder every other unresolved
+    joint still carries.
+
+    Reconciled by comparing the physical bring-up log (README: "+ticks =
+    counterclockwise viewed from above") against MATLAB's own convention
+    (right-hand rule on J1's FK rotation axis, -Z, gives clockwise from above
+    for +angle). Opposite senses -> dir_sign must flip the sign, or a
+    positive tick delta gets reported to MATLAB as a negative angle change
+    and vice versa -- silently commanding/interpreting the wrong direction.
+    Locking this in so it can't drift back to +1 by accident.
+    """
+    bus = _bus(monkeypatch, FakeServoSerial())
+    assert bus._cal(1)["dir_sign"] == -1
+
+
+def test_j4_dir_sign_stays_positive_reconciled_2026_07_22(monkeypatch):
+    """J4's dir_sign is +1 -- confirmed correct, not merely untested.
+
+    J4 and J1 share the same reconciliation method (README bring-up log vs.
+    MATLAB's FK rotation axis) but land on opposite conclusions: J4's physical
+    "+ticks = ccw from the side" (confirmed vantage point: the left side, +Y)
+    matches MATLAB's own +Y-axis convention (also ccw viewed from the left),
+    so no flip is needed. Locking in the placeholder value here specifically
+    so a future accidental sign flip (e.g. someone "fixing" it to match J1) is
+    caught by a test failure, not a wrong-direction move on real hardware.
+    """
+    bus = _bus(monkeypatch, FakeServoSerial())
+    assert bus._cal(4)["dir_sign"] == 1
+
+
+def test_j2_dir_sign_is_inverted_reconciled_2026_07_22(monkeypatch):
+    """J2's dir_sign must be -1.
+
+    J2's physical description ("tilts up") doesn't state a viewing
+    convention, so this was reconciled differently from J1/J4: by directly
+    comparing which way the WRIST moves for a pure MATLAB +angle delta on J2
+    alone (the same observable a human watches during a single-joint jog).
+    MATLAB's +angle moves the wrist DOWN (~2.6mm for a 0.05 rad delta from
+    true home) -- opposite the physical "tilts up" -- so dir_sign must flip.
+    """
+    bus = _bus(monkeypatch, FakeServoSerial())
+    assert bus._cal(2)["dir_sign"] == -1
+
+
+def test_j3_dir_sign_stays_positive_reconciled_2026_07_22(monkeypatch):
+    """J3's dir_sign is +1 -- confirmed correct via the same wrist-displacement
+    method used for J2 (see test_j2_dir_sign_is_inverted_reconciled_2026_07_22).
+
+    MATLAB's +angle moves the wrist DOWN (~6.9mm for a 0.05 rad delta from
+    true home), matching the physical "folds down, toward the table" -- same
+    sense, no flip needed. Locked in so an accidental "fix" doesn't flip it
+    to match J2's sign by mistaken pattern-matching.
+    """
+    bus = _bus(monkeypatch, FakeServoSerial())
+    assert bus._cal(3)["dir_sign"] == 1
+
+
 # --- move safety + settling ---------------------------------------------
 
 def _goal_writes(fake):
@@ -262,8 +361,11 @@ def _goal_writes(fake):
 
 @pytest.fixture
 def _fast_polls(monkeypatch):
-    """Strip the poll delay so settle tests run at full speed."""
+    """Strip the poll delay and stall grace period so settle tests run at full
+    speed. Both are wall-clock-timed (time.monotonic()), so leaving the grace
+    period at its real 0.5s would make stall tests either slow or flaky."""
     monkeypatch.setattr(config, "SERVO_MOVE_POLL_INTERVAL_S", 0.0)
+    monkeypatch.setattr(config, "SERVO_MOVE_STALL_GRACE_S", 0.0)
 
 
 def test_move_waits_for_servo_to_arrive(monkeypatch, _fast_polls):
@@ -315,6 +417,35 @@ def test_move_within_cap_is_allowed(monkeypatch, _fast_polls):
     assert _goal_writes(fake), "expected a goal-position write for a permitted move"
 
 
+def test_settle_survives_a_transient_read_glitch(monkeypatch, _fast_polls):
+    """A dropped read (gate check or settle poll — both share the same retry
+    helper) must not abort a move whose goal has already been written.
+
+    The goal is written to the servo BEFORE polling starts, so it drives
+    toward the target via its own onboard control regardless of whether OUR
+    verification read succeeds. This is exactly what happened during
+    bring-up: move_and_verify crashed on a single flaky read from J2, even
+    though the servo had already received the goal and (per a separate
+    read-only check afterward) landed almost exactly on target anyway.
+    """
+    fake = FlakyReadFakeServo(servo_id=1, present_ticks=2048, fail_reads=2)
+    bus = _bus(monkeypatch, fake)
+
+    # Under SERVO_MOVE_READ_RETRIES=3 (default), 2 failures then a real
+    # response must still resolve correctly.
+    arrived = bus.move_and_verify(1, 2048, tolerance_ticks=5)
+    assert arrived == 2048
+
+
+def test_settle_gives_up_after_sustained_read_failure(monkeypatch, _fast_polls):
+    """Real communication loss (not one glitch) must still surface as an error."""
+    fake = FlakyReadFakeServo(servo_id=1, present_ticks=2048, fail_reads=999)
+    bus = _bus(monkeypatch, fake)
+
+    with pytest.raises(RuntimeError, match="did not respond"):
+        bus.move_and_verify(1, 2048, tolerance_ticks=5)
+
+
 def test_stalled_servo_returns_early_instead_of_hanging(monkeypatch, _fast_polls):
     """An obstructed servo must be reported, not held against the obstruction.
 
@@ -327,6 +458,53 @@ def test_stalled_servo_returns_early_instead_of_hanging(monkeypatch, _fast_polls
     arrived = bus.move_and_verify(1, 2148, tolerance_ticks=5)
 
     assert arrived == 2048, "should report where the servo actually is"
+
+
+def test_j5_dir_sign_stays_positive_confirmed_by_jog_2026_07_22(monkeypatch):
+    """J5's dir_sign is +1 -- the only joint that needed an actual physical
+    jog rather than desk reconciliation (its FK rotation axis is only 73%
+    pure at the home pose, unlike the clean 100%-pure axes for J1-J4, so
+    neither the viewpoint method used for J1/J4 nor the wrist-displacement
+    method used for J2/J3 applied confidently).
+
+    Confirmed via scripts/jog_joint.py: a +80 tick jog predicted the claw
+    would rotate ~7 deg counterclockwise seen from above; a second +80 jog
+    (total ~14 deg from the starting pose, chosen after the first jog's
+    result was inconclusive by eye) was reported by the operator as matching
+    the prediction. No flip applied -- this is the last of the six joints'
+    dir_sign values to be settled.
+    """
+    bus = _bus(monkeypatch, FakeServoSerial())
+    assert bus._cal(5)["dir_sign"] == 1
+
+
+def test_settle_grace_period_survives_acceleration_ramp_up(monkeypatch):
+    """A servo that hasn't started moving yet must not be misreported as
+    stalled during its acceleration ramp-up.
+
+    Confirmed on hardware 2026-07-22: an 80-tick J5 move was reported settled
+    at essentially its start position (a false stall), but a later read-only
+    check found it had actually travelled the full distance. Without a grace
+    period, STALL_POLLS consecutive "no movement yet" reads during a normal
+    ramp-up look identical to a genuine obstruction.
+
+    Uses explicit (non-fast) timing rather than the _fast_polls fixture,
+    since this specifically tests the grace period's real wall-clock effect:
+    delay_reads is sized so a servo that starts moving only after it expires
+    would have falsely tripped the OLD (ungated) stall check by roughly
+    STALL_POLLS iterations in, but succeeds under the grace-period fix.
+    """
+    monkeypatch.setattr(config, "SERVO_MOVE_POLL_INTERVAL_S", 0.01)
+    monkeypatch.setattr(config, "SERVO_MOVE_STALL_GRACE_S", 0.08)
+    # Movement starts at the 11th position read (~0.10s in) -- after the grace
+    # period (0.08s) expires, but well past where 6 consecutive "no movement"
+    # reads would already have tripped an ungated stall check (~0.06s in).
+    fake = DelayedMovingFakeServo(servo_id=1, present_ticks=2048, step_ticks=50, delay_reads=10)
+    bus = _bus(monkeypatch, fake)
+
+    arrived = bus.move_and_verify(1, 2148, tolerance_ticks=5)
+
+    assert abs(arrived - 2148) <= 5, "should have reached the real target, not a false-stall position"
 
 
 def test_calibration_missing_home_angle_is_rejected(monkeypatch, tmp_path):
