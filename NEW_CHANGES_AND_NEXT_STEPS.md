@@ -122,18 +122,119 @@ values to floating-point precision — see git history for the scratch check.
 `validate_pixel_to_world.py`; the web-UI section documents `--calibrate`; the Tests
 section documents the new test files.
 
+## Session 2 (2026-07-26): camera intrinsics CALIBRATED on hardware
+
+Merge Path step 1 is **done**. This was the first time any of the calibration tooling above
+ran against the real camera.
+
+### Result
+
+| Metric | Value |
+|---|---|
+| Views captured | **56** (minimum is `CALIB_INTRINSICS_MIN_SAMPLES` = 15) |
+| Boards contributing | all 6 |
+| RMS reprojection error | **0.324 px** (accept threshold ~1 px) |
+| Resolution | 640x480 |
+
+```
+fx = 660.9045852787211      cx = 316.54256156175046
+fy = 661.1259343533698      cy = 230.38470664487326
+distortion = [0.04948341884997802, -0.0928735686760541, -0.007186978169095462,
+              -0.0008801535848997029, 0.060709883927266166]
+```
+
+Three sanity checks beyond the RMS, all of which pass — worth repeating on any re-calibration,
+because a low RMS alone can hide a bad view set:
+- **`fx` ~= `fy`** (660.90 vs 661.13, 0.03% apart) — square pixels, correct for this sensor.
+- **`cx, cy` near the image centre** (316.5, 230.4) vs (320, 240) — off by 3.5 / 9.6 px, i.e.
+  plausible lens decentering. A result tens of px away would mean the solve fit noise.
+- **Small distortion coefficients** — normal for this class of webcam.
+
+**This step mattered more than it looks.** The `config.py` placeholder was `CAMERA_FX = 550`;
+the truth is 661 — a **20% error**, which every lateral world coordinate inherited.
+
+### Where the data lives (and why it is NOT in git)
+
+`data/camera_intrinsics.json`, written by `save_intrinsics`. It is **gitignored on purpose**
+(`.gitignore`: "Local calibration data ... machine-specific"), alongside `data/hand_eye.json`
+and `data/servo_calibration.json`. So **cloning this repo does not get you a calibrated
+camera** — the numbers above are recorded here precisely because the file itself never leaves
+this machine. Backed up locally to `data/camera_intrinsics.json.bak-20260726-184843`
+(`data/*.bak-*` is also gitignored).
+
+### Camera identity: the NexiGo is OpenCV index 1
+
+This machine exposes three capture devices, and only one is the arm camera. Determined by
+probing resolution + grabbing frames, since OpenCV indices carry no device names:
+
+| Index | Device | Signature |
+|---|---|---|
+| 0 | EOS Webcam Utility | caps at 1024x576; dark when the DSLR is off |
+| **1** | **NexiGo N930AF** | **the arm camera — FHD-capable** |
+| 2 | OBS Virtual Camera | FHD, shows the OBS placeholder logo |
+
+`config.CAMERA_INDEX = 1` is therefore already correct. If a device is added or unplugged
+these indices can renumber — re-probe rather than assuming.
+
+### Why 640x480, not the NexiGo's native 1080p
+
+**Intrinsics are resolution-specific** — `fx/fy/cx/cy` are in pixels, so the same lens gives
+`fx ~= 661` at 640x480 and `fx ~= 1650` at 1920x1080. `Camera` opens at
+`config.FRAME_WIDTH/HEIGHT` (640x480), which is what the pick pipeline, demo scripts, and web
+UI all run at, so calibrating at that size is the correct and self-consistent choice.
+**Never change resolution partway through a capture run** — the views become mutually
+inconsistent and `calibrateCamera` fits garbage.
+
+Moving to 1080p later is a real but bounded change (est. 1.5-3 h). An audit of `config.py`
+found only four genuinely pixel-pinned values — `MIN_CONTOUR_AREA` (area, ~6.75x),
+`MORPH_KERNEL_SIZE`, `STUD_REGION_CLOSE_MIN/MAX_PX`, `SPECULAR_INPAINT_RADIUS`. Everything
+else is either a fraction, normalised against `STUD_ROI_REFERENCE_PX`, or derived
+(`CAMERA_CX/CY` follow `FRAME_WIDTH/HEIGHT` automatically). Evidence it is low-risk:
+`tests/sample_images/` already spans 540x360 to 3024x3024 with `MIN_CONTOUR_AREA = 350`
+unchanged, because that constant is a *noise floor*, not a "bricks are this big" threshold.
+The genuine unknown is the **aspect-ratio change** (4:3 -> 16:9), which is a different sensor
+crop and not a resampling, so the field of view changes shape — verify empirically before
+assuming 1080p is strictly a superset. Recommendation: get the full chain validated at
+640x480 first, so a bad result later can't be blamed on two variables at once.
+
+### Operational notes learned the hard way
+
+- **Re-running intrinsics starts from scratch AND overwrites.** Views accumulate in in-memory
+  lists only — nothing is persisted between runs — and `save_intrinsics` is a plain
+  `write_text` with no backup. A second run capturing 20 mediocre views would silently
+  replace this 56-view / 0.324 px result, unrecoverably. Back the JSON up before re-running.
+- **`no board with at least 6 corners - not captured` is the guard working, not an error.**
+  It fired 3 times out of ~59 `c` presses (pointed off the boards / motion blur / too
+  oblique). A refused press banks nothing, so it cannot corrupt the set. Only worry if it
+  fires on *every* press and the run ends with 0 views.
+- **The interactive OpenCV scripts need a real console window.** Launching
+  `calibrate_camera_intrinsics.py` as a detached background process made it exit immediately
+  with 0 views — a detached process has no interactive desktop session, so `cv2.waitKey`
+  never receives keys. Launch via `Start-Process powershell -ArgumentList '-NoExit',...`
+  (a helper script doing this is not committed; it is two lines). **Click the video window
+  before pressing keys** — `waitKey` only sees input directed at that window, not the console.
+- **`.venv` had to be recreated** on this machine (`pyvenv.cfg` pointed at a nonexistent
+  interpreter, so `import cv2` failed). `Remove-Item -Recurse -Force .venv;
+  python -m venv .venv; .venv\Scripts\pip install -r requirements.txt` — as CLAUDE.md's
+  Commands section already documents. Resolved to `opencv-python 4.13.0`, which satisfies the
+  `>=4.8,<5.0` pin and has both `calibrateHandEye` and the modern ChArUco API.
+- `pytest`: **129 passed** after the environment rebuild.
+
 ## Next steps (needs the physical arm + camera + MATLAB server)
 
-Nothing above has been run against real hardware yet — do this **in order**:
+Step 2 below is **DONE** (see Session 2 above). Steps 1 and 3-5 are still outstanding — note
+that step 1 was *not* needed for intrinsics (no arm involved) but **is** required before
+hand-eye. Do the rest **in order**:
 
 1. **Re-verify the frame seam is intact.** `python scripts/check_servo_health.py` — the
    B4 block must show the claw tip *below* the wrist. If not, stop: the physical/model
    frame conversion has been broken somewhere and every downstream number is garbage (see
    CLAUDE.md's "COORDINATE FRAMES" section).
-2. **Camera intrinsics.** `python scripts/calibrate_camera_intrinsics.py`, with the boards
-   still loose/handheld (do this *before* taping them down — intrinsics need varied
-   angles/distances, hand-eye needs the boards stationary). Accept at RMS reprojection
-   error < 1 px. Then tape all 6 boards flat and rigid across the tabletop.
+2. ~~**Camera intrinsics.**~~ **DONE 2026-07-26** — 56 views, RMS 0.324 px, written to
+   `data/camera_intrinsics.json`. See "Session 2" above for the values, the camera-index
+   mapping, and why it was done at 640x480. **Still to do before step 3: tape all 6 boards
+   flat and rigid across the tabletop** — hand-eye requires them stationary for the whole
+   session, and they were handheld/loose for the intrinsics run.
 3. **Hand-eye calibration.** Either `python scripts/calibrate_hand_eye.py` or
    `python scripts/run_arm_ui.py --hardware --calibrate` (MATLAB server must be running:
    `matlab/` → `ik_fk_server`). Record ≥12 samples per board across varied jogged poses.
