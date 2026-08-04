@@ -32,6 +32,7 @@ producing solutions the arm cannot reach.
 import argparse
 import json
 import sys
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
@@ -54,6 +55,26 @@ def _confirm(prompt: str) -> bool:
         return False
 
 
+def _settled_position(bus: ServoBus, joint: int, timeout_s: float = 4.0) -> int:
+    """Poll until the joint stops moving, then return where it actually is.
+
+    move_and_verify's return value cannot be used to judge how far a joint
+    travelled: _wait_for_settle returns early when its stall check trips, which
+    on a real servo happens routinely during the acceleration ramp, so it hands
+    back a position the joint has already left. Trusting it made this script
+    read "moved 0 ticks" mid-travel and declare a stop that was not there.
+    """
+    previous = None
+    deadline = time.monotonic() + timeout_s
+    while time.monotonic() < deadline:
+        current = bus.read_position(joint)
+        if previous is not None and abs(current - previous) <= 2:
+            return current
+        previous = current
+        time.sleep(0.15)
+    return previous if previous is not None else bus.read_position(joint)
+
+
 def explore(bus: ServoBus, joint: int, step: int) -> int | None:
     """Step one direction until the operator stops it. Returns the end tick."""
     sign = "+" if step > 0 else "-"
@@ -63,19 +84,24 @@ def explore(bus: ServoBus, joint: int, step: int) -> int | None:
 
     last = bus.read_position(joint)
     print(f"    starting at {last}")
+    stalled = 0
 
     while True:
         if not _confirm(f"    step {step:+d} from {last}? [y/N] "):
             print(f"    stopped at {last}")
             return last
         try:
-            actual = bus.move_and_verify(joint, last + step)
+            bus.move_and_verify(joint, last + step)
         except ServoSafetyError as e:
             print(f"    REFUSED: {e}")
             return last
         except Exception as e:
             print(f"    move failed: {e} — stopping here.")
             return last
+
+        # Re-read after the joint has actually stopped; move_and_verify's return
+        # value is unreliable mid-travel (see _settled_position).
+        actual = _settled_position(bus, joint)
 
         if abs(actual - last) > SEAM_JUMP_TICKS:
             print(f"\n    *** ENCODER WRAP DETECTED: {last} -> {actual} ***")
@@ -86,13 +112,21 @@ def explore(bus: ServoBus, joint: int, step: int) -> int | None:
             return None
 
         moved = actual - last
+        # Two consecutive under-travels, not one: a single short step can come
+        # from a transient read or the servo still creeping, and calling the
+        # limit early is exactly how this script first under-measured J2.
         if abs(moved) < abs(step) * 0.4:
-            print(f"    only moved {moved:+d} of {step:+d} requested — likely AT THE STOP.")
-            print(f"    treating {actual} as the limit.")
-            return actual
+            stalled += 1
+            print(f"    only moved {moved:+d} of {step:+d} "
+                  f"({'STOP CONFIRMED' if stalled >= 2 else 'once more to confirm'})")
+            if stalled >= 2:
+                print(f"    treating {actual} as the limit.")
+                return actual
+        else:
+            stalled = 0
+            print(f"    now at {actual} ({moved:+d})")
 
         last = actual
-        print(f"    now at {actual} ({moved:+d})")
 
 
 def main() -> None:
@@ -112,6 +146,15 @@ def main() -> None:
     args = ap.parse_args()
 
     bus = ServoBus(args.port, args.baud, calibration_path=args.calibration)
+
+    # Ignore any limits already recorded for THIS joint: the job here is to
+    # establish them, and a previous bad measurement would otherwise refuse the
+    # very steps needed to correct it. Every other joint stays protected, and
+    # each step is still operator-confirmed.
+    stale = {k: bus._cal(args.joint).pop(k, None) for k in ("min_tick", "max_tick")}
+    if any(v is not None for v in stale.values()):
+        print(f"  (ignoring previously recorded limits {stale} while re-measuring)")
+
     print(f"J{args.joint}: finding travel limits. The arm WILL move on each confirmed step.")
 
     with bus:
