@@ -324,6 +324,21 @@ TABLE_Z_IN_BASE = -0.074
 # Where the gripper should end up to grasp, relative to the table surface.
 # Slightly above the table so the fingers close around the brick body rather
 # than driving into the tabletop. Tune to your gripper + brick height.
+# Hard floor for any commanded claw-tip height, as a clearance above
+# TABLE_Z_IN_BASE. HardwareRobot refuses targets below it.
+#
+# This is the constraint that actually bounds this arm. Per-joint travel limits
+# cannot express it: what stops the arm is the CLAW REACHING THE TABLE, which
+# depends on every joint at once. Measured 2026-08-04, J2's usable range came
+# out ~51 deg of its real travel purely because the claw grounded out at the
+# elbow angle it was measured at — a different elbow angle makes the same J2
+# angle safe. Recording that as a joint limit is conservative but misleading;
+# the height is the real rule.
+#
+# Below PICK_Z_OFFSET on purpose: the grasp legitimately descends to
+# PICK_Z_OFFSET, and this must not refuse the pick it exists to protect.
+MIN_CLAW_HEIGHT_M = 0.005      # 5 mm above the table
+
 PICK_Z_OFFSET = 0.010          # 10 mm above the table
 
 # How high above the pick point to hover before descending and after lifting,

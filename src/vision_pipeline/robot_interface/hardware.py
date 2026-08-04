@@ -105,6 +105,22 @@ class HardwareRobot(RobotInterface):
                 f"({config.PICK_ROLL_DEG}°, {config.PICK_PITCH_DEG}°)."
             )
 
+        # Floor guard. The measured joint limits cannot express this: the thing
+        # that actually stops this arm is the CLAW REACHING THE TABLE, which
+        # depends on the whole arm's configuration, not on any one joint. J2's
+        # recorded range, for instance, is only ~51 deg of its real travel
+        # because the claw grounded out at the elbow angle it was measured at —
+        # fold the elbow differently and the same joint angle is perfectly safe.
+        # A Cartesian floor is the honest form of that constraint.
+        floor_z = config.TABLE_Z_IN_BASE + config.MIN_CLAW_HEIGHT_M
+        if pose.z < floor_z:
+            logger.error(
+                f"Refusing target z={pose.z * 1000:.1f} mm: below the floor guard "
+                f"({floor_z * 1000:.1f} mm = table {config.TABLE_Z_IN_BASE * 1000:.1f} "
+                f"+ {config.MIN_CLAW_HEIGHT_M * 1000:.0f} mm clearance). Nothing commanded."
+            )
+            return False
+
         # Solve IK for position only, seeded from the arm's current angles so
         # the solver returns the NEAREST solution. Unseeded it can return a
         # valid posture ~180 deg away, which ServoBus would then refuse move
