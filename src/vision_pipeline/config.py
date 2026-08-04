@@ -23,6 +23,17 @@ touching any detection code.
 # index and look at the frame rather than trusting the number.
 CAMERA_INDEX = 1
 
+# Fixed focus position, applied by Camera after switching autofocus OFF.
+# Autofocus and photogrammetry are incompatible: refocusing moves the lens and
+# so changes the focal length, and fx/fy are precisely what turn pixels into
+# millimetres. The lens must sit at ONE position for the calibrated intrinsics
+# to mean anything, and at the SAME position when they are later used.
+#
+# 0 is infinity on the UVC scale; higher values focus nearer. If the boards or
+# bricks look soft at the working distance, raise this and RE-RUN the intrinsics
+# calibration — changing focus invalidates existing intrinsics.
+CAMERA_FOCUS = 0
+
 # Requested capture resolution. The camera may ignore this and use its own
 # default if the exact size isn't supported.
 FRAME_WIDTH = 640
