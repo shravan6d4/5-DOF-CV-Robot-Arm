@@ -110,16 +110,33 @@ def main() -> None:
                 break
 
             fk_mm = float(np.linalg.norm(after_fk[:3, 3] - before_fk[:3, 3])) * 1000
+            # Camera displacement must be measured as its position in the FIXED
+            # board frame. The board's position within the camera frame changes
+            # when the camera merely ROTATES -- at 9 deg with a board 400 mm out
+            # that is ~60 mm of pure artifact -- so it cannot be used here.
             cam_mm = float(np.mean([
-                np.linalg.norm(after_poses[b][:3, 3] - before_poses[b][:3, 3]) for b in shared
+                np.linalg.norm(
+                    (-after_poses[b][:3, :3].T @ after_poses[b][:3, 3])
+                    - (-before_poses[b][:3, :3].T @ before_poses[b][:3, 3])
+                )
+                for b in shared
             ])) * 1000
             rot = np.degrees(np.linalg.norm(
                 cv2.Rodrigues((np.linalg.inv(after_fk) @ before_fk)[:3, :3])[0]))
 
-            ratio = cam_mm / fk_mm if fk_mm > 1 else float("nan")
-            ratios.append(ratio)
-            print(f"  step {step+1}: FK moved {fk_mm:6.1f} mm | camera moved {cam_mm:6.1f} mm"
-                  f" | ratio {ratio:5.2f} | rot {rot:5.1f} deg  (boards {[b+1 for b in shared]})")
+            # Both wrist and camera swing about the SAME joint axis, so each one's
+            # travel is proportional to its radius from it. They legitimately
+            # differ -- but only by however far the camera sits from the wrist,
+            # which is physically bounded. Exceeding that bound is a real fault.
+            chord = 2.0 * np.sin(np.radians(rot) / 2.0)
+            r_wrist = fk_mm / chord if chord > 1e-6 else float("nan")
+            r_cam = cam_mm / chord if chord > 1e-6 else float("nan")
+            gap = abs(r_cam - r_wrist)
+            ratios.append(gap)
+            print(f"  step {step+1}: FK {fk_mm:6.1f} mm | camera {cam_mm:6.1f} mm | rot {rot:5.1f} deg")
+            print(f"           radius from joint axis: wrist {r_wrist:6.1f} mm, camera {r_cam:6.1f} mm"
+                  f"  -> camera is >= {gap:.0f} mm from the wrist"
+                  f"{'   <-- IMPOSSIBLE (>135 mm)' if gap > 135 else '   ok'}")
 
             before_poses, before_fk = after_poses, after_fk
 
@@ -127,12 +144,14 @@ def main() -> None:
     if not good:
         print("\nNo usable measurements.")
         return
-    print(f"\nJ{args.joint} mean ratio: {np.mean(good):.2f}")
-    print("  ~1.0  -> this joint's geometry and tick scale are correct.")
-    print("  >1.0  -> the arm moves FURTHER than FK believes (FK understates it).")
-    print("  <1.0  -> the arm moves LESS than FK believes.")
-    print("\nNOTE: camera motion includes a lever-arm term when the wrist rotates,")
-    print("so judge on the trend across joints, not one number in isolation.")
+    mean_gap = float(np.mean(good))
+    print(f"\nJ{args.joint}: camera sits >= {mean_gap:.0f} mm from the wrist, per this joint.")
+    print("  <= ~135 mm -> consistent with the physical mount; this joint checks out.")
+    print("  >  ~135 mm -> FK and the camera disagree about how far the arm swung;")
+    print("                this joint's link geometry or tick scale is wrong.")
+    print("\nThe bound is a lower one (only the component perpendicular to the joint")
+    print("axis shows up), so a small number is not proof of correctness -- but a")
+    print("large one IS proof of a fault, since the camera cannot be that far out.")
 
 
 if __name__ == "__main__":
