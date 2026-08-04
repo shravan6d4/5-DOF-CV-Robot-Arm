@@ -186,14 +186,28 @@ def main() -> None:
                     print(f"  REFUSED: {e}")
 
             elif key == ord("r"):
-                if not board_poses:
+                # Re-capture rather than banking the frame the display loop is
+                # holding. cv2.VideoCapture buffers frames, and detecting
+                # CALIB_BOARD_COUNT boards per iteration makes this loop slower
+                # than the camera's frame rate — so the buffer stays full and
+                # the displayed frame can lag the arm by hundreds of ms. Pairing
+                # a stale frame with a fresh FK reading records the camera and
+                # the wrist at DIFFERENT poses, which silently corrupts the
+                # solve: it stays self-consistent per sample but no single rigid
+                # transform can fit the set. Diagnosed 2026-08-04, after the
+                # arm itself was cleared by scripts/validate_joint_geometry.py.
+                for _ in range(6):
+                    fresh = camera.read_frame()
+                fresh_gray = cv2.cvtColor(fresh, cv2.COLOR_BGR2GRAY)
+                fresh_poses = detect_board_poses(fresh_gray, intr, detectors)
+                if not fresh_poses:
                     print("  no board visible with enough corners — not recorded.")
                     continue
                 angles_rad = _current_angles_rad(bus)
                 t_base_gripper = client.request_fk(angles_rad)
-                new_counts = acc.add(board_poses, t_base_gripper)
+                new_counts = acc.add(fresh_poses, t_base_gripper)
                 save_samples(acc, args.samples)
-                print(f"  recorded boards {sorted(board_poses)} -> counts {new_counts}")
+                print(f"  recorded boards {sorted(fresh_poses)} -> counts {new_counts}")
 
             elif key == ord("c"):
                 break

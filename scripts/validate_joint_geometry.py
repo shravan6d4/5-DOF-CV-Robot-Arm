@@ -124,6 +124,17 @@ def main() -> None:
             rot = np.degrees(np.linalg.norm(
                 cv2.Rodrigues((np.linalg.inv(after_fk) @ before_fk)[:3, :3])[0]))
 
+            # The SAME rotation, measured by the camera against the fixed board.
+            # Every radius below is a distance divided by this angle, so if FK
+            # understates it the radii inflate and the joint looks broken when
+            # it is not. FK is not allowed to be the only witness to its own
+            # rotation.
+            cam_rot = float(np.mean([
+                np.degrees(np.linalg.norm(cv2.Rodrigues(
+                    after_poses[b][:3, :3] @ before_poses[b][:3, :3].T)[0]))
+                for b in shared
+            ]))
+
             # Both wrist and camera swing about the SAME joint axis, so each one's
             # travel is proportional to its radius from it. They legitimately
             # differ -- but only by however far the camera sits from the wrist,
@@ -133,10 +144,12 @@ def main() -> None:
             r_cam = cam_mm / chord if chord > 1e-6 else float("nan")
             gap = abs(r_cam - r_wrist)
             ratios.append(gap)
-            print(f"  step {step+1}: FK {fk_mm:6.1f} mm | camera {cam_mm:6.1f} mm | rot {rot:5.1f} deg")
+            print(f"  step {step+1}: FK {fk_mm:6.1f} mm | camera {cam_mm:6.1f} mm")
+            print(f"           rotation: FK says {rot:5.2f} deg, camera says {cam_rot:5.2f} deg"
+                  f"  (ratio {cam_rot/rot if rot > 1e-6 else float('nan'):4.2f})"
+                  f"{'   <-- FK UNDERSTATES ROTATION' if cam_rot > rot * 1.15 else ''}")
             print(f"           radius from joint axis: wrist {r_wrist:6.1f} mm, camera {r_cam:6.1f} mm"
-                  f"  -> camera is >= {gap:.0f} mm from the wrist"
-                  f"{'   <-- IMPOSSIBLE (>135 mm)' if gap > 135 else '   ok'}")
+                  f"  -> camera >= {gap:.0f} mm from wrist")
 
             before_poses, before_fk = after_poses, after_fk
 
@@ -145,13 +158,15 @@ def main() -> None:
         print("\nNo usable measurements.")
         return
     mean_gap = float(np.mean(good))
-    print(f"\nJ{args.joint}: camera sits >= {mean_gap:.0f} mm from the wrist, per this joint.")
-    print("  <= ~135 mm -> consistent with the physical mount; this joint checks out.")
-    print("  >  ~135 mm -> FK and the camera disagree about how far the arm swung;")
-    print("                this joint's link geometry or tick scale is wrong.")
-    print("\nThe bound is a lower one (only the component perpendicular to the joint")
-    print("axis shows up), so a small number is not proof of correctness -- but a")
-    print("large one IS proof of a fault, since the camera cannot be that far out.")
+    print(f"\nJ{args.joint}: camera sits ~{mean_gap:.0f} mm from this joint's axis.")
+    print("\nJudge this joint on the ROTATION RATIO above, not on that distance.")
+    print("  ratio ~1.0 -> FK and the camera agree on how far the joint turned, so")
+    print("               this joint's tick scale and axis are correct.")
+    print("  ratio > 1  -> FK understates the rotation: tick scale or gearing is wrong.")
+    print("\nThe distance is informational only. It is measured from FK's Body08")
+    print("origin, which is wherever the CAD import placed that body's frame -- NOT")
+    print("necessarily a joint centre you can put a ruler on. Comparing it against a")
+    print("hand measurement produced a false 'IMPOSSIBLE' verdict on 2026-08-04.")
 
 
 if __name__ == "__main__":
