@@ -404,6 +404,7 @@ class ServoBus:
                 f"solve, not a real target — verify the servo's position by hand before "
                 f"overriding with max_delta_ticks."
             )
+        self._check_travel_limits(servo_id, start_ticks, target_ticks)
 
         goal_lo = target_ticks & 0xFF
         goal_hi = (target_ticks >> 8) & 0xFF
@@ -425,6 +426,59 @@ class ServoBus:
                 f"(err {error_ticks}/{tolerance_ticks} ticks)"
             )
         return present_ticks
+
+    def travel_limits(self, servo_id: int) -> Optional[tuple[int, int]]:
+        """This servo's (min_tick, max_tick), or None if it has not been measured.
+
+        Absent by design rather than defaulted: an invented range is worse than
+        none, because it reads as protection while permitting the very moves it
+        appears to forbid. Measure with scripts/find_joint_limits.py.
+        """
+        cal = self._cal(servo_id)
+        lo, hi = cal.get("min_tick"), cal.get("max_tick")
+        if lo is None or hi is None:
+            return None
+        return int(lo), int(hi)
+
+    def _check_travel_limits(self, servo_id: int, start_ticks: int, target_ticks: int) -> None:
+        """Refuse a move that would leave this joint's measured travel range.
+
+        The existing max_delta gate only bounds how far ONE command travels, so
+        a joint can be walked into a hard stop in small legal steps — which is
+        how both jams on 2026-08-04 happened. This bounds WHERE the joint may
+        go, not just how far it moves at once.
+
+        A joint already outside its range is not trapped: moves that reduce the
+        violation are allowed, so an arm parked out of bounds can always be
+        driven back in. Only moves that go further out are refused.
+
+        Raises:
+            ServoSafetyError: target is out of range and not an improvement.
+        """
+        limits = self.travel_limits(servo_id)
+        if limits is None:
+            return
+        lo, hi = limits
+        if lo <= target_ticks <= hi:
+            return
+
+        def violation(t: int) -> int:
+            return max(lo - t, t - hi, 0)
+
+        if violation(target_ticks) < violation(start_ticks):
+            logger.warning(
+                f"Servo {servo_id} is outside its travel range [{lo}, {hi}] at "
+                f"{start_ticks}; allowing {target_ticks} because it moves back toward range."
+            )
+            return
+
+        raise ServoSafetyError(
+            f"Refusing to move servo {servo_id} to {target_ticks}: outside its "
+            f"measured travel range [{lo}, {hi}] (currently at {start_ticks}). "
+            f"Nothing was commanded. Small in-range steps can still walk a joint "
+            f"into a hard stop, which is what this prevents — re-measure with "
+            f"scripts/find_joint_limits.py if the range itself is wrong."
+        )
 
     def _read_position_retrying(self, servo_id: int) -> int:
         """read_position, absorbing up to SERVO_MOVE_READ_RETRIES transient failures.

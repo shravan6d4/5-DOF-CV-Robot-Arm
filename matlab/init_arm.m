@@ -91,6 +91,31 @@ rangeDeg = [ -90  90;    % J1 base yaw
              -90  90;    % J4 forearm
              -90  90;    % J5 wrist pitch
              -45  45 ];  % J6 claw rotation
+
+% MEASURED limits override the blanket +-90 above, per joint, where they exist.
+% Those defaults are a placeholder, not a measurement: the IK solver will
+% happily return a solution the arm physically cannot reach, and the servo bus
+% then either refuses it or -- before travel limits existed -- drove the joint
+% into a hard stop (J3 and J4 both jammed that way on 2026-08-04).
+%
+% Written by scripts/find_joint_limits.py, which measures each end by small
+% operator-confirmed steps. The file is per-arm and gitignored, so a missing
+% file simply leaves the defaults in place. Radians, model convention.
+limitsFile = fullfile('..','data','joint_limits_rad.json');
+if isfile(limitsFile)
+    lim = jsondecode(fileread(limitsFile));
+    for k = 1:6
+        f = sprintf('x%d', k);          % jsondecode prefixes numeric keys
+        if isfield(lim, f)
+            rangeDeg(k,:) = rad2deg([lim.(f).min_rad, lim.(f).max_rad]);
+            fprintf('init_arm: J%d limits from file: [%.1f %.1f] deg\n', ...
+                    k, rangeDeg(k,1), rangeDeg(k,2));
+        end
+    end
+else
+    fprintf(['init_arm: no %s — using placeholder +-90 deg limits. ' ...
+             'Measure with scripts/find_joint_limits.py.\n'], limitsFile);
+end
 for i = 1:robot.NumBodies
     jnt = robot.Bodies{i}.Joint;
     h = jnt.HomePosition;

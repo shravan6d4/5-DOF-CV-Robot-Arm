@@ -71,3 +71,6 @@ data/*.bak-*
 # physical arm, same policy as the solved transforms above.
 data/hand_eye_samples.json
 data/*.rejected-*
+
+# Per-arm measured joint travel limits (scripts/find_joint_limits.py)
+data/joint_limits_rad.json
