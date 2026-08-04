@@ -45,6 +45,10 @@ from vision_pipeline.robot_interface.servo_driver import ServoBus, ServoSafetyEr
 # A real step is tens of ticks. Anything approaching half the encoder's range is
 # the 4095->0 wrap showing up as a huge apparent jump, not real motion.
 SEAM_JUMP_TICKS = 1500
+# How close a RECORDED limit may sit to the 0/4095 seam before it is called out.
+# ~18 deg, several times the servo's observed settling error (tens of ticks) and
+# enough that unpowered sag cannot walk the joint across the boundary.
+SEAM_MARGIN_TICKS = 200
 ANGLE_LIMITS_PATH = "data/joint_limits_rad.json"
 
 
@@ -198,6 +202,23 @@ def main() -> None:
     span = hi - lo
     print(f"\n=== J{args.joint} measured travel: [{lo}, {hi}]  ({span} ticks, "
           f"{np.degrees(span / 651.89):.0f} deg) ===")
+
+    # A limit is only useful if the joint can sit near it safely. One landing on
+    # the 0/4095 seam cannot: a hair of motion past it — a commanded overshoot,
+    # or gravity sag while unpowered — wraps the reading by ~4000 ticks, and the
+    # servo cannot cross back. J3 was first measured to tick 6 this way.
+    # Warned rather than refused: the measurement is real, it is the RECORDING
+    # that needs a decision, and only the operator knows whether the joint needs
+    # that end of its travel at all.
+    for name, edge in (("lower", lo), ("upper", hi)):
+        margin = min(edge, 4095 - edge)
+        if margin < SEAM_MARGIN_TICKS:
+            print(f"\n  *** the {name} limit ({edge}) is only {margin} ticks from the")
+            print(f"      0/4095 encoder seam ({np.degrees(margin / 651.89):.1f} deg). A limit here is")
+            print("      not usable — past it the reading wraps and the servo is stuck.")
+            print("      If the arm does not need that end, pull the limit in by hand")
+            print(f"      (~{SEAM_MARGIN_TICKS} ticks of margin) and note why in limit_basis.")
+            print("      If it DOES need it, re-centre the servo instead.")
 
     if not _confirm("Write these limits into the calibration? [y/N] "):
         print("Nothing written.")

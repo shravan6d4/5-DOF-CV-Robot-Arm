@@ -74,3 +74,9 @@ data/*.rejected-*
 
 # Per-arm measured joint travel limits (scripts/find_joint_limits.py)
 data/joint_limits_rad.json
+
+# Board->base tie (scripts/calibrate_board_to_base.py): valid only for one
+# physical board sitting in one spot, same policy as the transforms above.
+data/board_to_base.json
+data/board_to_base_samples.json
+data/dryrun.png
