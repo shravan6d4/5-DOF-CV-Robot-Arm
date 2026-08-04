@@ -23,6 +23,17 @@ touching any detection code.
 # index and look at the frame rather than trusting the number.
 CAMERA_INDEX = 1
 
+# Fixed focus position, applied by Camera after switching autofocus OFF.
+# Autofocus and photogrammetry are incompatible: refocusing moves the lens and
+# so changes the focal length, and fx/fy are precisely what turn pixels into
+# millimetres. The lens must sit at ONE position for the calibrated intrinsics
+# to mean anything, and at the SAME position when they are later used.
+#
+# 0 is infinity on the UVC scale; higher values focus nearer. If the boards or
+# bricks look soft at the working distance, raise this and RE-RUN the intrinsics
+# calibration — changing focus invalidates existing intrinsics.
+CAMERA_FOCUS = 0
+
 # Requested capture resolution. The camera may ignore this and use its own
 # default if the exact size isn't supported.
 FRAME_WIDTH = 640
@@ -313,6 +324,21 @@ TABLE_Z_IN_BASE = -0.074
 # Where the gripper should end up to grasp, relative to the table surface.
 # Slightly above the table so the fingers close around the brick body rather
 # than driving into the tabletop. Tune to your gripper + brick height.
+# Hard floor for any commanded claw-tip height, as a clearance above
+# TABLE_Z_IN_BASE. HardwareRobot refuses targets below it.
+#
+# This is the constraint that actually bounds this arm. Per-joint travel limits
+# cannot express it: what stops the arm is the CLAW REACHING THE TABLE, which
+# depends on every joint at once. Measured 2026-08-04, J2's usable range came
+# out ~51 deg of its real travel purely because the claw grounded out at the
+# elbow angle it was measured at — a different elbow angle makes the same J2
+# angle safe. Recording that as a joint limit is conservative but misleading;
+# the height is the real rule.
+#
+# Below PICK_Z_OFFSET on purpose: the grasp legitimately descends to
+# PICK_Z_OFFSET, and this must not refuse the pick it exists to protect.
+MIN_CLAW_HEIGHT_M = 0.005      # 5 mm above the table
+
 PICK_Z_OFFSET = 0.010          # 10 mm above the table
 
 # How high above the pick point to hover before descending and after lifting,
@@ -472,6 +498,27 @@ SERVO_MAX_MOVE_DELTA_TICKS = 400
 # fires if that cap is deliberately raised via move_and_verify(max_delta_ticks)
 # — which is exactly the case that most deserves a human watching.
 SERVO_WATCH_POWER_MOVE_DEG = 45.0
+
+# How fast a commanded joint move is allowed to run, in ticks/s (4096 ticks is a
+# full turn, so 200 ~= 18 deg/s). The servos default to full speed, which during
+# bring-up means a wrong move completes before anyone can react to it. Capping
+# the SIZE of a step bounds where the joint stops; this bounds how fast it gets
+# there, which is what actually makes an unexpected move watchable.
+# SRAM on the servo: reset by every power cycle, so it is re-applied per run.
+SERVO_MOVE_SPEED_TICKS_S = 200
+# Ramp rate in units of 100 ticks/s^2. A low speed with maximum acceleration
+# still starts with a jerk that rocks the whole arm.
+SERVO_MOVE_ACCEL = 10
+
+# Motion pacing for anything near the table. Every commanded move in the pick
+# path is broken into hops of at most PICK_STEP_TICKS with PICK_STEP_PAUSE_S of
+# rest between them, so the arm advances in short, watchable increments instead
+# of one continuous slew. Operator-specified after a mid-move power cut dropped
+# the arm and overloaded J3 (2026-08-04): the pause is what makes a wrong move
+# stoppable by hand. Distinct from SERVO_MOVE_SPEED_TICKS_S, which caps how fast
+# a single hop runs -- these cap how far it goes and how long the arm rests.
+PICK_STEP_TICKS = 60           # ~5.3 deg per hop on J1-J5
+PICK_STEP_PAUSE_S = 0.5
 
 # Gripper (J6) open/closed positions, expressed as an angle offset (radians) from
 # the servo's calibrated home. Converted to ticks through the same per-servo

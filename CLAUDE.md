@@ -8,7 +8,9 @@ Computer vision pipeline (OpenCV, classical CV — no ML yet) for a **5-DOF** ro
 
 The full path is implemented end-to-end against a **simulated** robot: detect brick → back-project its pixel to a table coordinate in the robot base frame → plan a top-down grasp → command the arm. What is *not* real yet: the calibration numbers (camera intrinsics + hand-eye transform are placeholders) and the robot backend (only `SimRobot` exists). See **Merge path** below — those are the two things to fill in.
 
-See [README.md](README.md) for a quick project overview, setup, and the command list; this file goes deeper on architecture, the data flow, and the merge path onto real hardware.
+See [README.md](README.md) for a quick project overview, setup, and the command list; this file goes deeper on architecture, the data flow, and the merge path onto real hardware. Session narratives live in `SESSION_LOG_2026-07-22.md` (bring-up) and `SESSION_LOG_2026-08-04.md` (hand-eye diagnosis, joint limits, the arm-drop incident).
+
+**Current state in one line:** the vision pipeline is merge-ready and fully tested; the arm's vertical kinematics are validated on hardware; **`data/hand_eye.json` is measurably wrong** (52 mm, see below) and a pick is additionally blocked by ground-derived joint limits capping forward reach at ~180 mm. Both have identified causes and neither is a code defect in the pipeline.
 
 ## COORDINATE FRAMES — the imported model is upside-down (read before touching kinematics)
 
@@ -96,6 +98,21 @@ python scripts/review_images.py               # step through tests/sample_images
 python scripts/run_arm_ui.py                  # mock joints, no hardware needed
 python scripts/run_arm_ui.py --hardware       # drives the real servo bus
 python scripts/run_arm_ui.py --no-camera --overlay   # flags compose freely
+
+# HARDWARE — read-only, safe any time (run these first after a power cycle)
+python scripts/check_servo_health.py          # bus, reads, home agreement, FK cross-check
+python scripts/servo_torque.py                # which joints are actually HOLDING
+python scripts/test_pick_dry_run.py --save data/dryrun.png   # whole pick path, commands nothing
+
+# HARDWARE — these MOVE the arm. Ctrl-C freezes it; power cut is the last resort.
+python scripts/goto_point.py --x 145 --y 35 --z -64 --hover-only   # ruler-driven, no vision
+python scripts/jog_joint.py --joint 5 --ticks 150                  # one joint, dir_sign check
+python scripts/goto_tick.py --joint 2 --ticks 2883                 # one joint to a tick
+python scripts/find_joint_limits.py --joint 3                      # measure travel
+
+# HARDWARE — recovery
+python scripts/freeze.py                      # STOP the arm without dropping it
+python scripts/servo_torque.py --enable 3     # re-enable a limp joint where it sits
 ```
 
 There is no build step and no linter configured.
@@ -209,7 +226,56 @@ The arm-side chain is **live and validated on the vertical axis**; the camera-si
 
 **Still open on the arm side:** the lateral probes (`forward`/`left`/`right` — where a J1/J5 sign or scale error would surface, since vertical barely exercises them), and J6's open/closed tick range against `SERVO_GRIPPER_OPEN_RAD`/`CLOSE_RAD`. The `back` probe is *expected* to be refused by the tick cap: the arm works close in (tip x ≈ 75 mm) where the tip is near the J1 axis, so small Cartesian moves demand large J1/J5 swings. That refusal is the safety system working, not a driver bug.
 
-**Operator safety convention:** stand by the power cut whenever a commanded move turns any joint more than `config.SERVO_WATCH_POWER_MOVE_DEG` (45°). Both `jog_joint.py` and `validate_ik_roundtrip.py` preview per-joint degree deltas and print a banner when a move crosses it. Cutting power drops holding torque on *every* joint at once — it is the only real e-stop, and there is no way to power down one servo independently.
+#### J5's `dir_sign` is probably inverted — the likely cause of the hand-eye failure (2026-08-04, UNRESOLVED)
+
+Hand-eye calibration failed repeatedly with one signature: **FK and the camera agreed on rotation *magnitude* (0.3° median) but disagreed on rotation *axis* (Kabsch residual 25–40°)**. For a rigidly-mounted camera both must hold, and no rigid transform explains data where only one does. Board square size, resolution, planar pose ambiguity, outliers, stale frames, MATLAB joint axes, `ticks_per_rad`, joint zero offsets and autofocus were each eliminated **by measurement** (see `SESSION_LOG_2026-08-04.md` §1).
+
+Re-solving the 49 saved samples under all 32 `dir_sign` combinations:
+
+```
+as recorded  (+1 +1 +1 +1 +1)   39.0 deg   <- no rigid transform explains this
+flip J5 only (+1 +1 +1 +1 -1)    3.4 deg   <- consistent
+flip J2/3/4/5(+1 -1 -1 -1 -1)    3.5 deg   <- same solution in disguise (J2||J3||J4)
+```
+
+It fits: **the camera is mounted on J5** and visibly swings with it, so an inverted sign means FK believes the camera rotated one way while it physically rotated the other — right magnitude, wrong axis. It also explains why Stage D passed, since vertical moves barely exercise J5.
+
+**Do not flip it on this evidence alone.** Two unresolved conflicts: the operator twice observed *J1* turning the wrong way, yet every J1-flipped combination scores ≥19°; and the recovered angles came from inverting stored FK, where a 5-DOF arm's multiple joint solutions per tip pose mean the recovery may not be the original branch. Settle it with one clean `scripts/jog_joint.py` per joint — small, isolated, and now safe at the capped speed. **If J5 is confirmed inverted, the 49 saved samples become consistent with no recapture.**
+
+**Corollary for any future `dir_sign` work:** an FK-vs-IK error number cannot validate a sign (`rad_to_ticks`/`ticks_to_rad` cancel it), and neither can a hand-eye solve's own residual. Only a physical jog or a ruler closes that loop.
+
+#### The stored hand-eye transform is WRONG — do not trust `data/hand_eye.json` (2026-08-04)
+
+Measured against the board, which lies flat on the table and so gives an absolute camera pose independent of FK and hand-eye:
+
+| | camera height above table |
+|---|---|
+| Board (`solvePnP`) | **228.0 mm** |
+| FK + hand-eye | 279.9 mm |
+
+52 mm out, and the optical axis points 91° off the claw direction. A brick back-projects ~400 mm from where a ruler puts it. **This test uses no ruler and no assumption about the base origin**, so it condemns the transform regardless of where the base column actually is. Run [`scripts/test_pick_dry_run.py`](scripts/test_pick_dry_run.py) to reproduce — it walks the whole pick path and commands nothing. Wrong calibration does not fail loudly; it yields a confident, well-formed `PickTarget` that `run_once` would drive straight to.
+
+[`scripts/calibrate_board_to_base.py`](scripts/calibrate_board_to_base.py) is the route around it: a brick's pixel intersected with the **board plane** needs only intrinsics and `solvePnP`, so the camera's base-frame pose never enters. Prefer its `--touch` mode (claw onto a known ChArUco corner, read FK) over `--add` (ruler) — a ruler measured from an assumed base origin that is off by some offset produces a transform in the *operator's* frame, and the arm then misses every pick by exactly that offset, silently and consistently. Bring-up scaffolding, not the merge path.
+
+#### Joint travel limits, and why ground collision is not one (2026-08-04)
+
+`ServoBus` capped how FAR one command travelled but had no idea WHERE a joint could go, so small legal steps walked J3 and then J4 into hard stops. `_check_travel_limits` now enforces absolute `min_tick`/`max_tick`; a joint already out of range is not trapped, since moves that *reduce* the violation are allowed. Measure with [`scripts/find_joint_limits.py`](scripts/find_joint_limits.py) (operator-confirmed steps, watches for the 4095→0 wrap); `matlab/init_arm.m` reads the resulting `data/joint_limits_rad.json` so IK stops proposing unreachable solutions. [`scripts/goto_tick.py`](scripts/goto_tick.py) walks one joint to a target in sub-cap increments.
+
+**Recorded: J2 `[2883, 3468]` (51°), J3 `[200, 1096]` (79°). J1/J4/J5/J6 unmeasured.**
+
+**Both recorded limits are ground-derived, not mechanical** — the joint stopped because the *claw* reached the table at the elbow angle used when measuring. Fold the elbow differently and the same joint angle is safe. They carry a `limit_basis` field saying so. The honest form of that constraint is Cartesian: `config.MIN_CLAW_HEIGHT_M` (5 mm), enforced in `HardwareRobot.send_target_pose`, deliberately below `PICK_Z_OFFSET` (10 mm) so it cannot refuse the pick it exists to protect.
+
+**Consequence, and it bites:** at table height the arm reaches only **~180 mm forward** (220 mm at z = +80), with J2 and J3 both pinned at their minimums. That is the joint limits, not the arm's geometry. Re-measuring the *mechanical* stops with the elbow folded so the claw cannot ground out would give back workspace to ~280 mm.
+
+A limit that lands on the 0/4095 encoder seam is unusable — J3's was first measured at tick 6, the same geometry as the July J1 runaway — so it was pulled in to 200 (~18° of margin). `find_joint_limits.py` now warns when a *measured* limit lands near the seam, not just the starting position.
+
+**Operator safety convention:** stand by the power cut whenever a commanded move turns any joint more than `config.SERVO_WATCH_POWER_MOVE_DEG` (45°). Both `jog_joint.py` and `validate_ik_roundtrip.py` preview per-joint degree deltas and print a banner when a move crosses it.
+
+**Two stops exist, and the power cut is the WORSE one — reach for it second.** Once a Goal Position is written the servo travels there regardless of whether anything is still talking to it, so killing the script does not stop the arm.
+- **Freeze (`ServoBus.freeze`, Ctrl-C in `goto_point.py`, or `scripts/freeze.py` from a second terminal)** overwrites each joint's goal with its present position. Motion halts, torque stays on, nothing falls. Needs a working serial link.
+- **The power cut** drops holding torque on *every* joint simultaneously and the arm falls under its own weight; there is no way to power down one servo independently. Use it when freeze doesn't visibly stop the arm within a second, or when the bus is unresponsive. On 2026-08-04 a mid-move power cut dropped the arm face-first and back-drove J3 hard enough to trip its overload protection — the servo came back answering the bus normally, at healthy voltage with no fault flags, but with torque disabled and the joint sagged 54°. `scripts/servo_torque.py` reports the Torque Enable register (the only thing that distinguishes this from a dead servo) and re-enables a limp joint *at its present position*, so it holds rather than snapping back to a stale goal.
+
+**Servo speed is capped in software, not by the servos.** `config.SERVO_MOVE_SPEED_TICKS_S` / `SERVO_MOVE_ACCEL` are written via `ServoBus.set_motion_profile`; without them every move runs at the servo's full default speed, which ends each step in a hard stop and puts peak torque far above what the pose needs statically. They live in the servo's SRAM, so they reset on every power cycle and must be re-applied per run — `goto_point.py` does this at startup and prints the limit.
 
 ## Tuning is centralized in config.py
 

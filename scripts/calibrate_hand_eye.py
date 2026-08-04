@@ -44,6 +44,7 @@ TSAI-vs-PARK (which shares its input data) cannot. See calibration/hand_eye.py.
 
 import argparse
 import sys
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
@@ -58,6 +59,9 @@ from vision_pipeline.calibration.hand_eye import (
     HandEyeAccumulator,
     cross_board_agreement_mm,
     detect_board_poses,
+    load_samples,
+    rotation_axis_spread_deg,
+    save_samples,
     select_best,
 )
 from vision_pipeline.calibration.pixel_to_world import save_hand_eye
@@ -76,6 +80,37 @@ def _current_angles_rad(bus: ServoBus) -> list[float]:
     return [bus.ticks_to_rad(j, bus.read_position(j)) for j in IK_JOINTS]
 
 
+def _wait_until_still(bus: ServoBus, timeout_s: float = 6.0, tol_ticks: int = 2):
+    """Block until every IK joint reports the same position on two successive reads.
+
+    A sample pairs ONE camera frame with ONE FK reading and asserts they describe
+    the same instant. Record while the arm is still settling and they do not: the
+    sample stays internally plausible, so nothing rejects it, but it silently
+    contradicts every other sample and no rigid transform can fit the set.
+
+    Measured on hardware 2026-08-04: samples taken without this showed FK and
+    camera rotation angles disagreeing by up to 68 deg on individual pairs, while
+    scripts/validate_joint_geometry.py — which does wait — agreed to within 2%
+    on the same joints. Verifying stillness is cheap; trusting the operator to
+    pause long enough is not.
+
+    Returns:
+        The settled tick readings, or the last reading if it never stabilised.
+    """
+    deadline = time.monotonic() + timeout_s
+    previous = None
+    while time.monotonic() < deadline:
+        current = [bus.read_position(j) for j in IK_JOINTS]
+        if previous is not None and all(
+            abs(a - b) <= tol_ticks for a, b in zip(current, previous)
+        ):
+            return current
+        previous = current
+        time.sleep(0.15)
+    print("  WARNING: joints never settled — sample may be unreliable.")
+    return previous
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--camera-index", type=int, default=config.CAMERA_INDEX)
@@ -83,6 +118,14 @@ def main() -> None:
     parser.add_argument("--servo-baud", type=int, default=config.SERVO_BAUD)
     parser.add_argument("--out", default=config.HAND_EYE_PATH)
     parser.add_argument("--min-samples", type=int, default=config.CALIB_HAND_EYE_MIN_SAMPLES)
+    parser.add_argument(
+        "--samples", default="data/hand_eye_samples.json",
+        help="raw samples file; rewritten after every 'r' so a crashed session is not lost",
+    )
+    parser.add_argument(
+        "--fresh", action="store_true",
+        help="ignore any existing --samples file instead of resuming from it",
+    )
     args = parser.parse_args()
 
     intr = load_intrinsics()
@@ -107,6 +150,15 @@ def main() -> None:
         sys.exit(1)
 
     acc = HandEyeAccumulator(min_samples=args.min_samples)
+    if not args.fresh:
+        try:
+            acc = load_samples(args.samples, min_samples=args.min_samples)
+            print(f"Resumed {sum(acc.counts().values())} samples from {args.samples} "
+                  f"-> counts {acc.counts()}")
+            print("(pass --fresh to start empty instead)")
+        except FileNotFoundError:
+            pass
+
     active_joint = 1
     step_ticks = DEFAULT_STEP_TICKS
 
@@ -166,13 +218,36 @@ def main() -> None:
                     print(f"  REFUSED: {e}")
 
             elif key == ord("r"):
-                if not board_poses:
+                # Re-capture rather than banking the frame the display loop is
+                # holding. cv2.VideoCapture buffers frames, and detecting
+                # CALIB_BOARD_COUNT boards per iteration makes this loop slower
+                # than the camera's frame rate — so the buffer stays full and
+                # the displayed frame can lag the arm by hundreds of ms. Pairing
+                # a stale frame with a fresh FK reading records the camera and
+                # the wrist at DIFFERENT poses, which silently corrupts the
+                # solve: it stays self-consistent per sample but no single rigid
+                # transform can fit the set. Diagnosed 2026-08-04, after the
+                # arm itself was cleared by scripts/validate_joint_geometry.py.
+                # Order matters: settle FIRST, then flush the buffer, then read
+                # the joints again and require they have not moved. Only then do
+                # the frame and the FK pose provably describe the same instant.
+                settled = _wait_until_still(bus)
+                for _ in range(6):
+                    fresh = camera.read_frame()
+                fresh_gray = cv2.cvtColor(fresh, cv2.COLOR_BGR2GRAY)
+                fresh_poses = detect_board_poses(fresh_gray, intr, detectors)
+                if not fresh_poses:
                     print("  no board visible with enough corners — not recorded.")
                     continue
-                angles_rad = _current_angles_rad(bus)
+                after = [bus.read_position(j) for j in IK_JOINTS]
+                if settled is None or any(abs(a - b) > 2 for a, b in zip(after, settled)):
+                    print("  arm MOVED while capturing — discarded. Let it settle and retry.")
+                    continue
+                angles_rad = [bus.ticks_to_rad(j, t) for j, t in zip(IK_JOINTS, after)]
                 t_base_gripper = client.request_fk(angles_rad)
-                new_counts = acc.add(board_poses, t_base_gripper)
-                print(f"  recorded boards {sorted(board_poses)} -> counts {new_counts}")
+                new_counts = acc.add(fresh_poses, t_base_gripper)
+                save_samples(acc, args.samples)
+                print(f"  recorded boards {sorted(fresh_poses)} -> counts {new_counts}")
 
             elif key == ord("c"):
                 break
@@ -189,6 +264,16 @@ def main() -> None:
         print(f"\nBoard #{idx+1}: {r.n_samples} samples")
         print(f"  TSAI vs PARK translation disagreement: {r.tsai_park_disagreement_mm:.1f} mm "
               f"({'ok' if r.tsai_park_disagreement_mm < 5 else 'HIGH — add more/varied poses'})")
+        # Rotation is checked separately because translation agreement alone does
+        # NOT imply the orientation is right — see hand_eye.rotation_angle_deg.
+        print(f"  TSAI vs PARK ROTATION disagreement: {r.tsai_park_rotation_deg:.1f} deg "
+              f"({'ok' if r.tsai_park_rotation_deg < 2 else 'HIGH — orientation is not trustworthy'})")
+        axis_spread = rotation_axis_spread_deg(acc, idx)
+        if axis_spread is None:
+            print("  rotation-axis diversity: TOO FEW MOTIONS to assess")
+        else:
+            print(f"  rotation-axis diversity: {axis_spread:.0f} deg "
+                  f"({'ok' if axis_spread > 30 else 'DEGENERATE — jog a different joint'})")
         print(f"  board base-frame position spread: {r.board_spread_mm:.1f} mm "
               f"({'ok' if r.board_spread_mm < 10 else 'HIGH — result is suspect'})")
         print(f"  mean board origin (base) [m]: {r.mean_board_origin_base}")
@@ -201,9 +286,32 @@ def main() -> None:
         print("\nOnly one board solved — no cross-board agreement check available.")
 
     best = select_best(results)
+
+    # --- physical plausibility, independent of every internal statistic -------
+    # A solve can be perfectly self-consistent and still describe a camera that
+    # cannot exist on this arm. Both checks below caught a bad solve on
+    # 2026-08-04 that passed the translation gate at 3.0 mm.
+    print("\n=== physical plausibility ===")
+    offset_mm = float(np.linalg.norm(best.t_gripper_camera_tsai[:3, 3])) * 1000.0
+    print(f"  camera is {offset_mm:.0f} mm from the wrist — compare against a ruler "
+          f"(claw tip sits ~70 mm out).")
+
+    # The camera looks at the table, so its optical axis must point DOWNWARD in
+    # the base frame at the poses actually sampled. An axis pointing up means the
+    # solved orientation is flipped, which puts every board on the wrong side.
+    samples = acc._samples[best.board_index]
+    axis_z = [
+        float((s.T_base_gripper[:3, :3] @ best.t_gripper_camera_tsai[:3, 2])[2])
+        for s in samples
+    ]
+    mean_axis_z = float(np.mean(axis_z))
+    print(f"  optical axis base-frame z component: {mean_axis_z:+.2f} "
+          f"({'ok — camera looks down' if mean_axis_z < 0 else 'WRONG — camera looks UP; do not use this result'})")
+
     save_hand_eye(best.t_gripper_camera_tsai, args.out)
     print(f"\nSaved gripper->camera transform from board #{best.board_index+1} to {args.out}")
     print(f"  translation [mm]: {best.t_gripper_camera_tsai[:3, 3] * 1000}")
+    print(f"  raw samples kept in {args.samples} (re-run to resume, --fresh to discard)")
 
 
 if __name__ == "__main__":
