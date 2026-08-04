@@ -44,6 +44,7 @@ TSAI-vs-PARK (which shares its input data) cannot. See calibration/hand_eye.py.
 
 import argparse
 import sys
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
@@ -77,6 +78,37 @@ MAX_STEP_TICKS = 300
 def _current_angles_rad(bus: ServoBus) -> list[float]:
     """J1..J5 angles in radians, straight from a servo read-back — no Pose involved."""
     return [bus.ticks_to_rad(j, bus.read_position(j)) for j in IK_JOINTS]
+
+
+def _wait_until_still(bus: ServoBus, timeout_s: float = 6.0, tol_ticks: int = 2):
+    """Block until every IK joint reports the same position on two successive reads.
+
+    A sample pairs ONE camera frame with ONE FK reading and asserts they describe
+    the same instant. Record while the arm is still settling and they do not: the
+    sample stays internally plausible, so nothing rejects it, but it silently
+    contradicts every other sample and no rigid transform can fit the set.
+
+    Measured on hardware 2026-08-04: samples taken without this showed FK and
+    camera rotation angles disagreeing by up to 68 deg on individual pairs, while
+    scripts/validate_joint_geometry.py — which does wait — agreed to within 2%
+    on the same joints. Verifying stillness is cheap; trusting the operator to
+    pause long enough is not.
+
+    Returns:
+        The settled tick readings, or the last reading if it never stabilised.
+    """
+    deadline = time.monotonic() + timeout_s
+    previous = None
+    while time.monotonic() < deadline:
+        current = [bus.read_position(j) for j in IK_JOINTS]
+        if previous is not None and all(
+            abs(a - b) <= tol_ticks for a, b in zip(current, previous)
+        ):
+            return current
+        previous = current
+        time.sleep(0.15)
+    print("  WARNING: joints never settled — sample may be unreliable.")
+    return previous
 
 
 def main() -> None:
@@ -196,6 +228,10 @@ def main() -> None:
                 # solve: it stays self-consistent per sample but no single rigid
                 # transform can fit the set. Diagnosed 2026-08-04, after the
                 # arm itself was cleared by scripts/validate_joint_geometry.py.
+                # Order matters: settle FIRST, then flush the buffer, then read
+                # the joints again and require they have not moved. Only then do
+                # the frame and the FK pose provably describe the same instant.
+                settled = _wait_until_still(bus)
                 for _ in range(6):
                     fresh = camera.read_frame()
                 fresh_gray = cv2.cvtColor(fresh, cv2.COLOR_BGR2GRAY)
@@ -203,7 +239,11 @@ def main() -> None:
                 if not fresh_poses:
                     print("  no board visible with enough corners — not recorded.")
                     continue
-                angles_rad = _current_angles_rad(bus)
+                after = [bus.read_position(j) for j in IK_JOINTS]
+                if settled is None or any(abs(a - b) > 2 for a, b in zip(after, settled)):
+                    print("  arm MOVED while capturing — discarded. Let it settle and retry.")
+                    continue
+                angles_rad = [bus.ticks_to_rad(j, t) for j, t in zip(IK_JOINTS, after)]
                 t_base_gripper = client.request_fk(angles_rad)
                 new_counts = acc.add(fresh_poses, t_base_gripper)
                 save_samples(acc, args.samples)
