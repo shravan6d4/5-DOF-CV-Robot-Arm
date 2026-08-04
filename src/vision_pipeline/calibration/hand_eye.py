@@ -23,7 +23,9 @@ poisons calibrateHandEye, so callers here must pass the FK 4x4 straight through
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
+from pathlib import Path
 
 import cv2
 import numpy as np
@@ -99,8 +101,24 @@ class BoardResult:
     t_gripper_camera_tsai: np.ndarray  # 4x4 — the value actually saved
     t_gripper_camera_park: np.ndarray  # 4x4 — computed only as a trust cross-check
     tsai_park_disagreement_mm: float
+    tsai_park_rotation_deg: float
     board_spread_mm: float
     mean_board_origin_base: np.ndarray  # (3,) — doubles as a TABLE_Z_IN_BASE cross-check
+
+
+def rotation_angle_deg(R_a: np.ndarray, R_b: np.ndarray) -> float:
+    """Angle (degrees) of the rotation taking R_a to R_b.
+
+    Exists because comparing only TRANSLATION between two hand-eye methods is
+    not enough to trust a solve: an ill-conditioned or ambiguous sample set can
+    drive TSAI and PARK to the same badly-wrong ORIENTATION while their
+    translations agree to millimetres. Observed on hardware 2026-08-04 — a solve
+    reporting 3.0 mm TSAI-vs-PARK had the camera's optical axis pointing ~180
+    deg away from where it physically points, which put every board 430 mm off.
+    """
+    R = np.asarray(R_a, dtype=float).T @ np.asarray(R_b, dtype=float)
+    cos = (np.trace(R) - 1.0) / 2.0
+    return float(np.degrees(np.arccos(np.clip(cos, -1.0, 1.0))))
 
 
 class HandEyeAccumulator:
@@ -192,6 +210,7 @@ class HandEyeAccumulator:
             t_gripper_camera_tsai=T_tsai,
             t_gripper_camera_park=T_park,
             tsai_park_disagreement_mm=disagreement_mm,
+            tsai_park_rotation_deg=rotation_angle_deg(R_te, R_pk),
             board_spread_mm=spread_mm,
             mean_board_origin_base=board_origins.mean(axis=0),
         )
@@ -213,6 +232,84 @@ def select_best(results: dict[int, BoardResult]) -> BoardResult:
     if not results:
         raise ValueError("no board results to select from")
     return max(results.values(), key=lambda r: (r.n_samples, -r.tsai_park_disagreement_mm))
+
+
+def save_samples(accumulator: HandEyeAccumulator, path: str | Path) -> None:
+    """Write every accumulated raw sample to JSON.
+
+    A hand-eye session is 20+ minutes of hand-jogging an arm, and the solve can
+    fail in ways only visible in the raw samples (rotation-axis degeneracy, a
+    board that shifted mid-session). Without this the samples die with the
+    process and a failed run leaves nothing to diagnose or resume from — which
+    is exactly what happened on 2026-08-04. Call after every recorded sample;
+    the files are small and rewriting is cheaper than losing a session.
+    """
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "boards": {
+            str(idx): [
+                {
+                    "T_base_gripper": s.T_base_gripper.tolist(),
+                    "T_cam_board": s.T_cam_board.tolist(),
+                }
+                for s in samples
+            ]
+            for idx, samples in accumulator._samples.items()
+        }
+    }
+    path.write_text(json.dumps(payload, indent=2))
+
+
+def load_samples(
+    path: str | Path, min_samples: int = config.CALIB_HAND_EYE_MIN_SAMPLES
+) -> HandEyeAccumulator:
+    """Rebuild an accumulator from a file written by save_samples.
+
+    Raises:
+        FileNotFoundError: no such file (callers decide whether that's fatal).
+    """
+    payload = json.loads(Path(path).read_text())
+    acc = HandEyeAccumulator(min_samples=min_samples)
+    for idx_str, samples in payload.get("boards", {}).items():
+        acc._samples[int(idx_str)] = [
+            HandEyeSample(
+                T_base_gripper=np.array(s["T_base_gripper"], dtype=float),
+                T_cam_board=np.array(s["T_cam_board"], dtype=float),
+            )
+            for s in samples
+        ]
+    return acc
+
+
+def rotation_axis_spread_deg(accumulator: HandEyeAccumulator, board_index: int) -> float | None:
+    """Max angle between the rotation AXES of this board's relative motions.
+
+    calibrateHandEye needs at least two motions whose rotation axes are NOT
+    parallel; with every motion about one axis the camera translation along it
+    is unobservable and the solve returns a confident, wrong answer. This
+    reports how much axis diversity the samples actually contain, so a
+    degenerate set is visible BEFORE trusting the result rather than after.
+
+    Returns None if there are fewer than two usable motions.
+    """
+    samples = accumulator._samples.get(board_index, [])
+    axes = []
+    for a, b in zip(samples, samples[1:]):
+        R_rel = a.T_base_gripper[:3, :3].T @ b.T_base_gripper[:3, :3]
+        rvec, _ = cv2.Rodrigues(R_rel)
+        angle = float(np.linalg.norm(rvec))
+        if angle < np.radians(2.0):  # too small to define an axis reliably
+            continue
+        axes.append(rvec.reshape(3) / angle)
+    if len(axes) < 2:
+        return None
+    worst = 0.0
+    for i in range(len(axes)):
+        for j in range(i + 1, len(axes)):
+            cos = abs(float(np.dot(axes[i], axes[j])))  # abs: +/-axis is the same axis
+            worst = max(worst, float(np.degrees(np.arccos(np.clip(cos, -1.0, 1.0)))))
+    return worst
 
 
 def cross_board_agreement_mm(results: dict[int, BoardResult]) -> float | None:

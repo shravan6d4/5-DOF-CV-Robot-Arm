@@ -67,3 +67,7 @@ data/camera_intrinsics.json
 data/hand_eye.json
 data/servo_calibration.json
 data/*.bak-*
+# Raw hand-eye samples (calibrate_hand_eye.py --samples): measurements from one
+# physical arm, same policy as the solved transforms above.
+data/hand_eye_samples.json
+data/*.rejected-*

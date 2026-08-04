@@ -58,6 +58,9 @@ from vision_pipeline.calibration.hand_eye import (
     HandEyeAccumulator,
     cross_board_agreement_mm,
     detect_board_poses,
+    load_samples,
+    rotation_axis_spread_deg,
+    save_samples,
     select_best,
 )
 from vision_pipeline.calibration.pixel_to_world import save_hand_eye
@@ -83,6 +86,14 @@ def main() -> None:
     parser.add_argument("--servo-baud", type=int, default=config.SERVO_BAUD)
     parser.add_argument("--out", default=config.HAND_EYE_PATH)
     parser.add_argument("--min-samples", type=int, default=config.CALIB_HAND_EYE_MIN_SAMPLES)
+    parser.add_argument(
+        "--samples", default="data/hand_eye_samples.json",
+        help="raw samples file; rewritten after every 'r' so a crashed session is not lost",
+    )
+    parser.add_argument(
+        "--fresh", action="store_true",
+        help="ignore any existing --samples file instead of resuming from it",
+    )
     args = parser.parse_args()
 
     intr = load_intrinsics()
@@ -107,6 +118,15 @@ def main() -> None:
         sys.exit(1)
 
     acc = HandEyeAccumulator(min_samples=args.min_samples)
+    if not args.fresh:
+        try:
+            acc = load_samples(args.samples, min_samples=args.min_samples)
+            print(f"Resumed {sum(acc.counts().values())} samples from {args.samples} "
+                  f"-> counts {acc.counts()}")
+            print("(pass --fresh to start empty instead)")
+        except FileNotFoundError:
+            pass
+
     active_joint = 1
     step_ticks = DEFAULT_STEP_TICKS
 
@@ -172,6 +192,7 @@ def main() -> None:
                 angles_rad = _current_angles_rad(bus)
                 t_base_gripper = client.request_fk(angles_rad)
                 new_counts = acc.add(board_poses, t_base_gripper)
+                save_samples(acc, args.samples)
                 print(f"  recorded boards {sorted(board_poses)} -> counts {new_counts}")
 
             elif key == ord("c"):
@@ -189,6 +210,16 @@ def main() -> None:
         print(f"\nBoard #{idx+1}: {r.n_samples} samples")
         print(f"  TSAI vs PARK translation disagreement: {r.tsai_park_disagreement_mm:.1f} mm "
               f"({'ok' if r.tsai_park_disagreement_mm < 5 else 'HIGH — add more/varied poses'})")
+        # Rotation is checked separately because translation agreement alone does
+        # NOT imply the orientation is right — see hand_eye.rotation_angle_deg.
+        print(f"  TSAI vs PARK ROTATION disagreement: {r.tsai_park_rotation_deg:.1f} deg "
+              f"({'ok' if r.tsai_park_rotation_deg < 2 else 'HIGH — orientation is not trustworthy'})")
+        axis_spread = rotation_axis_spread_deg(acc, idx)
+        if axis_spread is None:
+            print("  rotation-axis diversity: TOO FEW MOTIONS to assess")
+        else:
+            print(f"  rotation-axis diversity: {axis_spread:.0f} deg "
+                  f"({'ok' if axis_spread > 30 else 'DEGENERATE — jog a different joint'})")
         print(f"  board base-frame position spread: {r.board_spread_mm:.1f} mm "
               f"({'ok' if r.board_spread_mm < 10 else 'HIGH — result is suspect'})")
         print(f"  mean board origin (base) [m]: {r.mean_board_origin_base}")
@@ -201,9 +232,32 @@ def main() -> None:
         print("\nOnly one board solved — no cross-board agreement check available.")
 
     best = select_best(results)
+
+    # --- physical plausibility, independent of every internal statistic -------
+    # A solve can be perfectly self-consistent and still describe a camera that
+    # cannot exist on this arm. Both checks below caught a bad solve on
+    # 2026-08-04 that passed the translation gate at 3.0 mm.
+    print("\n=== physical plausibility ===")
+    offset_mm = float(np.linalg.norm(best.t_gripper_camera_tsai[:3, 3])) * 1000.0
+    print(f"  camera is {offset_mm:.0f} mm from the wrist — compare against a ruler "
+          f"(claw tip sits ~70 mm out).")
+
+    # The camera looks at the table, so its optical axis must point DOWNWARD in
+    # the base frame at the poses actually sampled. An axis pointing up means the
+    # solved orientation is flipped, which puts every board on the wrong side.
+    samples = acc._samples[best.board_index]
+    axis_z = [
+        float((s.T_base_gripper[:3, :3] @ best.t_gripper_camera_tsai[:3, 2])[2])
+        for s in samples
+    ]
+    mean_axis_z = float(np.mean(axis_z))
+    print(f"  optical axis base-frame z component: {mean_axis_z:+.2f} "
+          f"({'ok — camera looks down' if mean_axis_z < 0 else 'WRONG — camera looks UP; do not use this result'})")
+
     save_hand_eye(best.t_gripper_camera_tsai, args.out)
     print(f"\nSaved gripper->camera transform from board #{best.board_index+1} to {args.out}")
     print(f"  translation [mm]: {best.t_gripper_camera_tsai[:3, 3] * 1000}")
+    print(f"  raw samples kept in {args.samples} (re-run to resume, --fresh to discard)")
 
 
 if __name__ == "__main__":
