@@ -180,10 +180,17 @@ one joint per confirmation.
 
 Confirmed physical behavior:
 
+> **CORRECTION (2026-08-04): the J2 row below is INVERTED.** A raw-tick jog
+> during camera-based joint validation showed `-ticks` tilts the shoulder UP,
+> i.e. `+ticks` tilts it DOWN. MATLAB FK independently predicts `+100 ticks ->
+> wrist z -5.2 mm (down)`, so FK and the physical arm agree and
+> `data/servo_calibration.json`'s `dir_sign = -1` for J2 is CORRECT — only this
+> table is wrong. Do not re-derive anything from the J2 row; verify by jog.
+
 | Joint | Role | +ticks direction |
 |---|---|---|
 | J1 | base yaw | counterclockwise (viewed from above) |
-| J2 | shoulder | tilts up |
+| J2 | shoulder | tilts up  *(WRONG — see correction above; +ticks tilts DOWN)* |
 | J3 | elbow | folds down, toward the table |
 | J4 | wrist pitch | down/toward base (ccw from the side) |
 | J5 | wrist roll | ccw (viewed from behind the robot) |
