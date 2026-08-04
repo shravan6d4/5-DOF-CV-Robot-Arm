@@ -99,6 +99,13 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--joint", type=int, required=True, choices=range(1, 7))
     ap.add_argument("--step", type=int, default=30, help="ticks per step (default 30)")
+    ap.add_argument(
+        "--direction", choices=("both", "plus", "minus"), default="both",
+        help="which way to explore. Use plus/minus when the joint already sits "
+             "AT one end: the starting position is then recorded as that end and "
+             "only the other direction is explored, so the arm is never driven "
+             "into a stop it is already touching.",
+    )
     ap.add_argument("--port", default=config.SERVO_PORT)
     ap.add_argument("--baud", type=int, default=config.SERVO_BAUD)
     ap.add_argument("--calibration", default=config.SERVO_CALIBRATION_PATH)
@@ -114,22 +121,34 @@ def main() -> None:
             print(f"  WARNING: only {min(start, 4095-start)} ticks from the 0/4095 seam.")
             print("  Limits measured here are fragile; consider re-centring first.")
 
-        hi = explore(bus, args.joint, abs(args.step))
-        if hi is None:
-            sys.exit(1)
+        if args.direction == "plus":
+            print(f"  --direction plus: recording {start} as the LOWER limit "
+                  f"(joint is already at that end) and exploring + only.")
+            lo = start
+            hi = explore(bus, args.joint, abs(args.step))
+        elif args.direction == "minus":
+            print(f"  --direction minus: recording {start} as the UPPER limit "
+                  f"(joint is already at that end) and exploring - only.")
+            hi = start
+            lo = explore(bus, args.joint, -abs(args.step))
+        else:
+            hi = explore(bus, args.joint, abs(args.step))
+            if hi is None:
+                sys.exit(1)
 
-        print(f"\n  returning toward the start ({start}) before the other direction...")
-        while abs(bus.read_position(args.joint) - start) > abs(args.step):
-            cur = bus.read_position(args.joint)
-            nxt = cur + int(np.sign(start - cur)) * abs(args.step)
-            try:
-                bus.move_and_verify(args.joint, nxt)
-            except Exception as e:
-                print(f"  stopped returning: {e}")
-                break
+            print(f"\n  returning toward the start ({start}) before the other direction...")
+            while abs(bus.read_position(args.joint) - start) > abs(args.step):
+                cur = bus.read_position(args.joint)
+                nxt = cur + int(np.sign(start - cur)) * abs(args.step)
+                try:
+                    bus.move_and_verify(args.joint, nxt)
+                except Exception as e:
+                    print(f"  stopped returning: {e}")
+                    break
 
-        lo = explore(bus, args.joint, -abs(args.step))
-        if lo is None:
+            lo = explore(bus, args.joint, -abs(args.step))
+
+        if lo is None or hi is None:
             sys.exit(1)
 
     lo, hi = sorted((lo, hi))
