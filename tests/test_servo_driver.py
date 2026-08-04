@@ -532,3 +532,84 @@ def test_calibration_missing_home_angle_is_rejected(monkeypatch, tmp_path):
     monkeypatch.setattr(sd.serial, "Serial", lambda *a, **k: FakeServoSerial())
     with pytest.raises(sd.ServoCalibrationError, match="home_angle_rad"):
         ServoBus("COM_FAKE", calibration_path=str(stale))
+
+
+# --- paced stepping (config.PICK_STEP_TICKS / PICK_STEP_PAUSE_S) -------------
+#
+# The operator requirement after the 2026-08-04 J3 overload: every move in the
+# pick path advances in hops of at most 60 ticks with a rest between them, so a
+# wrong move can be watched and stopped by hand. These pin that no single
+# commanded hop exceeds the step size, that the joint still arrives exactly, and
+# that the rest actually happens -- a regression in any of the three turns a
+# paced move back into a continuous slew.
+
+
+def _goal_values(fake, servo_id):
+    """Every Goal Position value written to one servo, in order."""
+    return [
+        p["data"][0] | (p["data"][1] << 8)
+        for p in _parse_packets(bytes(fake.written))
+        if p["inst"] == sd.ServoBus.INST_WRITE
+        and p["id"] == servo_id
+        and p["addr"] == sd.ServoBus.ADDR_GOAL_POSITION
+    ]
+
+
+def test_move_joints_stepped_never_exceeds_step_size(monkeypatch):
+    fake = FakeServoSerial(servo_id=1, present_ticks=2000)
+    bus = _bus(monkeypatch, fake)
+
+    bus.move_joints_stepped({1: 2300}, step_ticks=60, pause_s=0)
+
+    goals = _goal_values(fake, 1)
+    assert goals[-1] == 2300, "must actually arrive at the target"
+    hops = [b - a for a, b in zip([2000] + goals, goals)]
+    assert all(abs(h) <= 60 for h in hops), f"a hop exceeded the step size: {hops}"
+    assert len(goals) == 5, f"300 ticks / 60 should be 5 hops, got {len(goals)}"
+
+
+def test_move_joints_stepped_rests_between_steps(monkeypatch):
+    fake = FakeServoSerial(servo_id=1, present_ticks=2000)
+    bus = _bus(monkeypatch, fake)
+    slept = []
+    monkeypatch.setattr(sd.time, "sleep", lambda s: slept.append(s))
+
+    bus.move_joints_stepped({1: 2180}, step_ticks=60, pause_s=0.5)
+
+    # 3 hops -> 2 rests: the arm should not sit paused after arriving.
+    assert slept.count(0.5) == 2, f"expected 2 rests of 0.5s, got {slept}"
+
+
+def test_move_joints_stepped_is_a_noop_when_already_there(monkeypatch):
+    fake = FakeServoSerial(servo_id=1, present_ticks=2048)
+    bus = _bus(monkeypatch, fake)
+
+    assert bus.move_joints_stepped({1: 2048}, step_ticks=60, pause_s=0) == {1: 2048}
+    assert _goal_values(fake, 1) == [], "should command nothing when already at target"
+
+
+def test_freeze_commands_present_position_as_goal(monkeypatch):
+    fake = FakeServoSerial(servo_id=1, present_ticks=1234)
+    bus = _bus(monkeypatch, fake)
+
+    assert bus.freeze([1]) == {1: 1234}
+    assert _goal_values(fake, 1) == [1234], "freeze must pin the goal to where it is"
+
+
+def test_enable_torque_sets_goal_before_enabling(monkeypatch):
+    fake = FakeServoSerial(servo_id=1, present_ticks=915)
+    bus = _bus(monkeypatch, fake)
+
+    assert bus.enable_torque(1) == 915
+
+    writes = [
+        p["addr"]
+        for p in _parse_packets(bytes(fake.written))
+        if p["inst"] == sd.ServoBus.INST_WRITE and p["id"] == 1
+    ]
+    goal_at = writes.index(sd.ServoBus.ADDR_GOAL_POSITION)
+    torque_at = writes.index(sd.ServoBus.ADDR_TORQUE_ENABLE)
+    assert goal_at < torque_at, (
+        "torque must be enabled AFTER the goal is pinned to the present position, "
+        "or the servo snaps back to a stale goal from wherever gravity left it"
+    )

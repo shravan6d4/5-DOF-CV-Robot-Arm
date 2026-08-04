@@ -499,6 +499,27 @@ SERVO_MAX_MOVE_DELTA_TICKS = 400
 # — which is exactly the case that most deserves a human watching.
 SERVO_WATCH_POWER_MOVE_DEG = 45.0
 
+# How fast a commanded joint move is allowed to run, in ticks/s (4096 ticks is a
+# full turn, so 200 ~= 18 deg/s). The servos default to full speed, which during
+# bring-up means a wrong move completes before anyone can react to it. Capping
+# the SIZE of a step bounds where the joint stops; this bounds how fast it gets
+# there, which is what actually makes an unexpected move watchable.
+# SRAM on the servo: reset by every power cycle, so it is re-applied per run.
+SERVO_MOVE_SPEED_TICKS_S = 200
+# Ramp rate in units of 100 ticks/s^2. A low speed with maximum acceleration
+# still starts with a jerk that rocks the whole arm.
+SERVO_MOVE_ACCEL = 10
+
+# Motion pacing for anything near the table. Every commanded move in the pick
+# path is broken into hops of at most PICK_STEP_TICKS with PICK_STEP_PAUSE_S of
+# rest between them, so the arm advances in short, watchable increments instead
+# of one continuous slew. Operator-specified after a mid-move power cut dropped
+# the arm and overloaded J3 (2026-08-04): the pause is what makes a wrong move
+# stoppable by hand. Distinct from SERVO_MOVE_SPEED_TICKS_S, which caps how fast
+# a single hop runs -- these cap how far it goes and how long the arm rests.
+PICK_STEP_TICKS = 60           # ~5.3 deg per hop on J1-J5
+PICK_STEP_PAUSE_S = 0.5
+
 # Gripper (J6) open/closed positions, expressed as an angle offset (radians) from
 # the servo's calibrated home. Converted to ticks through the same per-servo
 # calibration as the arm joints. Tune to your claw's actual open/closed spread.

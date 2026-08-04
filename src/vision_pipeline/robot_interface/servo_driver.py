@@ -67,6 +67,19 @@ class ServoBus:
     ADDR_PRESENT_POSITION = 0x38    # 56, 2 bytes little-endian
     ADDR_ID = 0x05                  # 5, 1 byte, servo bus ID (0..253), EEPROM
     ADDR_LOCK = 0x37                # 55, 1 byte, EEPROM write-protect (0=unlocked, 1=locked)
+    # Both SRAM (the SRAM block starts at 40 = Torque Enable), so these are
+    # volatile: they reset to the servo's defaults on every power cycle and must
+    # be re-applied after one. Writing them is NOT an EEPROM operation.
+    ADDR_ACCELERATION = 0x29        # 41, 1 byte, units of 100 ticks/s^2
+    ADDR_GOAL_SPEED = 0x2E          # 46, 2 bytes little-endian, ticks/s (0 = max)
+    # Health registers. A servo that has tripped its own overload or thermal
+    # protection still answers the bus but refuses to hold position, which looks
+    # identical to "no power" from the outside -- these tell the two apart.
+    ADDR_TORQUE_ENABLE = 0x28       # 40, 1 byte, 0 = torque off (limp)
+    ADDR_PRESENT_LOAD = 0x3C        # 60, 2 bytes, signed-magnitude
+    ADDR_PRESENT_VOLTAGE = 0x3E     # 62, 1 byte, units of 0.1 V
+    ADDR_PRESENT_TEMPERATURE = 0x3F  # 63, 1 byte, degrees C
+    ADDR_STATUS = 0x41              # 65, 1 byte, error bitfield
 
     TICK_MIN = 0
     TICK_MAX = 4095                 # STS3215 is 12-bit (0..4095)
@@ -262,6 +275,220 @@ class ServoBus:
         return data[:count]
 
     # --- public API -------------------------------------------------------
+
+    def set_speed(self, servo_id: int, ticks_per_sec: int) -> bool:
+        """Cap how fast this servo travels toward its goal position.
+
+        Without this the servo slews to every Goal Position at its default
+        speed, which is fast enough that a wrong move is over before an operator
+        can react -- capping the SIZE of a step (SERVO_MAX_MOVE_DELTA_TICKS)
+        bounds where it ends up, not how violently it gets there. During
+        bring-up, where a move going the wrong way is a live possibility, slow
+        is the difference between "watch it and cut power" and "hear a bang".
+
+        Args:
+            servo_id: servo ID (1-6).
+            ticks_per_sec: speed limit, 0 for the servo's maximum. 4096 ticks is
+                a full revolution, so 200 ticks/s is roughly 18 deg/s.
+
+        Returns:
+            True if the write was acknowledged.
+
+        Note:
+            SRAM, so it does NOT survive a power cycle. Re-apply after one.
+        """
+        value = max(0, min(int(ticks_per_sec), 0xFFFF))
+        ok = self._write_register(
+            servo_id, self.ADDR_GOAL_SPEED, bytes([value & 0xFF, (value >> 8) & 0xFF])
+        )
+        if not ok:
+            logger.warning(f"Servo {servo_id}: speed limit write not acknowledged")
+        return ok
+
+    def set_acceleration(self, servo_id: int, accel: int) -> bool:
+        """Ramp rate toward the speed limit, in units of 100 ticks/s^2 (0 = max).
+
+        Pairs with set_speed: a low speed with maximum acceleration still starts
+        with a jerk, which on a loaded arm shows up as the whole assembly
+        rocking. Keeping both low is what makes the motion look deliberate.
+        """
+        value = max(0, min(int(accel), 0xFF))
+        ok = self._write_register(servo_id, self.ADDR_ACCELERATION, bytes([value]))
+        if not ok:
+            logger.warning(f"Servo {servo_id}: acceleration write not acknowledged")
+        return ok
+
+    def set_motion_profile(self, servo_ids, ticks_per_sec: int, accel: int) -> None:
+        """Apply the same speed and acceleration limits to several servos."""
+        for servo_id in servo_ids:
+            self.set_speed(servo_id, ticks_per_sec)
+            self.set_acceleration(servo_id, accel)
+
+    def move_joints_stepped(
+        self,
+        targets: dict,
+        step_ticks: Optional[int] = None,
+        pause_s: Optional[float] = None,
+        progress=None,
+    ) -> dict:
+        """Move several joints to their targets together, in small paced steps.
+
+        The motion primitive for anything near the table. A servo commanded
+        straight to a distant goal slews there at whatever speed it can manage
+        and stops hard at the end; broken into short hops with a pause between
+        them, the same move becomes something an operator can watch and stop.
+        `config.PICK_STEP_TICKS` / `PICK_STEP_PAUSE_S` set the pace.
+
+        All joints advance TOGETHER, a fraction of their travel per round,
+        rather than each being driven to its target in turn. Sequential motion
+        sends the arm through poses nobody planned -- swinging the base through
+        its full arc while the elbow is still folded back, for instance -- and
+        those intermediate poses are where the claw hits things.
+
+        This is separate from the speed cap in set_motion_profile and both
+        matter: the speed cap governs how fast a single hop executes, this
+        governs how far each hop goes and how long the arm rests between them.
+
+        Args:
+            targets: {servo_id: goal_tick}.
+            step_ticks: maximum ticks any joint moves per round.
+            pause_s: seconds to rest between rounds.
+            progress: optional callback(round, total) for UI.
+
+        Returns:
+            {servo_id: final_position} read back after the last step.
+
+        Raises:
+            ServoSafetyError: propagated from move_and_verify. The arm stops
+                part-way; joints already moved stay where they are.
+        """
+        if step_ticks is None:
+            step_ticks = config.PICK_STEP_TICKS
+        if pause_s is None:
+            pause_s = config.PICK_STEP_PAUSE_S
+        step_ticks = max(1, min(int(step_ticks), config.SERVO_MAX_MOVE_DELTA_TICKS))
+
+        starts = {sid: self.read_position(sid) for sid in targets}
+        deltas = {sid: targets[sid] - starts[sid] for sid in targets}
+        biggest = max((abs(d) for d in deltas.values()), default=0)
+        if biggest == 0:
+            return starts
+        rounds = int(-(-biggest // step_ticks))    # ceil
+
+        last = dict(starts)
+        for k in range(1, rounds + 1):
+            for sid, goal in targets.items():
+                want = goal if k == rounds else starts[sid] + int(round(deltas[sid] * k / rounds))
+                if want == last[sid]:
+                    continue                      # no-op, and no bus traffic for it
+                self.move_and_verify(sid, want)
+                last[sid] = want
+            if progress:
+                progress(k, rounds)
+            if pause_s and k < rounds:
+                time.sleep(pause_s)
+
+        return {sid: self.read_position(sid) for sid in targets}
+
+    def freeze(self, servo_ids) -> dict:
+        """Stop every listed joint where it stands, WITHOUT dropping the arm.
+
+        The software e-stop, and better than the power cut for almost every
+        failure. Once a Goal Position has been written the servo will travel to
+        it whether or not anything is still talking to it -- killing the script
+        does not stop the arm. The only ways to stop it are to cut power, which
+        drops holding torque on every joint simultaneously and lets the arm
+        fall (this is how J3 was overloaded on 2026-08-04, falling face-first
+        after an operator hit the power cut mid-move), or to overwrite the goal
+        with where the joint already is. This does the latter.
+
+        Deliberately does no verification and no settling -- it is meant to run
+        in milliseconds. Failures are collected and returned rather than raised,
+        because a servo that cannot be frozen must not prevent the others from
+        being frozen.
+
+        Returns:
+            {servo_id: position_held} for each joint successfully frozen.
+        """
+        held = {}
+        for servo_id in servo_ids:
+            try:
+                present = self.read_position(servo_id)
+                self._write_register(
+                    servo_id, self.ADDR_GOAL_POSITION,
+                    bytes([present & 0xFF, (present >> 8) & 0xFF]),
+                )
+                held[servo_id] = present
+            except Exception as e:
+                logger.error(f"Servo {servo_id}: FREEZE FAILED — {e}")
+        return held
+
+    def enable_torque(self, servo_id: int) -> int:
+        """Re-enable a servo's torque WITHOUT it lurching to a stale goal.
+
+        A servo that has tripped its overload protection sits limp, answering
+        the bus normally, while gravity moves the joint somewhere else entirely
+        (J3 sagged 54 deg this way on 2026-08-04). Its Goal Position register
+        still holds whatever it was last commanded to. Enabling torque with that
+        stale goal in place makes the servo snap back to it at full speed, under
+        no supervision, from a pose nobody chose -- the arm's most dangerous
+        single instruction.
+
+        So: read where the joint actually IS, make that the goal, and only then
+        enable torque. The servo wakes up holding its current position.
+
+        Returns:
+            The position it is now holding.
+        """
+        present = self.read_position(servo_id)
+        if not self._write_register(
+            servo_id, self.ADDR_GOAL_POSITION,
+            bytes([present & 0xFF, (present >> 8) & 0xFF]),
+        ):
+            raise RuntimeError(f"Servo {servo_id}: could not set holding goal")
+        time.sleep(0.02)
+        if not self._write_register(servo_id, self.ADDR_TORQUE_ENABLE, bytes([1])):
+            raise RuntimeError(f"Servo {servo_id}: could not enable torque")
+        logger.info(f"Servo {servo_id}: torque enabled, holding {present}")
+        return present
+
+    def disable_torque(self, servo_id: int) -> bool:
+        """Go limp. The joint will then be moved by gravity — support it first."""
+        return self._write_register(servo_id, self.ADDR_TORQUE_ENABLE, bytes([0]))
+
+    def read_diagnostics(self, servo_id: int) -> dict:
+        """Read a servo's health registers: voltage, temperature, load, faults.
+
+        Returns whatever it can rather than raising, because the whole point is
+        to characterise a servo that is already misbehaving -- a partial answer
+        ("answers the bus, reports 6.2 V") is far more diagnostic than an
+        exception. Keys are absent when that register did not come back.
+
+        `status` is the raw fault bitfield; `faults` is a best-effort decode of
+        it. Trust the raw byte over the decode -- the bit meanings vary across
+        Feetech firmware revisions and are not something this driver can verify.
+        """
+        out: dict = {}
+        readers = (
+            ("voltage_v", self.ADDR_PRESENT_VOLTAGE, 1, lambda b: b[0] / 10.0),
+            ("temperature_c", self.ADDR_PRESENT_TEMPERATURE, 1, lambda b: b[0]),
+            ("torque_enabled", self.ADDR_TORQUE_ENABLE, 1, lambda b: bool(b[0])),
+            ("status", self.ADDR_STATUS, 1, lambda b: b[0]),
+            ("load", self.ADDR_PRESENT_LOAD, 2, lambda b: b[0] | (b[1] << 8)),
+        )
+        for name, addr, count, decode in readers:
+            try:
+                raw = self._read_register(servo_id, addr, count)
+                if raw is not None and len(raw) >= count:
+                    out[name] = decode(raw)
+            except Exception:
+                pass
+
+        if "status" in out:
+            bits = {0x01: "voltage", 0x02: "angle sensor", 0x04: "overheat",
+                    0x08: "current", 0x10: "angle limit", 0x20: "overload"}
+            out["faults"] = [n for b, n in bits.items() if out["status"] & b]
+        return out
 
     def read_position(self, servo_id: int) -> int:
         """Read present position from a servo without commanding it.

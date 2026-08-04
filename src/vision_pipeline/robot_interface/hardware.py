@@ -42,6 +42,14 @@ class HardwareRobot(RobotInterface):
         self.matlab_client = MatlabIKClient(matlab_host, matlab_port)
         self.servo_bus = ServoBus(servo_port, servo_baud)
 
+        # Speed and acceleration limits live in the servos' SRAM, so they are
+        # lost on every power cycle and must be re-applied per session — not
+        # once at calibration time. Without them each move runs at the servo's
+        # full default speed.
+        self.servo_bus.set_motion_profile(
+            range(1, 7), config.SERVO_MOVE_SPEED_TICKS_S, config.SERVO_MOVE_ACCEL
+        )
+
         # Seed state by reading back current servo positions (J1..J5 only)
         self._last_angles_rad = self._read_servo_state()
         logger.info(f"HardwareRobot initialized. Current angles (rad): {self._last_angles_rad}")
@@ -137,17 +145,22 @@ class HardwareRobot(RobotInterface):
             logger.error(f"IK communication error: {e}")
             return False
 
-        # Command servos J1..J5, read back actual positions
+        # Command servos J1..J5 together, in paced steps, and read back actual
+        # positions. Stepped rather than one command per joint: a direct
+        # command slews each joint at speed and stops it hard, and driving them
+        # one at a time takes the arm through intermediate poses nobody planned.
+        # config.PICK_STEP_TICKS / PICK_STEP_PAUSE_S set the pace.
         try:
-            updated_angles_rad = []
-            for j_id, angle_rad in enumerate(angles_rad, start=1):
-                target_tick = self.servo_bus.rad_to_ticks(j_id, angle_rad)
-                actual_tick = self.servo_bus.move_and_verify(j_id, target_tick)
-                actual_angle_rad = self.servo_bus.ticks_to_rad(j_id, actual_tick)
-                updated_angles_rad.append(actual_angle_rad)
+            targets = {
+                j_id: self.servo_bus.rad_to_ticks(j_id, angle_rad)
+                for j_id, angle_rad in enumerate(angles_rad, start=1)
+            }
+            final = self.servo_bus.move_joints_stepped(targets)
 
             # Update state from verified read-back
-            self._last_angles_rad = updated_angles_rad
+            self._last_angles_rad = [
+                self.servo_bus.ticks_to_rad(j_id, final[j_id]) for j_id in sorted(final)
+            ]
             logger.info(f"Servos moved and verified. New state: {[f'{a:.3f}' for a in self._last_angles_rad]}")
             return True
 
