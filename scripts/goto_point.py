@@ -215,8 +215,17 @@ def main() -> None:
               + ("   <-- UNLIMITED" if args.speed == 0 else ""))
         print(f"pacing      {args.step} ticks per step, {args.pause:.1f}s between")
 
-        limp = [j for j in IK_JOINTS
-                if bus.read_diagnostics(j).get("torque_enabled") is False]
+        # Distinguish "reported torque off" from "did not answer". A failed read
+        # returns {}, which is not False, so treating absence as healthy would
+        # let this proceed against a bus it cannot actually talk to.
+        torque = {j: bus.read_diagnostics(j).get("torque_enabled") for j in IK_JOINTS}
+        silent = [j for j, t in torque.items() if t is None]
+        limp = [j for j, t in torque.items() if t is False]
+        if silent:
+            print(f"\n  *** {', '.join(f'J{j}' for j in silent)} DID NOT ANSWER. ***")
+            print("      Arm powered off, adapter unplugged, or port busy.")
+            print("      Run: python scripts/check_servo_health.py")
+            return
         if limp:
             print(f"\n  *** {', '.join(f'J{j}' for j in limp)} HAS NO TORQUE - not "
                   f"holding position. ***")

@@ -44,18 +44,21 @@ def main() -> None:
 
     bus = ServoBus(args.port, args.baud)
     with bus:
-        limp = []
+        limp, answered, silent = [], [], []
         print("joint   volts   temp   torque   position   faults")
         for j in range(1, 7):
             try:
                 if not bus.ping(j):
+                    silent.append(j)
                     print(f"  J{j}    NO RESPONSE")
                     continue
                 d = bus.read_diagnostics(j)
                 pos = bus.read_position(j)
             except Exception as e:
+                silent.append(j)
                 print(f"  J{j}    read failed: {e}")
                 continue
+            answered.append(j)
             on = d.get("torque_enabled")
             if on is False:
                 limp.append(j)
@@ -63,11 +66,23 @@ def main() -> None:
                   f"{'ON ' if on else 'OFF'}      {pos:>5}      "
                   f"{', '.join(d.get('faults', [])) or '-'}")
 
+        # Report what was actually established, never what was merely not
+        # contradicted. An earlier version printed "all joints are holding"
+        # when NOTHING answered, because no servo had reported torque=OFF --
+        # a health check that says "all good" to a dead bus is worse than none.
+        if not answered:
+            print("\n  NOTHING ON THE BUS ANSWERED. Nothing was verified.")
+            print("  The arm is powered off, the serial adapter is unplugged, or")
+            print(f"  {args.port} is held by another process. Torque state UNKNOWN.")
+            return
+        if silent:
+            print(f"\n  {', '.join(f'J{j}' for j in silent)} DID NOT ANSWER — "
+                  f"state unknown for those.")
         if limp:
             print(f"\n  LIMP: {', '.join(f'J{j}' for j in limp)} — not holding position.")
             print("  Anything outboard of these is held up by friction alone.")
-        else:
-            print("\n  All joints are holding.")
+        elif not silent:
+            print("\n  All six joints answered and all are holding.")
 
         if args.off:
             print(f"\nDisabling torque on J{args.off}. It WILL be moved by gravity.")
