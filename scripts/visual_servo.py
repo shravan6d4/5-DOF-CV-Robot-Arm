@@ -82,6 +82,15 @@ press g. Positioning the arm is the reason you started the script, so a missing
 brick at that moment is the normal state of things, not an error. Only after
 your go-ahead does 'no brick detected' become a reason to stop.
 
+EVERY RUN STARTS AT THE HOVER POSE, and that is not a convenience -- it is why
+the numbers mean anything. The camera is eye-in-hand, so a run beginning from an
+arbitrary posture begins with the operator hand-positioning the arm until the
+brick appears, and the probe then measures its gains against whatever geometry
+that happened to be. Two runs from two postures are not comparable, which is
+part of why a gain measured before a descent stopped describing the arm during
+it on 2026-08-05. The move is built in: no goto_pose.py beforehand, and
+--no-hover to opt out.
+
 Keys in the --view window (click it first — keys go to the focused window):
     g / Enter / Space   give the go-ahead and start
     q / Esc             quit; during a run this also FREEZES the arm
@@ -89,7 +98,9 @@ Keys in the --view window (click it first — keys go to the focused window):
 Usage (from the repo root):
     python scripts/visual_servo.py --view --dry-run          # look, move nothing
     python scripts/visual_servo.py --view                    # centre on x+y only
-    python scripts/visual_servo.py --view --descend          # centre, then descend
+    python scripts/visual_servo.py --view --descend          # THE WHOLE RUN:
+                                                             #   hover -> probe ->
+                                                             #   centre -> descend
     python scripts/visual_servo.py --view --descend --axes x # single-axis centring
 """
 
@@ -1164,8 +1175,11 @@ def main() -> None:
                          "when that joint does. 'auto' (default) uses cartesian "
                          "whenever a MATLAB connection exists.")
     ap.add_argument("--descend", action="store_true",
-                    help="after centring, descend onto the brick in steps, "
-                         "correcting the aim within the same move")
+                    help="the whole run: drive to HOVER, probe, centre, then "
+                         "descend onto the brick in steps, correcting the aim "
+                         "within the same move. The hover is automatic (skipped "
+                         "only by --no-hover, or when already within 40 ticks of "
+                         "it) -- there is no need to run goto_pose.py first")
     ap.add_argument("--descend-step", type=float, default=8.0,
                     help="millimetres of descent per step (default 8)")
     ap.add_argument("--descend-probe-mm", type=float,
