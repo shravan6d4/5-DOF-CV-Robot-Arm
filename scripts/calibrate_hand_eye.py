@@ -63,6 +63,8 @@ from vision_pipeline.calibration.hand_eye import (
     rotation_axis_spread_deg,
     save_samples,
     select_best,
+    solve_complaints,
+    translation_conditioning,
 )
 from vision_pipeline.calibration.pixel_to_world import save_hand_eye
 from vision_pipeline.capture.camera import Camera
@@ -70,14 +72,45 @@ from vision_pipeline.robot_interface.matlab_client import MatlabIKClient
 from vision_pipeline.robot_interface.servo_driver import ServoBus, ServoSafetyError
 
 IK_JOINTS = range(1, 6)  # J1..J5; J6 is the gripper, not part of hand-eye
-DEFAULT_STEP_TICKS = 60
+# Rotation between RECORDED poses is what decides whether the camera's offset
+# from the wrist is observable at all -- it is recovered from how far the camera
+# SWINGS about that offset, so a small rotation leaves it barely determined
+# while every residual still looks healthy. The 2026-08-04 session managed a
+# median of 15.5 deg and produced a transform no amount of re-solving could fix.
+# The literature (MVTec HALCON, and the hand-eye papers generally) wants >= 30
+# deg, ideally 60, over >= 8 poses.
+#
+# 651.89 ticks/rad means 60 deg is ~683 ticks. The old ceiling of 300 could not
+# reach even the 30 deg minimum in one step, which is a large part of why that
+# session came out the way it did.
+# ...but a single command may not exceed config.SERVO_MAX_MOVE_DELTA_TICKS
+# (400), so the ceiling here has to stay under it or the bus simply refuses the
+# jog. 350 ticks is ~31 deg: one press clears the minimum, two clears 60.
+DEFAULT_STEP_TICKS = 200        # ~17.6 deg -- two presses puts you past 30
 MIN_STEP_TICKS = 10
-MAX_STEP_TICKS = 300
+MAX_STEP_TICKS = 350            # ~31 deg, just under the bus's per-move cap
 
 
 def _current_angles_rad(bus: ServoBus) -> list[float]:
     """J1..J5 angles in radians, straight from a servo read-back — no Pose involved."""
     return [bus.ticks_to_rad(j, bus.read_position(j)) for j in IK_JOINTS]
+
+
+def _rotation_since(client, bus, last_ticks) -> float:
+    """Degrees the WRIST has rotated since the last recorded sample.
+
+    Measured through FK rather than by summing jog ticks, because what the
+    solve cares about is the rotation of the camera-carrying body, and several
+    joints contribute to it by different amounts. Returns inf when there is no
+    previous sample, so the first record is never blocked.
+    """
+    if last_ticks is None:
+        return float("inf")
+    now = [bus.ticks_to_rad(j, bus.read_position(j)) for j in IK_JOINTS]
+    then = [bus.ticks_to_rad(j, t) for j, t in zip(IK_JOINTS, last_ticks)]
+    M = np.linalg.inv(client.request_fk(then)) @ client.request_fk(now)
+    cos = np.clip((np.trace(M[:3, :3]) - 1.0) / 2.0, -1.0, 1.0)
+    return float(np.degrees(np.arccos(cos)))
 
 
 def _wait_until_still(bus: ServoBus, timeout_s: float = 6.0, tol_ticks: int = 2):
@@ -123,8 +156,16 @@ def main() -> None:
         help="raw samples file; rewritten after every 'r' so a crashed session is not lost",
     )
     parser.add_argument(
-        "--fresh", action="store_true",
-        help="ignore any existing --samples file instead of resuming from it",
+        "--resume", action="store_true",
+        help="continue an existing --samples file instead of archiving it. ONLY "
+             "correct if the joint calibration has not changed since those "
+             "samples were taken — mixing two calibrations produces a sample "
+             "set no rigid transform can fit.",
+    )
+    parser.add_argument(
+        "--force", action="store_true",
+        help="save even if the acceptance checks fail. For when you have a "
+             "reason the checks cannot see.",
     )
     args = parser.parse_args()
 
@@ -149,21 +190,46 @@ def main() -> None:
         print(f"Could not open the servo bus on {args.servo_port}: {e}")
         sys.exit(1)
 
+    # A NEW SESSION STARTS EMPTY. Resuming used to be the default, so that a
+    # crashed session could be continued -- and save_samples rewrites this file
+    # after every record, which is what made that possible. The cost showed up
+    # on 2026-08-05: a fresh capture silently appended to 53 samples taken under
+    # a superseded joint calibration (wrong home_tick, J5 dir_sign +1). The two
+    # sets describe different arms, no rigid transform fits both, and the solve
+    # came out with 162 mm of board spread while still reporting a plausible
+    # 33 mm camera offset.
+    #
+    # Resuming is only ever correct if the calibration has not changed since,
+    # which is not something this script can check -- so it is now opt-in, and
+    # the old file is archived rather than overwritten.
     acc = HandEyeAccumulator(min_samples=args.min_samples)
-    if not args.fresh:
+    samples_path = Path(args.samples)
+    if args.resume:
         try:
             acc = load_samples(args.samples, min_samples=args.min_samples)
-            print(f"Resumed {sum(acc.counts().values())} samples from {args.samples} "
-                  f"-> counts {acc.counts()}")
-            print("(pass --fresh to start empty instead)")
+            print(f"--resume: continuing {sum(acc.counts().values())} samples from "
+                  f"{args.samples} -> counts {acc.counts()}")
+            print("  Only correct if the joint calibration has not changed since")
+            print("  those samples were taken. If it has, they cannot be mixed.")
         except FileNotFoundError:
             pass
+    elif samples_path.exists() and samples_path.stat().st_size > 2:
+        archived = samples_path.with_suffix(
+            f".json.bak-{time.strftime('%Y%m%d-%H%M%S')}")
+        samples_path.rename(archived)
+        print(f"Archived the previous capture to {archived.name}; starting clean.")
+        print("  (--resume to continue it instead)")
 
     active_joint = 1
     step_ticks = DEFAULT_STEP_TICKS
+    last_recorded = None      # joint ticks at the previous accepted sample
 
     print(f"{config.CALIB_BOARD_COUNT} boards expected, {args.min_samples} samples/board minimum.")
-    print("1-5 = select joint, a/d = jog -/+ step, [/] = step size, r = record, c = compute, q = abort.")
+    print("1-5 = select joint, a/d = jog -/+ step, [/] = step size, "
+          "r = record, R = record anyway, c = compute, q = abort.")
+    print(f"Jog at least {config.CALIB_HAND_EYE_MIN_ROTATION_DEG:.0f} deg "
+          f"(60 is better) between each record — the on-screen readout says "
+          f"when. Fewer, bigger poses beat many small ones.")
     print("!!! Arm will MOVE on a/d. Keep the e-stop within reach. !!!")
 
     with client, bus, Camera(camera_index=args.camera_index) as camera:
@@ -188,6 +254,41 @@ def main() -> None:
                 f"J{active_joint} step {step_ticks}  visible: {sorted(board_poses)}  samples [{counts_str}]",
                 (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2,
             )
+            # How far the wrist has turned since the last RECORDED sample. This
+            # is the number that decides whether the capture is any good, so it
+            # is on screen the whole time rather than discovered afterwards.
+            swing = _rotation_since(client, bus, last_recorded)
+            ok = swing >= config.CALIB_HAND_EYE_MIN_ROTATION_DEG
+            cv2.putText(
+                display,
+                f"rotation since last sample: {swing:5.1f} deg  "
+                f"({'OK to record' if ok else 'KEEP JOGGING - want >=' + str(int(config.CALIB_HAND_EYE_MIN_ROTATION_DEG))})",
+                (10, 55), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
+                (0, 255, 0) if ok else (0, 165, 255), 2,
+            )
+            # Rotation MAGNITUDE above is only half of a good capture. Turning
+            # the same joint over and over racks up plenty of degrees while
+            # leaving the camera offset along that axis unobservable, because
+            # (R - I) n = 0 for a rotation about n. That is exactly how the
+            # 2026-08-06 capture failed: 14 poses, all the swing anyone could
+            # want, nine of thirteen pose changes sharing one axis to within
+            # 1 degree -- all J5. It solved the camera's orientation to 0.8 deg
+            # and its position not at all. Shown live because it cannot be
+            # fixed afterwards: no amount of extra poses about the same axis
+            # helps, so discovering it at solve time costs the whole session.
+            best = max(acc.counts(), key=lambda i: acc.counts()[i], default=None)
+            cond = (translation_conditioning(acc, best)
+                    if best is not None else None)
+            if cond is not None:
+                good = cond <= config.CALIB_HAND_EYE_MAX_CONDITION
+                cv2.putText(
+                    display,
+                    f"axis variety: {cond:4.1f} "
+                    f"({'good' if good else 'CLUSTERED - jog a DIFFERENT joint'})",
+                    (10, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.5,
+                    (0, 255, 0) if good else (0, 165, 255), 2,
+                )
+
             cv2.imshow("Hand-eye calibration", display)
             key = cv2.waitKey(1) & 0xFF
 
@@ -217,7 +318,8 @@ def main() -> None:
                 except ServoSafetyError as e:
                     print(f"  REFUSED: {e}")
 
-            elif key == ord("r"):
+            elif key in (ord("r"), ord("R")):
+                forced = key == ord("R")   # shift-R records regardless of rotation
                 # Re-capture rather than banking the frame the display loop is
                 # holding. cv2.VideoCapture buffers frames, and detecting
                 # CALIB_BOARD_COUNT boards per iteration makes this loop slower
@@ -245,9 +347,19 @@ def main() -> None:
                     continue
                 angles_rad = [bus.ticks_to_rad(j, t) for j, t in zip(IK_JOINTS, after)]
                 t_base_gripper = client.request_fk(angles_rad)
+                swing = _rotation_since(client, bus, last_recorded)
+                if (not forced and last_recorded is not None
+                        and swing < config.CALIB_HAND_EYE_MIN_ROTATION_DEG):
+                    print(f"  only {swing:.1f} deg since the last sample "
+                          f"(want >= {config.CALIB_HAND_EYE_MIN_ROTATION_DEG:.0f}). "
+                          f"Jog further and record again — small rotations are what")
+                    print(f"  made the 2026-08-04 capture unusable. Press 'R' to force it.")
+                    continue
                 new_counts = acc.add(fresh_poses, t_base_gripper)
                 save_samples(acc, args.samples)
-                print(f"  recorded boards {sorted(fresh_poses)} -> counts {new_counts}")
+                last_recorded = list(after)
+                print(f"  recorded boards {sorted(fresh_poses)} -> counts {new_counts} "
+                      f"({swing:.1f} deg since last)")
 
             elif key == ord("c"):
                 break
@@ -285,7 +397,7 @@ def main() -> None:
     else:
         print("\nOnly one board solved — no cross-board agreement check available.")
 
-    best = select_best(results)
+    best = select_best(results, acc)
 
     # --- physical plausibility, independent of every internal statistic -------
     # A solve can be perfectly self-consistent and still describe a camera that
@@ -308,10 +420,33 @@ def main() -> None:
     print(f"  optical axis base-frame z component: {mean_axis_z:+.2f} "
           f"({'ok — camera looks down' if mean_axis_z < 0 else 'WRONG — camera looks UP; do not use this result'})")
 
+    # --- the gate, which used to not exist ------------------------------------
+    # Everything above this line PRINTED its concerns and then saved anyway. On
+    # 2026-08-05 that would have overwritten a good transform with one solved
+    # from a sample file that had silently accumulated records from two
+    # different joint calibrations: 162 mm of board spread, TSAI and PARK 169
+    # deg apart on camera orientation, and a camera offset of 33 mm that looked
+    # entirely reasonable next to the 24 mm on the ruler. A warning nobody is
+    # forced to read is not a check.
+    complaints = solve_complaints(best)
+    if complaints and not args.force:
+        print("\n=== NOT SAVED ===")
+        for c in complaints:
+            print(f"  - {c}")
+        print(f"\n  {args.out} is untouched. The samples are still in "
+              f"{args.samples}, so nothing is lost.")
+        print("  Capture more poses with larger rotations between them, or "
+              "re-run with --force if you know better.")
+        return
+
+    if complaints:
+        print("\n  --force: saving despite " + f"{len(complaints)} failed check(s).")
+
     save_hand_eye(best.t_gripper_camera_tsai, args.out)
     print(f"\nSaved gripper->camera transform from board #{best.board_index+1} to {args.out}")
     print(f"  translation [mm]: {best.t_gripper_camera_tsai[:3, 3] * 1000}")
-    print(f"  raw samples kept in {args.samples} (re-run to resume, --fresh to discard)")
+    print(f"  raw samples kept in {args.samples}")
+    print("\n  Verify on hardware next: python scripts/test_pick_dry_run.py")
 
 
 if __name__ == "__main__":

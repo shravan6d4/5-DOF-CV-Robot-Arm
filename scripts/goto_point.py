@@ -44,6 +44,7 @@ import numpy as np
 
 from vision_pipeline import config
 from vision_pipeline.robot_interface.matlab_client import IKUnreachableError, MatlabIKClient
+from vision_pipeline.robot_interface.servo_calibration import dir_sign_report
 from vision_pipeline.robot_interface.servo_driver import ServoBus, ServoSafetyError
 
 IK_JOINTS = (1, 2, 3, 4, 5)
@@ -214,6 +215,13 @@ def main() -> None:
               f"{config.SERVO_MOVE_ACCEL}"
               + ("   <-- UNLIMITED" if args.speed == 0 else ""))
         print(f"pacing      {args.step} ticks per step, {args.pause:.1f}s between")
+
+        # A provisionally-flipped dir_sign is invisible to every number this
+        # script prints (the IK residual cancels it), so say it out loud before
+        # the arm moves rather than after.
+        print()
+        for line in dir_sign_report(bus.calibration, IK_JOINTS):
+            print(line)
 
         # Distinguish "reported torque off" from "did not answer". A failed read
         # returns {}, which is not False, so treating absence as healthy would

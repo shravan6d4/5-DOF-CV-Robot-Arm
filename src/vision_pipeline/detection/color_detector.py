@@ -51,7 +51,9 @@ class ColorDetector:
         hsv_upper_2: tuple[int, int, int] | None = config.HSV_UPPER_2,
         min_contour_area: float = config.MIN_CONTOUR_AREA,
         morph_kernel_size: int = config.MORPH_KERNEL_SIZE,
+        glare_recovery: bool = config.GLARE_RECOVERY,
     ) -> None:
+        self.glare_recovery = glare_recovery
         self.hsv_lower_1 = np.array(hsv_lower_1, dtype=np.uint8)
         self.hsv_upper_1 = np.array(hsv_upper_1, dtype=np.uint8)
 
@@ -73,10 +75,21 @@ class ColorDetector:
             mask_2 = cv2.inRange(hsv_frame, self.hsv_lower_2, self.hsv_upper_2)
             mask = cv2.bitwise_or(mask, mask_2)
 
-        # Opening: erode then dilate — removes small speckle noise.
+        # Opening: erode then dilate — removes small speckle noise. Done BEFORE
+        # glare recovery so the recovery is judged against a clean red mask
+        # rather than against noise specks.
         mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, self._morph_kernel)
+
+        if self.glare_recovery:
+            mask = recover_specular_regions(mask, hsv_frame)
+
         # Closing: dilate then erode — fills small holes inside the blob.
         mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, self._morph_kernel)
+        # Fill whatever holes remain. A hole strictly inside a red silhouette is
+        # always a defect of the threshold, never information: no real brick has
+        # a window through it. Cheap, and it cannot leak outward, since filling
+        # external contours can only add pixels they already enclose.
+        mask = fill_interior_holes(mask)
 
         return mask
 
@@ -143,6 +156,107 @@ class ColorDetector:
                 2,
             )
         return overlay
+
+
+def fill_interior_holes(mask: np.ndarray) -> np.ndarray:
+    """Fill every hole strictly inside a masked region.
+
+    Re-drawing the external contours filled is the whole trick: RETR_EXTERNAL
+    discards interior boundaries, so painting what survives can only add pixels
+    those outlines already enclose. Nothing can leak outward, which is what
+    makes this safe to run unconditionally.
+    """
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return mask
+    filled = np.zeros_like(mask)
+    cv2.drawContours(filled, contours, -1, color=255, thickness=-1)
+    return filled
+
+
+def recover_specular_regions(
+    mask: np.ndarray,
+    hsv_frame: np.ndarray,
+    v_min: int = config.GLARE_V_MIN,
+    s_max: int = config.GLARE_S_MAX,
+    max_region_px: int = config.GLARE_MAX_REGION_PX,
+    ring_px: int = config.GLARE_RING_PX,
+    enclosure_frac: float = config.GLARE_ENCLOSURE_FRAC,
+) -> np.ndarray:
+    """Add blown-out highlights back into the red mask — but only where enclosed by red.
+
+    A glossy Lego stud under direct light reflects a highlight so bright that
+    its saturation collapses below the red threshold. The pixels are physically
+    part of the brick; the mask simply cannot see them as red. When such a
+    highlight lands mid-brick it punches a hole (which closing repairs), but
+    when it lands across the silhouette it CUTS THE BRICK IN TWO, leaving
+    fragments that individually fall under MIN_CONTOUR_AREA. Detection then
+    reports nothing at all — the flicker this function exists to remove.
+
+    The test for "is this glare part of the brick" is what it is SURROUNDED BY,
+    not how bright it is. Brightness alone would swallow the white ChArUco board
+    the workspace is tiled with, which is every bit as bright and as desaturated
+    as a stud highlight. So each bright region is dilated by a few pixels and
+    the resulting ring is measured: mostly red means the region sits inside the
+    brick and is restored; anything else is left out. A white board square fails
+    because what surrounds it is board.
+
+    Deliberately bounded, because this is the one place in detection that ADDS
+    pixels a threshold rejected:
+      * regions larger than `max_region_px` are never considered (a stud
+        highlight is small; a lit tabletop is not);
+      * only pixels not already in the mask are candidates;
+      * the enclosure fraction must be met, so an unenclosed bright region
+        cannot join the brick by touching it.
+
+    Args:
+        mask: the cleaned red mask.
+        hsv_frame: the same frame in HSV.
+
+    Returns:
+        A new mask with enclosed highlights restored. The input is not modified.
+    """
+    bright = cv2.inRange(hsv_frame, (0, 0, v_min), (179, s_max, 255))
+    # Only pixels the red threshold rejected can be candidates.
+    bright = cv2.bitwise_and(bright, cv2.bitwise_not(mask))
+    if not bright.any():
+        return mask
+
+    count, labels, stats, _ = cv2.connectedComponentsWithStats(bright, connectivity=8)
+    if count <= 1:
+        return mask
+
+    out = mask.copy()
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * ring_px + 1,) * 2)
+    h, w = mask.shape[:2]
+
+    for i in range(1, count):
+        area = stats[i, cv2.CC_STAT_AREA]
+        if area > max_region_px:
+            continue
+
+        # Work inside the region's own bounding box (plus the ring margin)
+        # rather than on full frames: a board-tiled scene yields dozens of
+        # bright components, and dilating a full-size mask for each is the
+        # difference between a usable frame rate and a slideshow.
+        x, y = stats[i, cv2.CC_STAT_LEFT], stats[i, cv2.CC_STAT_TOP]
+        bw, bh = stats[i, cv2.CC_STAT_WIDTH], stats[i, cv2.CC_STAT_HEIGHT]
+        x0, y0 = max(0, x - ring_px - 1), max(0, y - ring_px - 1)
+        x1, y1 = min(w, x + bw + ring_px + 1), min(h, y + bh + ring_px + 1)
+
+        region = (labels[y0:y1, x0:x1] == i).astype(np.uint8) * 255
+        ring = cv2.bitwise_and(cv2.dilate(region, kernel),
+                               cv2.bitwise_not(region))
+        ring_total = int(np.count_nonzero(ring))
+        if ring_total == 0:
+            continue
+
+        red_in_ring = int(np.count_nonzero(
+            cv2.bitwise_and(ring, mask[y0:y1, x0:x1])))
+        if red_in_ring / ring_total >= enclosure_frac:
+            out[y0:y1, x0:x1] = cv2.bitwise_or(out[y0:y1, x0:x1], region)
+
+    return out
 
 
 def close_contour_gaps(frame_shape: tuple[int, int], contour: np.ndarray) -> np.ndarray:

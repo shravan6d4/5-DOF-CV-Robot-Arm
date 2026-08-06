@@ -32,7 +32,41 @@ CAMERA_INDEX = 1
 # 0 is infinity on the UVC scale; higher values focus nearer. If the boards or
 # bricks look soft at the working distance, raise this and RE-RUN the intrinsics
 # calibration — changing focus invalidates existing intrinsics.
-CAMERA_FOCUS = 0
+#
+# MEASURED 2026-08-05 by sweeping the lens across its range with the arm at its
+# usual working height, scoring each step by Laplacian variance over the brick
+# and by what the detector made of it:
+#
+#     focus    brick sharpness    studs found    confidence
+#         0               123              0          0.10   <- old value
+#        75               263              0          0.06
+#       105               709              3          0.64
+#       120              1156              4          0.95   <- chosen
+#       135              1229              4          0.89
+#       165               553              2          0.48
+#       255                63              0          0.02
+#
+# 0 was pinning the lens at infinity while the camera works ~200 mm from the
+# table, so every frame was soft. Studs are small and round and the first thing
+# blur destroys, which left detection leaning on shape alone and hovering right
+# at DETECTION_CONFIDENCE_THRESHOLD — it fired on about 5% of frames and looked
+# like a flickering detector rather than a focus problem. 120 sits mid-plateau
+# (105-150 all resolve at least 3 studs) so small changes in working height do
+# not fall off it.
+CAMERA_FOCUS = 120
+
+# Frames to pull BEFORE writing CAP_PROP_FOCUS. This camera ignores the property
+# until the stream is actually running, and get(CAP_PROP_FOCUS) reports 0.0
+# regardless, so a set that did nothing is indistinguishable from one that
+# worked. Measured 2026-08-05: focus set before the first read left frame
+# sharpness at 134, set while streaming it reached 2116.
+CAMERA_FOCUS_WARMUP_FRAMES = 5
+# Setting CAP_PROP_FOCUS only STARTS the lens moving. These give the motor time
+# to arrive and throw away the frames captured while it was still travelling —
+# without them the first frames of every run are focused somewhere between the
+# old position and the new one, which looks exactly like an unreliable detector.
+CAMERA_FOCUS_SETTLE_S = 0.6
+CAMERA_FOCUS_SETTLE_FRAMES = 5
 
 # Requested capture resolution. The camera may ignore this and use its own
 # default if the exact size isn't supported.
@@ -178,6 +212,42 @@ STUD_FULL_CREDIT_COUNT = 4
 SPECULAR_V_MIN = 245           # HSV V floor for "blown-out glare," not just "well lit"
 SPECULAR_S_MAX = 60            # HSV S ceiling for glare
 SPECULAR_INPAINT_RADIUS = 3    # cv2.inpaint neighborhood, px — small, local fill
+
+# --- Glare recovery in the COLOR MASK itself --------------------------------
+#
+# The SPECULAR_* settings above repair glare for STUD detection, inside a region
+# that was already found. This block repairs it one stage earlier, in the red
+# mask, and exists because of a failure the later repair structurally cannot
+# reach: a highlight bright enough to cut a brick's silhouette clean in two
+# leaves fragments that individually fall under MIN_CONTOUR_AREA, so
+# ColorDetector emits no candidate at all and close_contour_gaps never runs.
+# Observed 2026-08-05 as detection flickering on and off frame to frame on a
+# brick with strong stud glare.
+#
+# The rule: a bright, desaturated region is added to the red mask only if it is
+# ENCLOSED by red. That enclosure test is what makes this safe on a workspace
+# tiled with white ChArUco board — a white square is just as bright and just as
+# desaturated as a stud highlight, and is rejected because what surrounds it is
+# board, not brick. Thresholds are deliberately looser than SPECULAR_* (a
+# highlight's edge is partially washed out, not fully blown), which only widens
+# what is CONSIDERED; the enclosure test still decides.
+GLARE_RECOVERY = True
+GLARE_V_MIN = 200              # bright enough to be a highlight
+GLARE_S_MAX = 120              # below the red mask's S floor (150) by construction
+GLARE_MAX_REGION_PX = 2500     # a stud highlight is small; a lit wall is not
+GLARE_RING_PX = 5              # how far out to look when asking "what surrounds this?"
+GLARE_ENCLOSURE_FRAC = 0.55    # this much of the surroundings must be red
+#
+# Two refinements were tried here and REJECTED by measurement; both look
+# obviously right and are not. (1) A "bridge" rule accepting any highlight that
+# touches two separate red regions: it repairs a highlight lying across the
+# silhouette, but it also merges the fragments of a red cup and a hand into
+# brick-shaped blobs, and both sample-photo false-positive guards failed.
+# (2) Clipping candidates to within a few pixels of red, to stop a highlight
+# merging with the white board: it splits a wide band into two thin strips, one
+# hugging each red fragment, and a strip with red on one side and glare on the
+# other lands near 50% enclosure — just under the threshold, so the repair
+# stopped firing at all. Neither is worth re-attempting without new evidence.
 
 
 # --- Shape/geometry confidence (independent of studs) -----------------------
@@ -478,7 +548,19 @@ SERVO_MOVE_STALL_EPSILON_TICKS = 3   # movement below this per poll counts as no
 # move was reported "stalled" near its start position, but a later read-only
 # check found it had fully arrived (within 1 tick) all along.
 SERVO_MOVE_STALL_GRACE_S = 0.5
-SERVO_MOVE_READ_RETRIES = 3          # transient serial read failures to absorb per poll
+SERVO_MOVE_READ_RETRIES = 15         # transient serial read failures to absorb per poll
+# Pause before each retry, DOUBLING each time. Non-zero is what makes the retry
+# work at all: reads fail because motor current puts noise on the shared serial
+# line, and that noise arrives in bursts. The original tight loop spent all its
+# attempts inside a single burst and declared the servo dead — on 2026-08-05
+# that took down a run whose J2 was holding torque perfectly and answered every
+# read-only check before and after.
+SERVO_READ_RETRY_BACKOFF_S = 0.02
+# ...but CAPPED, or the doubling runs away. Uncapped, 15 attempts would wait
+# 20ms * 2^14 on the last one — over five minutes for a single read. Capped at
+# 0.2s the whole sequence spans ~2.5s, which is long enough to outlast any
+# plausible noise burst and short enough to sit inside a move.
+SERVO_READ_RETRY_MAX_S = 0.20
 
 # Hard cap on how far a single commanded move may travel from the servo's CURRENT
 # position. Exists because of the J1 encoder wrap-seam runaway during bring-up: a
@@ -528,6 +610,331 @@ SERVO_GRIPPER_CLOSE_RAD = 0.2   # ~11.5 deg of claw rotation to close
 
 # Total servos on the bus: J1..J5 (arm) + J6 (gripper).
 NUM_JOINTS = 6
+
+# How far outside a MEASURED travel range a joint may be commanded, in ticks.
+# Zero by default: the limits exist because small in-range steps walked J3 and
+# then J4 into hard stops on 2026-08-04, and a margin applied blindly gives that
+# back. Raise it only for a range whose `limit_basis` says it is GROUND-DERIVED
+# (J2, J3) — those stopped where the claw met the table at one particular elbow
+# angle, so with the elbow folded differently the same joint angle is safe, and
+# the recorded limit is simply too tight. Never widen a mechanical stop.
+# Scripts expose this as --limit-margin so it is a per-run decision, visible in
+# the command that made it, rather than a quiet change to the stored limits.
+SERVO_LIMIT_MARGIN_TICKS = 0
+
+# How many passes ServoBus.freeze makes over the joints it is stopping. A freeze
+# that gives up on one dropped byte is a soft e-stop that does not stop the arm,
+# and a dropped byte on a shared serial chain is ordinary. Passes, not per-joint
+# retries: one unresponsive servo's timeouts must not delay freezing the joints
+# after it, which are still travelling meanwhile.
+SERVO_FREEZE_ATTEMPTS = 15
+
+# Angle limits handed to MATLAB's IK solver, regenerated from the tick limits in
+# servo_calibration.json. Two files for one fact, because two different systems
+# enforce it: ServoBus refuses moves in ticks, matlab/init_arm.m constrains the
+# solver in radians. They are always written together (see
+# servo_calibration.write_angle_limits) — if they disagree, IK returns solutions
+# the bus refuses and a run dies mid-move with no obvious cause.
+JOINT_LIMITS_RAD_PATH = "data/joint_limits_rad.json"
+
+# How close a recorded travel limit may sit to the 0/4095 encoder seam before
+# find_joint_limits.py calls it out. A WARNING threshold, not the margin that
+# gets applied: ~18 deg, several times the servo's settling error and enough
+# that unpowered sag cannot walk the joint across the boundary. A limit inside
+# this distance is a sign the joint's encoder needs re-centring
+# (scripts/recentre_joint.py) rather than a sign the limit should be moved.
+SERVO_SEAM_WARN_TICKS = 200
+
+
+# --- Closed-loop visual servoing (scripts/visual_servo.py) ------------------
+#
+# Tunables for planning/visual_servo.py, which centres the brick in the frame by
+# looking, nudging, and looking again. All of these are in PIXELS and TICKS on
+# purpose: the loop deliberately never converts to millimetres, so none of the
+# calibration above (intrinsics, hand-eye, TABLE_Z_IN_BASE) can affect it.
+#
+# The probe move the loop uses to measure which way a joint pushes the brick.
+# Large enough to produce an unambiguous pixel shift, small enough to be a
+# harmless move if the answer turns out to be surprising.
+SERVO_VISUAL_PROBE_TICKS = 40
+# Below this pixel response, a probe has measured nothing usable. Raise it if
+# detection noise makes the loop confident about a gain it should not trust.
+SERVO_MIN_PROBE_RESPONSE_PX = 4.0
+# Fraction of the measured error to correct per iteration. Under 1.0 because the
+# gain comes from a single probe: take most of the gap, re-measure, repeat.
+SERVO_VISUAL_GAIN = 0.6
+# Hard clamp per iteration. A safety bound on a bad estimate, not a tuning knob
+# -- well under PICK_STEP_TICKS, since this moves without an operator confirming
+# each step.
+SERVO_VISUAL_MAX_STEP_TICKS = 35
+# Close enough. At typical working distance a brick stud is tens of pixels, so
+# this is comfortably tighter than the grasp needs.
+SERVO_VISUAL_DEADBAND_PX = 12.0
+# Runaway guard: iterations of non-improvement tolerated, and the shrink that
+# counts as improvement at all.
+SERVO_VISUAL_PATIENCE = 3
+SERVO_VISUAL_MIN_IMPROVEMENT_PX = 2.0
+# Absolute cap on iterations, so a marginal loop terminates on its own.
+SERVO_VISUAL_MAX_ITERATIONS = 25
+# Rest between iterations, seconds: settle the arm, then take a fresh frame.
+SERVO_VISUAL_SETTLE_S = 0.6
+
+# --- Cartesian re-centring (the joint-limit workaround) ---------------------
+#
+# Re-centring by jogging ONE joint has a hard ceiling: when that joint reaches
+# its travel limit the correction simply stops, even though the arm as a whole
+# could easily make the motion with a different posture. That is what happened
+# on 2026-08-05 -- re-centring drove J2 to its stop twice, and widening the
+# limit only bought a few more cycles.
+#
+# Cartesian mode asks for a small MOVEMENT OF THE TOOL instead, and lets
+# MATLAB's IK choose the joints. matlab/init_arm.m already loads the measured
+# limits into PositionLimits, so the solver will not propose a joint angle the
+# arm cannot reach -- it redistributes onto the joints that still have travel,
+# which is precisely "hold the joint that ran out, move the others".
+#
+# The probe works identically; it simply measures pixels per MILLIMETRE instead
+# of pixels per tick, so the loop stays free of any camera calibration.
+SERVO_VISUAL_PROBE_MM = 8.0        # test nudge for the Cartesian probe
+SERVO_VISUAL_MAX_STEP_MM = 12.0    # per-iteration clamp, millimetres
+SERVO_VISUAL_MIN_STEP_MM = 0.5     # below this the move is not worth commanding
+
+# The clamp that actually matters: most of the frame's shorter side that ONE
+# step may move the brick across. The tick and millimetre clamps above bound the
+# COMMAND, which says nothing about how far the image moves -- that depends on
+# the measured gain, and the same 12 mm nudge is gentle from far away and half a
+# frame from close up. On 2026-08-05 a 12 mm step, well inside its millimetre
+# clamp, put the brick outside the frame and the run died on the next look. A
+# loop cannot correct what it cannot see, so the binding limit belongs in pixels.
+SERVO_VISUAL_MAX_FRAME_FRACTION = 0.30
+
+# The smallest commanded step a loaded joint will actually execute. Below this
+# the servo cannot break stiction and simply does not move, so a loop that keeps
+# computing ever-smaller corrections stalls while looking busy. Measured on J3
+# (load 56, carrying the forearm) 2026-08-05: -35 ticks moved 28 px, -23 moved
+# 9 px, -18 moved 2 px, -17 moved nothing at all. Both stalled runs that day
+# ended exactly here, at corrections of 17-19 ticks.
+#
+# Consequences the loop must respect: a correction below this is rounded UP to
+# it (overshooting and coming back beats commanding a move that does nothing),
+# and the deadband can never be finer than half of it, because aiming inside
+# that asks for a step the joint will ignore.
+SERVO_VISUAL_MIN_STEP_TICKS = 25
+
+# --- Where to aim, and how close is close enough -----------------------------
+#
+# The camera does not look down the claw's axis — it sits above and behind it —
+# so "brick at the image centre" is NOT "claw over the brick". The brick should
+# come to rest BELOW the crosshair by roughly the camera-to-claw offset, which
+# is what these express: the aim point is the frame centre pushed DOWN by
+# AIM_OFFSET_Y_PX, so a centred run leaves the crosshair sitting above the brick.
+#
+# Measure it once: put the claw over the brick by hand, look at the live view,
+# and read off how far below the crosshair the brick sits.
+#
+# Set to 240 on 2026-08-05 (4x the original 60 px placeholder) from the live
+# view. In a 480 px frame that puts the aim point on the BOTTOM EDGE, y = 480,
+# so only the upper half of the acceptance box is on screen and the brick has to
+# finish in the last ~55 rows. That is legal but tight, and it is the reason
+# visual_servo.py now reports how much of the box is actually visible at
+# startup: an aim point the camera cannot see is a loop that can never converge,
+# and nothing else about the run would look wrong.
+SERVO_VISUAL_AIM_OFFSET_Y_PX = 240
+#
+# The tolerance is a BOX, and it is deliberately generous. Two reasons. The
+# descent re-centres at every step, so the approach corrects itself on the way
+# in and the hover does not need to be exact. And the joints cannot resolve
+# better than ~30 px anyway (see SERVO_VISUAL_MIN_STEP_TICKS), so a tighter
+# target only produces corrections the arm ignores.
+SERVO_VISUAL_TOLERANCE_X_PX = 45
+SERVO_VISUAL_TOLERANCE_Y_PX = 55
+
+# --- Hand-eye: the acceptance test, and why capture geometry decides it ------
+#
+# MEASURED WITH A RULER: the camera sits about this far from the wrist joint.
+# A hand-eye solve that disagrees with this is wrong, however small its own
+# residual is. On 2026-08-05 five independent solvers (TSAI, PARK, HORAUD,
+# DANIILIDIS, and the separate AX=ZB robot-world formulation) all agreed on
+# 80 mm, against 24 mm on the ruler -- mutual agreement between solvers is not
+# evidence of correctness when they are all fed the same badly-conditioned data.
+HAND_EYE_EXPECTED_OFFSET_MM = 24.0
+HAND_EYE_OFFSET_TOLERANCE_MM = 25.0    # generous: the model's wrist-body origin
+                                       # need not sit exactly where a ruler is
+                                       # naturally placed on the bracket.
+#
+# MINIMUM ROTATION BETWEEN CAPTURE POSES. The translation part of a hand-eye
+# solve is recovered from how the camera swings about the unknown offset, so it
+# is only as observable as the rotation is large. The 2026-08-04 session used a
+# median of 15.5 deg between poses, with 2-7 mm of gripper translation -- and
+# produced a translation that no amount of re-solving could fix.
+#
+# MVTec's HALCON documentation and the surrounding literature put the working
+# figure at "at least 30 degrees, better 60" for articulated arms, with >= 8
+# poses and at least two non-parallel rotation axes. Our axis spread was already
+# fine (90 deg); the rotation MAGNITUDE was half the minimum.
+CALIB_HAND_EYE_MIN_ROTATION_DEG = 30.0
+#
+# ...and rotation magnitude is only half of it. Rotating repeatedly about the
+# SAME axis leaves the camera offset ALONG that axis unobservable no matter how
+# large the rotations or how many the samples, because (R - I) n = 0 for a
+# rotation about n. hand_eye.translation_conditioning measures that directly as
+# the condition number of the stacked (R_a - I); 1 is perfect.
+#
+# 3.0 is set just under the 3.6 measured on the 2026-08-06 capture, which passed
+# every other check (median rotation 35 deg, axis spread 82 deg) while nine of
+# its thirteen pose changes shared one axis to within 1 degree -- all J5 wrist
+# roll. Rotation solved to 0.8 deg; position split 24 mm vs 50 mm between
+# solvers. Note that AXIS SPREAD did not catch it: spread reads the widest gap
+# between any two poses, so three unusual poses hide a clustered bulk.
+CALIB_HAND_EYE_MAX_CONDITION = 3.0
+#
+# ...and a condition number is SCALE-INVARIANT, which is its blind spot: a
+# capture of uniformly tiny rotations spread evenly over three axes scores a
+# perfect 1.0 and determines nothing. O3, the smallest singular value of the
+# same matrix, is not scale-invariant and so catches both failures at once --
+# ||(R - I)v|| = 2 sin(theta/2) * |v_perp| is small when rotations are SMALL or
+# when they SHARE AN AXIS. The robot-calibration literature (Sun & Hollerbach,
+# ICRA 2008) settles on it as the best single predictor of pose uncertainty.
+#
+# 1.5 is what CALIB_HAND_EYE_MIN_SAMPLES worth of good poses produce, so the two
+# gates agree instead of contradicting each other. Each pair contributes
+# 2 sin(theta/2) to the two directions perpendicular to its own axis, so N pairs
+# split evenly over two perpendicular axes give sigma_min ~ sqrt(N/2) *
+# 2 sin(theta/2); at N = 12 pairs and theta = 35 deg that is sqrt(6) * 0.60 =
+# 1.47. Below this the set is either too small, too timid, or too co-axial --
+# and O3 does not care which, which is the point of using it.
+#
+# The 2026-08-06 capture scored 0.86 on its cleanest board (9 samples, 8 pairs).
+CALIB_HAND_EYE_MIN_O3 = 1.5
+#
+# SCREW CONGRUENCE (Chen 1991) tolerances. AX = XB makes A and B conjugate, so
+# every pose pair must agree on rotation ANGLE and on PITCH (how far the motion
+# slid along its own axis) whatever X is. Both are testable with no solve, which
+# makes them the only checks here that a solver cannot flatter.
+#
+# Angle 3 deg: the clean 2026-08-06 capture ran a 1.16 deg median with its worst
+# good pair at 4.5 deg, against 33 deg and 18 deg for the two pairs touching the
+# one bad sample. The gap is wide enough that the exact threshold barely matters.
+# Pitch 15 mm: the arm's own open-loop positioning error is several mm and the
+# board sits ~470 mm away, so honest pairs carry real millimetres of disagreement.
+CALIB_HAND_EYE_CONGRUENCE_ANGLE_DEG = 3.0
+CALIB_HAND_EYE_CONGRUENCE_PITCH_MM = 15.0
+#
+# A sample is condemned when it is inconsistent with more than this fraction of
+# ALL the others, not merely with its neighbours in capture order. Congruence
+# holds between any two poses, so consecutive ordering carries no meaning and
+# testing only neighbours both wastes the evidence and leaves attribution
+# ambiguous -- an isolated bad consecutive pair implicates both its endpoints
+# equally. Over all pairs a truly bad sample disagrees with nearly everything
+# (score near 1.0) while its innocent neighbour disagrees only with it.
+#
+# 0.5 is the majority rule: a sample the majority cannot reconcile goes. It also
+# bounds what this can do -- if more than half the set is bad there is no
+# majority to appeal to, which is a recapture, not a cleanup.
+CALIB_HAND_EYE_MAX_DISAGREEMENT = 0.5
+#
+# ACCEPTANCE GATES for a finished solve. The ruler alone is NOT enough: on
+# 2026-08-05 a sample file that silently mixed two calibration frames produced
+# |t| = 33 mm, which sits inside 24 +/- 25 and "passed" -- while its board
+# spread was 183 mm and TSAI disagreed with PARK by 170 degrees. A solve has to
+# clear every one of these, because each catches a different kind of wrong:
+#   board spread   -- the chain does not place the stationary board consistently
+#   method spread  -- the solvers do not agree on an answer
+#   TSAI vs PARK   -- rotation is not determined at all
+HAND_EYE_MAX_BOARD_SPREAD_MM = 30.0
+HAND_EYE_MAX_METHOD_SPREAD_MM = 20.0
+HAND_EYE_MAX_TSAI_PARK_ROT_DEG = 5.0
+
+# --- Named poses, in raw ticks ----------------------------------------------
+#
+# HOME is the pose matlab/init_arm.m calls home: all five joint angles zero.
+# These ticks ARE the definition of home_tick in data/servo_calibration.json --
+# they are repeated here only so a script can drive back to it, and the two must
+# agree. FK at this pose puts the claw tip 70 mm in front of the base, dead
+# centre, 6.3 mm above the table.
+#
+# HOVER is where a run should START. The camera is eye-in-hand, so a brick that
+# is not in view cannot be detected, cannot be probed, and cannot be servoed to:
+# every loop in this repo begins by measuring the brick's pixel position, and
+# beginning from an arbitrary pose means the first thing the operator has to do
+# is hand-position the arm until the brick appears. Driving to a known hover
+# first makes a run reproducible -- the same starting geometry every time, which
+# is also what makes the probe gains comparable between runs.
+#
+# Measured 2026-08-05 by parking the arm where the brick was comfortably in
+# frame and reading hold_pose.py. Tip lands ~168 mm above the table at ~78 mm
+# reach, looking down at the work area.
+SERVO_HOME_TICKS = {1: 2020, 2: 2683, 3: 3298, 4: 1547, 5: 2744}
+SERVO_HOVER_TICKS = {1: 2021, 2: 2873, 3: 2448, 4: 1749, 5: 2744}
+# J6 is deliberately absent: it is the gripper, not part of positioning, and
+# pinning it here would make every goto_pose call quietly open or close the jaw.
+
+# --- Descent: one solve per step, not two loops ------------------------------
+#
+# Descending and correcting the brick's VERTICAL position in the image are the
+# same degree of freedom. Both ride on the shoulder/elbow chain, and the camera
+# is on the wrist, so lowering the claw swings the view -- about 7 px per mm,
+# measured 2026-08-05, which throws the brick 140 px up the frame on a 20 mm
+# step against a 55 px acceptance box.
+#
+# Running them as separate loops made the arm fight itself: IK lowered the tip,
+# a J3 jog dragged the brick back down and raised the tip by more than the step
+# had gained, and the next step spent itself undoing that. Four steps produced
+# 4 mm of net descent and then lost the brick off the top of the frame. So each
+# step now carries its own aim correction as a RADIAL reach in the same IK
+# solve, sized to cancel the swing the descent is about to cause
+# (planning/visual_servo.DescentModel).
+#
+# The model is fitted from the descent's own motion, which needs two steps whose
+# reach differs -- step 1 goes straight down, step 2 adds this offset. Both
+# still descend in full, so neither is a wasted probe move.
+SERVO_VISUAL_DESCEND_PROBE_MM = 8.0
+#
+# Cap on the radial correction one step may carry. The model is refitted every
+# step and an early fit can be poor; this bounds what a bad one can ask for.
+# Large enough to be useful (the brick is often tens of mm out), small enough
+# that a wrong sign is one recoverable step rather than a lunge.
+SERVO_VISUAL_DESCEND_MAX_REACH_MM = 25.0
+#
+# Total sideways (base-yaw) travel permitted across ONE whole descent.
+#
+# The descent corrects height and reach inside its IK solve, but sideways error
+# is left to a J1 jog running alongside it -- J1 cannot change tip height, so it
+# cannot undo a descent step. On 2026-08-05 that jog ran J1 away far enough that
+# the operator cut power: its gain had been measured before the descent, at a
+# different posture, and once wrong-signed each correction enlarged the error
+# and the next one was bigger. J1 has no measured travel limits, so the servo
+# bus could not refuse it either.
+#
+# This is the bound that does not depend on the pixel measurements being right.
+# ~200 ticks is about 17 deg of base yaw -- comfortably more than any real
+# sideways correction needs across a descent, and far short of a swing that
+# threatens anything.
+SERVO_VISUAL_SIDEWAYS_BUDGET_TICKS = 200.0
+
+# --- Cartesian conditioning guards ------------------------------------------
+#
+# Close to the base axis, Cartesian control of this arm is badly conditioned.
+# The claw hangs ~27 mm off the arm's own plane, so when the tip radius is small
+# that offset is a large fraction of the radius and the tip's BEARING becomes
+# hypersensitive to J1 — the solver then buys a few millimetres of tip motion
+# with several degrees of base yaw. The camera is on the wrist, so that yaw pans
+# the whole image and swamps the pixel error the loop is trying to null.
+#
+# Measured 2026-08-05, cost of a 5 mm radial nudge:
+#     radius  78 mm -> 6.59 deg of pan      (unusable)
+#     radius 130 mm -> 1.49 deg
+#     radius 160 mm -> 0.79 deg             (clean)
+# The fix is operational — work further out — but the loop must not quietly
+# thrash when it is not.
+SERVO_VISUAL_MAX_PAN_DEG = 1.5
+# Below this tip radius, warn that Cartesian re-centring will be poor.
+SERVO_VISUAL_MIN_RADIUS_M = 0.120
+# A "nudge" whose solution moves some joint this far is not a nudge: it is the
+# solver jumping to a different arm posture that happens to reach the same point.
+# Seen at 190 mm reach with J2 pinned at its limit: a 5 mm request came back as
+# J2-416, J3+366. Commanding that unsupervised would be a violent move.
+SERVO_VISUAL_MAX_SOLVE_TICKS = 120
 
 
 # --- Arm observation / jog web UI -------------------------------------------

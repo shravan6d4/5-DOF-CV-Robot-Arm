@@ -90,6 +90,78 @@ def invert_transform(t: np.ndarray) -> np.ndarray:
     return inv
 
 
+def screw_axis(t: np.ndarray) -> tuple[np.ndarray, np.ndarray, float]:
+    """Recover the axis a rigid motion rotates about: (direction, point, angle).
+
+    Rotating one joint of an arm moves every body distal to it by
+
+        M = T_after @ inv(T_before) = A @ Rot(theta) @ inv(A)
+
+    where A is the chain up to that joint. That is a pure rotation about the
+    joint's own axis expressed in the base frame, so feeding M here reads a
+    joint axis straight back out of forward kinematics — no model file, no link
+    parameters, nothing but two FK calls.
+
+    WHY THE POINT MATTERS AND NOT JUST THE DIRECTION. A direction alone cannot
+    tell you where an axis IS, and on this arm the base yaw axis does not pass
+    through the imported model's origin — it misses by 81 mm. Anything that
+    computes a "radial" or "outward" direction as `tip - origin` is therefore
+    measuring from the wrong centre, which at the home pose puts it 108 deg
+    away from the true radial direction. That is what made jog predictions
+    announce "1.9 mm left" while the claw plainly moved forward.
+
+    `t = (I - R) p` is rank 2 for a rotation, so p is only determined up to a
+    slide along the axis; lstsq returns the minimum-norm solution and we then
+    project out any residual along-axis component, giving the point on the axis
+    closest to the origin. Any point on the line is equally valid.
+
+    Returns a zero-length angle and the +Z axis for a pure translation, where
+    no axis exists.
+    """
+    r = np.asarray(t, dtype=float)[:3, :3]
+    p_t = np.asarray(t, dtype=float)[:3, 3]
+
+    angle = float(np.arccos(np.clip((np.trace(r) - 1.0) / 2.0, -1.0, 1.0)))
+    if angle < 1e-9:
+        return np.array([0.0, 0.0, 1.0]), np.zeros(3), 0.0
+
+    eigenvalues, eigenvectors = np.linalg.eig(r)
+    axis = np.real(eigenvectors[:, int(np.argmin(np.abs(eigenvalues - 1.0)))])
+    axis = axis / np.linalg.norm(axis)
+
+    # eig gives the axis up to sign; pick the one a positive rotation turns
+    # about, so a caller can tell clockwise from anticlockwise.
+    skew = (r - r.T) / 2.0
+    if float(np.dot(np.array([skew[2, 1], skew[0, 2], skew[1, 0]]), axis)) < 0:
+        axis = -axis
+
+    point, *_ = np.linalg.lstsq(np.eye(3) - r, p_t, rcond=None)
+    return axis, point - float(np.dot(point, axis)) * axis, angle
+
+
+def screw_pitch(t: np.ndarray, axis: np.ndarray) -> float:
+    """Translation ALONG a rigid motion's own rotation axis — the screw pitch.
+
+    Together with the rotation angle this is the pair of quantities the SCREW
+    CONGRUENCE THEOREM (Chen 1991) says must match between the two sides of a
+    hand-eye problem. AX = XB makes A and B conjugate, and conjugation cannot
+    change either invariant, so for every pose pair
+
+        angle(A) == angle(B)      and      pitch(A) == pitch(B)
+
+    must hold — whatever X turns out to be. That makes both testable BEFORE any
+    solve, which is the only kind of check that cannot be fooled by the solver
+    agreeing with its own assumptions.
+
+    Angle alone is the weaker half and was all this repo tested until
+    2026-08-06: it is blind to any fault that gets the amount of rotation right
+    while misplacing the motion along the axis, which is exactly what a bad
+    board detection or a mistimed frame produces.
+    """
+    axis = np.asarray(axis, dtype=float)
+    return float(np.dot(np.asarray(t, dtype=float)[:3, 3], axis))
+
+
 def transform_point(t: np.ndarray, point: np.ndarray) -> np.ndarray:
     """Apply a transform to a 3D point (translation included)."""
     point = np.asarray(point, dtype=float)

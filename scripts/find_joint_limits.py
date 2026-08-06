@@ -30,7 +30,6 @@ producing solutions the arm cannot reach.
 """
 
 import argparse
-import json
 import sys
 import time
 from pathlib import Path
@@ -40,16 +39,21 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 import numpy as np
 
 from vision_pipeline import config
+from vision_pipeline.robot_interface.servo_calibration import (
+    load_calibration_file,
+    save_calibration_file,
+    write_angle_limits,
+)
 from vision_pipeline.robot_interface.servo_driver import ServoBus, ServoSafetyError
 
 # A real step is tens of ticks. Anything approaching half the encoder's range is
 # the 4095->0 wrap showing up as a huge apparent jump, not real motion.
 SEAM_JUMP_TICKS = 1500
 # How close a RECORDED limit may sit to the 0/4095 seam before it is called out.
-# ~18 deg, several times the servo's observed settling error (tens of ticks) and
-# enough that unpowered sag cannot walk the joint across the boundary.
-SEAM_MARGIN_TICKS = 200
-ANGLE_LIMITS_PATH = "data/joint_limits_rad.json"
+# A warning threshold, not an applied margin -- a limit inside it means the
+# joint's ENCODER is badly placed and should be re-centred
+# (scripts/recentre_joint.py), not that the limit should be pulled in.
+SEAM_MARGIN_TICKS = config.SERVO_SEAM_WARN_TICKS
 
 
 def _confirm(prompt: str) -> bool:
@@ -224,25 +228,19 @@ def main() -> None:
         print("Nothing written.")
         return
 
-    path = Path(args.calibration)
-    cal = json.loads(path.read_text())
+    # UTF-8 explicitly: every joint now carries a prose limit_basis note, and a
+    # default-encoding read-modify-write on Windows mangles them permanently.
+    cal = load_calibration_file(args.calibration)
     cal[str(args.joint)]["min_tick"] = int(lo)
     cal[str(args.joint)]["max_tick"] = int(hi)
-    path.write_text(json.dumps(cal, indent=2))
+    path = save_calibration_file(cal, args.calibration)
     print(f"Wrote min_tick/max_tick for J{args.joint} to {path}")
 
-    # Angle limits for MATLAB's IK solver. Written as radians in the MODEL's own
-    # convention so init_arm.m can apply them directly, and kept in a separate
-    # file because they are specific to this physical arm.
-    angles = {}
-    for j in range(1, 7):
-        c = cal[str(j)]
-        if "min_tick" not in c or "max_tick" not in c:
-            continue
-        a = sorted((bus.ticks_to_rad(j, c["min_tick"]), bus.ticks_to_rad(j, c["max_tick"])))
-        angles[str(j)] = {"min_rad": a[0], "max_rad": a[1]}
-    Path(ANGLE_LIMITS_PATH).write_text(json.dumps(angles, indent=2))
-    print(f"Wrote angle limits for {len(angles)} joint(s) to {ANGLE_LIMITS_PATH}")
+    # Angle limits for MATLAB's IK solver, in the MODEL's own convention so
+    # init_arm.m can apply them directly. Written through the shared helper so
+    # the tick limits and the angle limits cannot drift apart.
+    angle_path, angles = write_angle_limits(cal)
+    print(f"Wrote angle limits for {len(angles)} joint(s) to {angle_path}")
     print("\nRestart the MATLAB server (ik_fk_server) so the IK solver picks them up.")
 
 

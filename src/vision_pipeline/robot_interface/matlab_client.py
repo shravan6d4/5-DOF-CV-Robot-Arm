@@ -51,6 +51,7 @@ class MatlabIKClient:
         self.host = host
         self.port = port
         self.socket = None
+        self._yaw_axis_xy = None      # measured lazily; see base_yaw_axis_xy
         self._connect()
 
     def _connect(self):
@@ -97,6 +98,7 @@ class MatlabIKClient:
         y: float,
         z: float,
         seed_rad: list[float] | None = None,
+        lock: list[int] | None = None,
     ) -> tuple[list[float], float]:
         """Request inverse kinematics for a position.
 
@@ -110,6 +112,13 @@ class MatlabIKClient:
                 different posture — a 45mm target once came back demanding
                 ~2600 ticks (~227 deg) of base rotation. Angles are
                 frame-independent, so no conversion applies to them.
+            lock: joint numbers (1..5) to HOLD at their seed angle. Five joints
+                against a 3-DOF position target leaves a 2-dimensional null
+                space, and a position-only solve has no preference within it —
+                so the solver is free to spend base yaw on a move that does not
+                need any. The camera rides on the wrist, so that pans the whole
+                image. Locking J1 for a pure descent asks for the answer in the
+                plane the arm is already in. Requires seed_rad.
 
         Returns:
             (angles_rad, err_mm): J1..J5 angles in radians, and IK error in mm.
@@ -118,10 +127,18 @@ class MatlabIKClient:
 
         Raises:
             IKUnreachableError: if target is outside workspace or IK tolerance.
+            ValueError: if lock is given without seed_rad.
         """
+        if lock and seed_rad is None:
+            raise ValueError(
+                "lock requires seed_rad: a joint can only be held at a known "
+                "angle, and without a seed the server has none to hold it at."
+            )
         req = {"cmd": "ik", "x": x, "y": -y, "z": -z}
         if seed_rad is not None:
             req["seed_rad"] = list(seed_rad)
+        if lock:
+            req["lock"] = [int(j) for j in lock]
         resp = self._send_request(req)
         angles_rad = resp["angles_rad"]  # list of 5 floats
         err_mm = resp["err_mm"]  # float
@@ -181,6 +198,33 @@ class MatlabIKClient:
         T_wrist = _F_PHYS_FROM_MODEL @ np.array(resp["T"]).reshape((4, 4), order="C")
         T_tip = _F_PHYS_FROM_MODEL @ np.array(resp["T_tip"]).reshape((4, 4), order="C")
         return T_wrist, T_tip
+
+    def base_yaw_axis_xy(self) -> np.ndarray:
+        """Where J1's rotation axis actually is, in base-frame XY METRES.
+
+        NOT the origin, and assuming otherwise is a live bug source. The
+        imported model's origin is a CAD artefact sitting 81 mm from the column
+        the arm turns about (measured 2026-08-06, scripts/audit_model_axes.py),
+        while at the home pose the claw tip is only ~25 mm from that column. So
+        a "radial" direction computed as `tip_xy / |tip_xy|` points up to 108 deg
+        away from truly outward. That error produced jog predictions announcing
+        sideways motion for joints that cannot move sideways, and it sat inside
+        the visual-servo descent, where it turns a reach correction into a
+        sideways one.
+
+        MEASURED, NOT STORED. Jog J1 a little and the axis it rotates the wrist
+        about IS the base yaw axis, so this cannot go stale if the model, the
+        joint mapping or the frame convention changes. Cached because it is a
+        property of the robot, not of the pose: two FK calls, once per session.
+        """
+        if self._yaw_axis_xy is None:
+            from vision_pipeline.calibration import geometry
+
+            t0 = self.request_fk([0.0] * 5)
+            t1 = self.request_fk([np.deg2rad(4.0), 0.0, 0.0, 0.0, 0.0])
+            _, point, _ = geometry.screw_axis(t1 @ geometry.invert_transform(t0))
+            self._yaw_axis_xy = point[:2]
+        return self._yaw_axis_xy
 
     def close(self):
         """Close the TCP connection."""

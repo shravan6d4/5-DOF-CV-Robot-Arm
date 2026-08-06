@@ -28,6 +28,10 @@ from typing import Optional
 import serial
 
 from vision_pipeline import config
+from vision_pipeline.robot_interface.servo_calibration import (
+    unwrap_tick,
+    wrapped_past_seam,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -85,13 +89,24 @@ class ServoBus:
     TICK_MAX = 4095                 # STS3215 is 12-bit (0..4095)
     EEPROM_SETTLE_S = 0.02          # let an EEPROM write commit before the next command
 
-    def __init__(self, port: str, baud: int = 1000000, calibration_path: Optional[str] = None):
+    def __init__(self, port: str, baud: int = 1000000, calibration_path: Optional[str] = None,
+                 limit_margin_ticks: int = config.SERVO_LIMIT_MARGIN_TICKS):
         """Initialize the servo bus.
 
         Args:
             port: serial port name (e.g., 'COM3', '/dev/ttyUSB0').
             baud: baud rate (default 1000000 for STS3215).
             calibration_path: path to servo_calibration.json, or None to use config default.
+            limit_margin_ticks: widen every measured travel range by this many
+                ticks at BOTH ends. Zero by default, and it should stay zero
+                unless a specific range is known to be too tight. The recorded
+                limits carry a `limit_basis` field saying how they were found:
+                J2's and J3's are GROUND-DERIVED, meaning the joint stopped
+                because the claw met the table at the elbow angle used when
+                measuring, not because the joint ran out of travel. Fold the
+                elbow differently and the same angle is safe, which is exactly
+                when a margin is justified. A margin on a MECHANICAL limit is
+                not justified and drives the joint into a hard stop.
 
         Raises:
             ServoCalibrationError: if calibration is missing or invalid.
@@ -101,6 +116,7 @@ class ServoBus:
         self.baud = baud
         self.serial = None
         self._calibration = {}
+        self.limit_margin_ticks = max(0, int(limit_margin_ticks))
 
         # Load calibration (JSON file, fallback to config placeholder)
         self._load_calibration(calibration_path or config.SERVO_CALIBRATION_PATH)
@@ -133,10 +149,23 @@ class ServoBus:
         calibration_path = Path(path)
         if calibration_path.exists():
             try:
-                with open(calibration_path) as f:
+                # UTF-8 EXPLICITLY. open() with no encoding uses the platform
+                # default, which is cp1252 on Windows, while this file is
+                # written as UTF-8 (servo_calibration.save_calibration_file) and
+                # carries prose notes full of em-dashes. The mismatch is
+                # invisible until a note contains a byte cp1252 has no character
+                # for, at which point the loader raises UnicodeDecodeError from
+                # inside a codec and the arm looks like a driver failure.
+                #
+                # It stayed hidden this long because the two scripts that
+                # rewrite the file used json.dumps' default ensure_ascii=True,
+                # quietly re-encoding every non-ASCII character as \\uXXXX and
+                # scrubbing the file clean on the way past. The first write that
+                # preserved the characters broke every test that opens a bus.
+                with open(calibration_path, encoding="utf-8") as f:
                     self._calibration = json.load(f)
                 logger.info(f"Loaded servo calibration from {path}")
-            except (json.JSONDecodeError, IOError) as e:
+            except (json.JSONDecodeError, IOError, UnicodeDecodeError) as e:
                 logger.warning(f"Failed to load {path}, using fallback: {e}")
                 self._calibration = config.SERVO_CALIBRATION_FALLBACK
         else:
@@ -160,6 +189,17 @@ class ServoBus:
                             else ""
                         )
                     )
+
+    @property
+    def calibration(self) -> dict:
+        """The loaded calibration dict, keyed by string joint ID.
+
+        Read-only accessor so callers can inspect provenance (dir_sign_basis and
+        friends) without reaching into _calibration or re-reading the file behind
+        the bus's back — a second read could pick up a different file if this bus
+        was constructed with a non-default calibration_path.
+        """
+        return self._calibration
 
     def _cal(self, servo_id: int) -> dict:
         """Return the calibration dict for a servo, or raise if uncalibrated."""
@@ -407,20 +447,51 @@ class ServoBus:
         because a servo that cannot be frozen must not prevent the others from
         being frozen.
 
+        RETRIED IN PASSES, not per joint. Every joint gets one fast attempt
+        first, and only the ones that failed are retried. Retrying a joint
+        in place would make a single unresponsive servo's timeouts delay the
+        freeze of every joint after it -- and during a freeze those joints are
+        still travelling toward their old goals. Observed 2026-08-05: a run hit
+        a bus error and the freeze that followed silently failed on two of five
+        joints, which is the soft e-stop not working at the moment it was
+        called for. A dropped byte on a shared serial chain is common; giving up
+        on the first one is not acceptable for this particular function.
+
         Returns:
             {servo_id: position_held} for each joint successfully frozen.
         """
         held = {}
-        for servo_id in servo_ids:
-            try:
-                present = self.read_position(servo_id)
-                self._write_register(
-                    servo_id, self.ADDR_GOAL_POSITION,
-                    bytes([present & 0xFF, (present >> 8) & 0xFF]),
-                )
-                held[servo_id] = present
-            except Exception as e:
-                logger.error(f"Servo {servo_id}: FREEZE FAILED — {e}")
+        pending = list(servo_ids)
+        errors: dict = {}
+
+        for _attempt in range(max(1, config.SERVO_FREEZE_ATTEMPTS)):
+            failed = []
+            for servo_id in pending:
+                try:
+                    present = self.read_position(servo_id)
+                    self._write_register(
+                        servo_id, self.ADDR_GOAL_POSITION,
+                        bytes([present & 0xFF, (present >> 8) & 0xFF]),
+                    )
+                    held[servo_id] = present
+                except Exception as e:
+                    errors[servo_id] = e
+                    failed.append(servo_id)
+            pending = failed
+            if not pending:
+                break
+            # Same reasoning as read_position_retrying: the reads fail because
+            # of a noise burst, and asking again inside the same burst fails
+            # again. Kept short — the joints still pending are still moving.
+            time.sleep(config.SERVO_READ_RETRY_BACKOFF_S)
+
+        for servo_id in pending:
+            logger.error(
+                f"Servo {servo_id}: FREEZE FAILED after "
+                f"{config.SERVO_FREEZE_ATTEMPTS} attempts — {errors[servo_id]}. "
+                f"This joint is still travelling to its last goal. If it does not "
+                f"stop, cut power."
+            )
         return held
 
     def enable_torque(self, servo_id: int) -> int:
@@ -665,7 +736,7 @@ class ServoBus:
         lo, hi = cal.get("min_tick"), cal.get("max_tick")
         if lo is None or hi is None:
             return None
-        return int(lo), int(hi)
+        return int(lo) - self.limit_margin_ticks, int(hi) + self.limit_margin_ticks
 
     def _check_travel_limits(self, servo_id: int, start_ticks: int, target_ticks: int) -> None:
         """Refuse a move that would leave this joint's measured travel range.
@@ -692,6 +763,53 @@ class ServoBus:
         def violation(t: int) -> int:
             return max(lo - t, t - hi, 0)
 
+        # Holding still is ALWAYS allowed, in range or out of it. Commanding a
+        # joint to the position it already occupies moves it nowhere, so there
+        # is nothing for a travel limit to protect against -- and refusing it
+        # breaks the one thing that helps most when a joint is out of range.
+        #
+        # Found 2026-08-05: J3 had sagged to tick 190, just below its limit of
+        # 200. hold_pose.py asked it to hold at 190 and this check refused,
+        # because `violation(target) < violation(start)` is false when the two
+        # are equal. With no goal written the joint kept falling -- 190, then
+        # 155 on the next attempt -- and every further attempt to catch it was
+        # refused for being even further out. The limit was actively preventing
+        # the rescue of the joint it had trapped.
+        if target_ticks == start_ticks:
+            if violation(start_ticks) > 0:
+                logger.warning(
+                    f"Servo {servo_id} is outside its travel range [{lo}, {hi}] "
+                    f"at {start_ticks}; allowing it to HOLD there (zero motion). "
+                    f"Drive it back into range before commanding anything else."
+                )
+            return
+
+        # Everything past this point compares tick numbers, and that arithmetic
+        # is only meaningful while the reading and the limits share a numbering.
+        # Once a joint crosses the 0/4095 seam they do not: J3 read 4079 on
+        # 2026-08-05 while really sitting 80 ticks BELOW a minimum of 63, so
+        # `violation` scored it ~3000 ticks past its MAXIMUM and the direction
+        # that recovers it looked like the direction that makes it worse. The
+        # one useful move was the one refused, under a message blaming a travel
+        # range that was entirely correct.
+        #
+        # Checked after the hold case above, not before: holding a wrapped joint
+        # writes its own present position as the goal and moves it nowhere, and
+        # that is exactly the rescue an operator reaches for. Only MOTION is
+        # refused.
+        if wrapped_past_seam(start_ticks, lo, hi):
+            unwrapped = unwrap_tick(start_ticks, (lo + hi) // 2)
+            raise ServoSafetyError(
+                f"Servo {servo_id}'s position reading has WRAPPED past the 0/4095 "
+                f"encoder seam: it reads {start_ticks}, which is really {unwrapped} "
+                f"relative to its range [{lo}, {hi}]. Nothing was commanded, and no "
+                f"goal position can fix this — the servo drives goals linearly and "
+                f"would take the long way round the circle, through every hard stop "
+                f"between here and there. The range is NOT wrong; do not re-measure "
+                f"it. Move the seam instead, which needs no motion at all: "
+                f"python scripts/recentre_joint.py --joint {servo_id} --here"
+            )
+
         if violation(target_ticks) < violation(start_ticks):
             logger.warning(
                 f"Servo {servo_id} is outside its travel range [{lo}, {hi}] at "
@@ -707,22 +825,54 @@ class ServoBus:
             f"scripts/find_joint_limits.py if the range itself is wrong."
         )
 
-    def _read_position_retrying(self, servo_id: int) -> int:
-        """read_position, absorbing up to SERVO_MOVE_READ_RETRIES transient failures.
+    def read_position_retrying(self, servo_id: int) -> int:
+        """read_position, absorbing transient serial failures with a backoff.
 
-        Only used while polling for settle — a move already in flight should not
-        be abandoned over one dropped byte on the read side.
+        Use this for any read taken while the arm is moving or has just moved.
+        Plain read_position stays un-retried because ping/scan_ids depend on
+        "no answer" meaning "not there".
+
+        THE BACKOFF IS THE POINT. This originally retried in a tight loop, which
+        cannot help with the failure it exists for: reads fail because motor
+        current puts noise on the shared serial line, and noise comes in bursts
+        lasting longer than three immediate retries take. All three attempts
+        landed inside the same burst and the loop reported a dead servo --
+        observed 2026-08-05, where J2 answered perfectly at rest, before and
+        after, and the bus was healthy on every read-only check. Waiting a few
+        milliseconds and asking again is what actually crosses a burst.
         """
         last_error = None
-        for _ in range(config.SERVO_MOVE_READ_RETRIES):
+        attempts = max(1, config.SERVO_MOVE_READ_RETRIES)
+        for attempt in range(attempts):
             try:
                 return self.read_position(servo_id)
             except RuntimeError as e:
                 last_error = e
+                if attempt < attempts - 1:
+                    # Growing pause: a short burst clears quickly, a long one
+                    # needs more room, and doubling covers both without a fixed
+                    # guess at how long the noise lasts. Capped, because doubling
+                    # over a dozen attempts would otherwise reach minutes.
+                    time.sleep(min(config.SERVO_READ_RETRY_BACKOFF_S * (2 ** attempt),
+                                   config.SERVO_READ_RETRY_MAX_S))
         raise RuntimeError(
-            f"Servo {servo_id} did not respond after "
-            f"{config.SERVO_MOVE_READ_RETRIES} attempts: {last_error}"
+            f"Servo {servo_id} did not respond after {attempts} attempts "
+            f"spanning {self._backoff_total():.2f}s: {last_error}. "
+            f"If the joint is visibly holding torque and answers "
+            f"scripts/check_servo_health.py at rest, this is line noise under "
+            f"motor current, not a failed servo."
         )
+
+    # Kept for the internal call sites that predate the public name.
+    _read_position_retrying = read_position_retrying
+
+    @staticmethod
+    def _backoff_total() -> float:
+        """Total time the retry backoff spans, for error messages."""
+        attempts = max(1, config.SERVO_MOVE_READ_RETRIES)
+        return sum(min(config.SERVO_READ_RETRY_BACKOFF_S * (2 ** i),
+                       config.SERVO_READ_RETRY_MAX_S)
+                   for i in range(attempts - 1))
 
     def _wait_for_settle(self, servo_id: int, target_ticks: int, tolerance_ticks: int) -> int:
         """Poll present position until the servo arrives, stalls, or times out.

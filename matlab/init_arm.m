@@ -85,11 +85,18 @@ assert(~any(cellfun(@isempty, realMotors)), 'Mapping failed - check block names.
 % homeConfiguration inside the new limits, so it remains a valid IK seed.
 eps_ = 1e-6;
 homeAngles = zeros(1,6);
+% Joint roles below were read back out of the model's own FK by
+% scripts/audit_model_axes.py and confirmed against the physical arm on
+% 2026-08-06: yaw, three PARALLEL pitches, then a wrist ROLL. J5 used to be
+% labelled "wrist pitch" here, which was a mislabel in this comment only --
+% the model's geometry always had it as a roll (0.2 deg off the forearm), and
+% the operator confirmed the physical joint spins the claw rather than
+% tilting it. Link lengths J2->J3 = 102.7 mm, J3->J4 = 136.2 mm.
 rangeDeg = [ -90  90;    % J1 base yaw
-             -90  90;    % J2 shoulder
-             -90  90;    % J3 elbow
-             -90  90;    % J4 forearm
-             -90  90;    % J5 wrist pitch
+             -90  90;    % J2 shoulder   pitch
+             -90  90;    % J3 elbow      pitch
+             -90  90;    % J4 wrist      pitch
+             -90  90;    % J5 wrist      ROLL (spins the claw; camera rides here)
              -45  45 ];  % J6 claw rotation
 
 % MEASURED limits override the blanket +-90 above, per joint, where they exist.

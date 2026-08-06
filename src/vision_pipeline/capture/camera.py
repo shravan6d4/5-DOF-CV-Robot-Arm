@@ -11,6 +11,7 @@ a simulator) without changing any detection code.
 from __future__ import annotations
 
 import logging
+import time
 from collections.abc import Iterator
 
 import cv2
@@ -54,7 +55,31 @@ class Camera:
         if self.autofocus_disabled:
             # Pin the lens too — disabling AF alone can leave it wherever it
             # last landed, which differs run to run.
+            #
+            # THE STREAM MUST BE RUNNING FIRST. This camera silently ignores
+            # CAP_PROP_FOCUS until frames are actually flowing, and
+            # get(CAP_PROP_FOCUS) returns 0.0 always, so a failed set looks
+            # exactly like a successful one. Measured 2026-08-05, frame
+            # sharpness (Laplacian variance) at the same scene:
+            #
+            #     focus never set .......... 134
+            #     focus set before reading . 134   <- what this code used to do
+            #     focus set while streaming  2116
+            #
+            # Every frame this project captured before that fix was therefore at
+            # whatever focus the camera powered up with, however carefully
+            # CAMERA_FOCUS was chosen. It showed up as a detector that fired on
+            # ~5% of frames with the confidence pinned to its threshold, which
+            # reads as a tuning problem and is not one.
+            for _ in range(config.CAMERA_FOCUS_WARMUP_FRAMES):
+                self._cap.read()
             self._cap.set(cv2.CAP_PROP_FOCUS, config.CAMERA_FOCUS)
+            # Setting the property only STARTS the lens moving; the motor takes
+            # a fair fraction of a second, and frames grabbed meanwhile are
+            # focused somewhere between the old position and the new one.
+            time.sleep(config.CAMERA_FOCUS_SETTLE_S)
+            for _ in range(config.CAMERA_FOCUS_SETTLE_FRAMES):
+                self._cap.read()
         else:
             logger.warning(
                 "Could not disable autofocus on camera %d — intrinsics and every "

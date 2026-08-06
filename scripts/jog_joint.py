@@ -34,13 +34,17 @@ Usage (from the repo root):
 import argparse
 import json
 import sys
+import time
+from datetime import date
 from pathlib import Path
+from typing import Optional
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 import numpy as np
 
 from vision_pipeline import config
+from vision_pipeline.calibration import geometry
 from vision_pipeline.robot_interface.matlab_client import MatlabIKClient
 from vision_pipeline.robot_interface.servo_driver import ServoBus, ServoSafetyError
 
@@ -50,15 +54,107 @@ MIN_VISIBLE_MM = 3.0         # below this the motion is too small to judge by ey
 MIN_VISIBLE_DEG = 3.0        # ...or, for a joint that only rotates the wrist
 CLAW_LEN_MM = 70.06          # ClawTip offset from the wrist, from init_arm.m
 CLEARANCE_MARGIN_MM = 5.0    # never plan to close more than this much of the gap
+SETTLE_TIMEOUT_S = 4.0       # how long to wait for the joint to stop creeping
+SETTLE_POLL_S = 0.25
+SETTLE_TOL_TICKS = 3         # two reads this close = it has come to rest
 
 
-def describe_motion(d_mm: np.ndarray) -> str:
-    """Render a base-frame displacement as directions a human can check."""
-    axes = [
-        (d_mm[0], "forward", "backward"),
-        (d_mm[1], "left", "right"),
-        (d_mm[2], "up", "down"),
-    ]
+def base_yaw_axis_xy(client) -> np.ndarray:
+    """Where the base yaw axis actually is, in base-frame XY millimetres.
+
+    NOT the origin. The imported model's origin is a CAD artefact sitting 81 mm
+    from the column the arm turns about (measured 2026-08-06 by
+    scripts/audit_model_axes.py), so "radial" computed as `tip - origin` points
+    108 deg away from the true radial direction at the home pose. That is the
+    bug behind jog predictions announcing sideways motion for the pitch joints.
+
+    Read out of FK rather than stored as a constant, so it cannot go stale if
+    the model or the frame convention changes: jog J1 a little, and the axis it
+    rotated the wrist about IS the base yaw axis.
+    """
+    a0 = [0.0] * 5
+    a1 = [np.deg2rad(4.0), 0.0, 0.0, 0.0, 0.0]
+    t0, _ = client.request_fk_tip(a0)
+    t1, _ = client.request_fk_tip(a1)
+    _, point, _ = geometry.screw_axis(t1 @ geometry.invert_transform(t0))
+    return point[:2] * 1000.0
+
+
+def describe_motion(d_mm: np.ndarray, tip_xy: np.ndarray | None = None,
+                    yaw_xy: np.ndarray | None = None,
+                    axis: np.ndarray | None = None) -> str:
+    """Render a base-frame displacement as directions a human can check.
+
+    DECOMPOSE ABOUT THE JOINT'S OWN AXIS. A revolute joint moves the tip
+    strictly perpendicular to its axis, so the axis fixes which directions are
+    even possible, and naming the impossible one is what makes a prediction
+    unfalsifiable. Two cases, and they need opposite language:
+
+      * horizontal axis (J2/J3/J4, the pitches) -- the claw moves OUT/IN and
+        UP/DOWN in the arm's own vertical plane, and CANNOT move sideways.
+      * vertical axis (J1 base yaw) -- the claw swings LEFT/RIGHT about that
+        axis and cannot change height.
+
+    TWO WRONG VERSIONS OF THIS CAME FIRST, both on 2026-08-06, and the second
+    is the instructive one:
+
+      1. Splitting along the fixed base Y axis, which called a pure pitch
+         "1.9 mm left" purely because the arm pointed off-centre. The operator
+         watched a J3 jog and said the claw plainly moved forward.
+      2. Splitting radially about the base yaw axis. Better, but still wrong:
+         the arm's plane is offset from that axis by the J1->J2 link (12.7 mm),
+         so a perfectly clean J3 pitch still came out as "14.8 mm out AND
+         5.1 mm left". The residual was real arithmetic about the wrong centre,
+         not an error the operator could ever see.
+
+    Sideways is still REPORTED for a pitch joint rather than dropped, because a
+    non-zero value there is evidence the model's axes are wrong -- which is
+    exactly the fault that was being hunted when this was written. It should
+    read 0.0.
+
+    `yaw_xy` (see base_yaw_axis_xy) only signs out-vs-in, so both cases agree
+    on which way is "away from the base column".
+    """
+    d_mm = np.asarray(d_mm, dtype=float)
+    axes = None
+
+    if axis is not None and tip_xy is not None and yaw_xy is not None:
+        axis = np.asarray(axis, dtype=float)
+        axis = axis / np.linalg.norm(axis)
+        radial = np.asarray(tip_xy[:2], dtype=float) - np.asarray(yaw_xy, dtype=float)
+
+        if abs(axis[2]) < 0.2 and np.linalg.norm(radial) > 1e-6:
+            # Horizontal axis: a pitch. "Out" is horizontal, perpendicular to
+            # the axis, signed away from the base column.
+            out = np.cross(axis, [0.0, 0.0, 1.0])
+            out = out / np.linalg.norm(out)
+            if float(np.dot(out[:2], radial)) < 0:
+                out = -out
+            axes = [
+                (float(np.dot(d_mm, out)), "out (away from the base column)",
+                 "in (toward the base column)"),
+                (float(d_mm[2]), "up", "down"),
+                (float(np.dot(d_mm, axis)), "sideways +axis", "sideways -axis"),
+            ]
+        elif abs(axis[2]) > 0.8 and np.linalg.norm(radial) > 1e-6:
+            # Vertical axis: a yaw. Sideways is the whole point here.
+            r = radial / np.linalg.norm(radial)
+            axes = [
+                (float(np.dot(d_mm[:2], np.array([-r[1], r[0]]))), "left", "right"),
+                (float(np.dot(d_mm[:2], r)), "out (away from the base column)",
+                 "in (toward the base column)"),
+                (float(d_mm[2]), "up", "down"),
+            ]
+
+    if axes is None:
+        # A tilted axis (or no axis supplied) has no clean two-term story, so
+        # say plainly what the base frame reports rather than inventing one.
+        axes = [
+            (float(d_mm[0]), "along +X", "along -X"),
+            (float(d_mm[1]), "along +Y", "along -Y"),
+            (float(d_mm[2]), "up", "down"),
+        ]
+
     parts = [
         f"{abs(v):.1f} mm {pos if v > 0 else neg}"
         for v, pos, neg in axes
@@ -67,13 +163,42 @@ def describe_motion(d_mm: np.ndarray) -> str:
     return ", ".join(parts) if parts else "no appreciable movement"
 
 
-def describe_rotation(R0: np.ndarray, R1: np.ndarray) -> tuple[str, float]:
-    """Describe the wrist's rotation between two poses, in base-frame terms.
+def is_roll(axis: np.ndarray, claw_dir: np.ndarray | None) -> bool:
+    """Does this joint SPIN the claw about its own pointing direction?
+
+    A roll barely translates the tip -- J5 moves it 7.5 mm for a 17.6 deg turn,
+    which clears MIN_VISIBLE_MM and would otherwise have the operator judging a
+    sign from a 7 mm wobble instead of an unmistakable spin. Worse, that small
+    translation has no clean description: the roll axis sits at no particular
+    angle to anything, so describe_motion can only fall back to raw base-frame
+    components. Watch the spin instead, whatever the travel.
+    """
+    if claw_dir is None:
+        return False
+    v = np.asarray(claw_dir, dtype=float)
+    n = np.linalg.norm(v)
+    if n < 1e-9:
+        return False
+    return abs(float(np.dot(np.asarray(axis, dtype=float), v / n))) > 0.8
+
+
+def describe_rotation(R0: np.ndarray, R1: np.ndarray,
+                      claw_dir: np.ndarray | None = None) -> tuple[str, float]:
+    """Describe the wrist's rotation between two poses.
 
     Needed for a joint like J5 that spins the wrist about its own axis: the
-    wrist ORIGIN does not move at all, so a position-only prediction reports
+    wrist ORIGIN barely moves, so a position-only prediction reports almost
     nothing and the operator has nothing to compare against. The claw visibly
     turns, though, so describe that instead.
+
+    A ROLL GETS A FRAME-INDEPENDENT DESCRIPTION, and that is the point of
+    `claw_dir`. The fallback below names the rotation against the BASE frame,
+    which on this arm is rotated ~89 deg from the direction the arm actually
+    reaches (measured 2026-08-06, scripts/audit_model_axes.py). A J5 roll about
+    the forearm therefore came out of that fallback as "tilting back/up" -- a
+    pitch, which is not what a roll does and not what the operator would see.
+    Spin sense about the claw's own pointing direction needs no base frame, so
+    it survives that error entirely.
 
     Returns (description, angle_deg).
     """
@@ -87,18 +212,30 @@ def describe_rotation(R0: np.ndarray, R1: np.ndarray) -> tuple[str, float]:
         R_rel[1, 0] - R_rel[0, 1],
     ]) / (2.0 * np.sin(angle))
     axis = R0 @ axis_local  # into base frame
+    deg = float(np.rad2deg(angle))
+
+    if claw_dir is not None and np.linalg.norm(claw_dir) > 1e-9:
+        view = np.asarray(claw_dir, dtype=float)
+        view = view / np.linalg.norm(view)
+        if is_roll(axis, claw_dir):
+            # Right-hand rule: looking ALONG the axis (it points away from the
+            # viewer), a positive rotation reads as clockwise. The viewer here
+            # stands at the wrist looking out towards the claw.
+            spin = "CLOCKWISE" if float(np.dot(axis, view)) > 0 else "ANTICLOCKWISE"
+            return (f"{deg:.1f} deg, the claw SPINS {spin} — viewed from the "
+                    f"wrist looking out along the claw", deg)
 
     i = int(np.argmax(np.abs(axis)))
     sense = axis[i] > 0
-    # Right-hand rule, read from the operator's viewpoint given +X forward,
-    # +Y left, +Z up (pinned empirically in Stage B).
+    # Base-frame naming, and the base frame is rotated ~89 deg from the arm's
+    # own forward, so treat these words as approximate.
     naming = {
         0: ("counterclockwise seen from the front", "clockwise seen from the front"),
         1: ("tilting back/up", "tilting forward/down"),
         2: ("counterclockwise seen from above", "clockwise seen from above"),
     }
     pos, neg = naming[i]
-    return f"{np.rad2deg(angle):.1f} deg, {pos if sense else neg}", float(np.rad2deg(angle))
+    return f"{deg:.1f} deg, {pos if sense else neg} (base-frame naming)", deg
 
 
 def read_angles(bus) -> dict:
@@ -138,17 +275,68 @@ def predict(client, state, joint, target_tick, bus):
     return T0, T1, tip0, tip1, tip1 - tip0, wrist_delta
 
 
-def apply_flip(joint: int) -> None:
+def _stamp(joint: int, confirmed: bool, basis: str) -> Optional[dict]:
+    """Record in the calibration file how this joint's dir_sign was decided.
+
+    A dir_sign is only ever settled by a physical jog, so the jog's verdict is
+    the one piece of evidence worth persisting — and the file is where it has to
+    live, because no downstream number can re-derive it. Returns the loaded dict
+    (already written back), or None if there is no file to write.
+    """
+    path = Path(config.SERVO_CALIBRATION_PATH)
+    if not path.exists():
+        print(f"  Cannot record: {path} does not exist (running on config fallback).")
+        print(f"  Edit config.SERVO_CALIBRATION_FALLBACK['{joint}'] by hand.")
+        return None
+    cal = json.loads(path.read_text(encoding="utf-8"))
+    cal[str(joint)]["dir_sign_confirmed"] = confirmed
+    cal[str(joint)]["dir_sign_basis"] = basis
+    # ensure_ascii=False keeps the prose notes legible in the file; the explicit
+    # encoding is what stops Windows writing cp1252 where every other reader
+    # expects UTF-8. Writing pure ASCII was masking a latent decode bug in
+    # ServoBus rather than avoiding one.
+    path.write_text(json.dumps(cal, indent=2, ensure_ascii=False) + "\n",
+                    encoding="utf-8")
+    return cal
+
+
+def confirm_sign(joint: int, sign: int, ticks: int, prediction: str) -> None:
+    """Mark a dir_sign as confirmed after the arm agreed with the prediction."""
+    stamped = _stamp(
+        joint, True,
+        f"CONFIRMED by physical jog on {date.today().isoformat()}: "
+        f"{ticks:+d} ticks, operator reported the motion matched the prediction "
+        f"({prediction}).",
+    )
+    if stamped is not None:
+        print(f"  Recorded in {config.SERVO_CALIBRATION_PATH}: "
+              f"J{joint} dir_sign {sign:+d} confirmed.")
+
+
+def apply_flip(joint: int, ticks: int = 0, prediction: str = "") -> None:
     """Flip one joint's dir_sign in the calibration file, in place."""
     path = Path(config.SERVO_CALIBRATION_PATH)
     if not path.exists():
         print(f"  Cannot apply: {path} does not exist (running on config fallback).")
         print(f"  Edit config.SERVO_CALIBRATION_FALLBACK['{joint}']['dir_sign'] by hand.")
         return
-    cal = json.loads(path.read_text())
+    cal = json.loads(path.read_text(encoding="utf-8"))
     old = cal[str(joint)]["dir_sign"]
     cal[str(joint)]["dir_sign"] = -old
-    path.write_text(json.dumps(cal, indent=2) + "\n")
+    # Flipped, but NOT yet confirmed: the confirming evidence is the *next* jog
+    # matching its prediction, which has not happened yet.
+    cal[str(joint)]["dir_sign_confirmed"] = False
+    cal[str(joint)]["dir_sign_basis"] = (
+        f"Flipped {old:+d} -> {-old:+d} on {date.today().isoformat()} after a "
+        f"{ticks:+d}-tick jog moved OPPOSITE to the prediction ({prediction}). "
+        f"NOT yet re-confirmed — jog again and check the new prediction matches."
+    )
+    # ensure_ascii=False keeps the prose notes legible in the file; the explicit
+    # encoding is what stops Windows writing cp1252 where every other reader
+    # expects UTF-8. Writing pure ASCII was masking a latent decode bug in
+    # ServoBus rather than avoiding one.
+    path.write_text(json.dumps(cal, indent=2, ensure_ascii=False) + "\n",
+                    encoding="utf-8")
     print(f"  Wrote {path}: J{joint} dir_sign {old:+d} -> {-old:+d}")
     print(f"  Re-run this jog to confirm the prediction now matches.")
 
@@ -199,20 +387,31 @@ def main() -> None:
         cal = bus._cal(joint)
         T0, T1, p0, p1, d, wrist_d = predict(client, state, joint, target_tick, bus)
         travel_mm = float(np.linalg.norm(d))
-        rot_desc, rot_deg = describe_rotation(T0[:3, :3], T1[:3, :3])
+        rot_desc, rot_deg = describe_rotation(
+            T0[:3, :3], T1[:3, :3], claw_dir=p0 - T0[:3, 3] * 1000.0)
+        yaw_xy = base_yaw_axis_xy(client)
+        # The joint's own axis, straight out of the two poses already computed
+        # -- the motion between them IS a rotation about it. No extra FK calls,
+        # and nothing to go stale if the model changes.
+        jog_axis, _, _ = geometry.screw_axis(T1 @ geometry.invert_transform(T0))
 
         print(f"\nJ{joint} jog:  {start_tick} -> {target_tick} ticks "
               f"({args.ticks:+d}, dir_sign {cal['dir_sign']:+d})")
         print(f"  CLAW TIP now:       ({p0[0]:+7.1f}, {p0[1]:+7.1f}, {p0[2]:+7.1f}) mm")
         print(f"  CLAW TIP predicted: ({p1[0]:+7.1f}, {p1[1]:+7.1f}, {p1[2]:+7.1f}) mm")
+        print(f"  (out/in below is measured from the BASE YAW AXIS at "
+              f"({yaw_xy[0]:+.1f}, {yaw_xy[1]:+.1f}) mm, not the model origin — "
+              f"the claw sits {np.linalg.norm(p0[:2] - yaw_xy):.0f} mm out from it)")
 
         # A joint whose axis passes through the tip (J5 roll) barely moves it,
         # so fall back to describing the rotation the operator can still see.
-        watch_rotation = travel_mm < MIN_VISIBLE_MM
+        watch_rotation = (travel_mm < MIN_VISIBLE_MM
+                          or is_roll(jog_axis, p0 - T0[:3, 3] * 1000.0))
         if watch_rotation:
             prediction = f"the claw should ROTATE {rot_desc}"
         else:
-            prediction = f"the CLAW should move {describe_motion(d)}"
+            prediction = (f"the CLAW should move "
+                          f"{describe_motion(d, p0, yaw_xy, jog_axis)}")
         print(f"\n  PREDICTION: {prediction}")
         print(f"              (claw travel {travel_mm:.1f} mm, rotation {rot_deg:.1f} deg)")
 
@@ -220,8 +419,10 @@ def main() -> None:
         # ways; surface that rather than letting the operator reconcile a
         # claw observation against a wrist number in their head.
         wrist_travel = float(np.linalg.norm(wrist_d))
-        if wrist_travel >= 0.5 and describe_motion(wrist_d) != describe_motion(d):
-            print(f"  (the WRIST meanwhile moves {describe_motion(wrist_d)} — "
+        claw_desc = describe_motion(d, p0, yaw_xy, jog_axis)
+        wrist_desc = describe_motion(wrist_d, p0, yaw_xy, jog_axis)
+        if wrist_travel >= 0.5 and wrist_desc != claw_desc:
+            print(f"  (the WRIST meanwhile moves {wrist_desc} — "
                   f"watch the CLAW, not the wrist)")
 
         if travel_mm < MIN_VISIBLE_MM and rot_deg < MIN_VISIBLE_DEG:
@@ -238,8 +439,22 @@ def main() -> None:
         descent_mm = -min(0.0, d[2])
         if descent_mm > 0:
             usable = args.clearance_mm - CLEARANCE_MARGIN_MM
-            print(f"\n  Clearance: claw is {args.clearance_mm:.0f} mm above the table; "
-                  f"this jog descends {descent_mm:.1f} mm.")
+            print(f"\n  Clearance: claw is {args.clearance_mm:.0f} mm above the table "
+                  f"(--clearance-mm, YOUR figure, default 10);")
+            # FK's own opinion, shown alongside. Deliberately NOT used as the
+            # guard: FK's absolute height depends on home_tick and
+            # TABLE_Z_IN_BASE, and this script exists precisely because the
+            # joint calibration is under suspicion. But the two figures
+            # disagreeing is worth knowing -- a large gap means one of them is
+            # wrong, and the operator is the one who can look.
+            fk_clearance = p0[2] - config.TABLE_Z_IN_BASE * 1000.0
+            print(f"            FK reckons {fk_clearance:.0f} mm from the same pose.")
+            if abs(fk_clearance - args.clearance_mm) > 30:
+                print(f"            Those disagree by {abs(fk_clearance - args.clearance_mm):.0f} mm. "
+                      f"If your figure is measured rather than\n"
+                      f"            estimated, TABLE_Z_IN_BASE ({config.TABLE_Z_IN_BASE * 1000:.0f} mm) "
+                      f"or home_tick is off.")
+            print(f"            This jog descends {descent_mm:.1f} mm.")
             if descent_mm > usable:
                 print(f"\n  REFUSED: that would leave under {CLEARANCE_MARGIN_MM:.0f} mm "
                       f"of clearance.")
@@ -266,6 +481,31 @@ def main() -> None:
             print(f"\n  REFUSED: {e}")
             sys.exit(1)
 
+        # WAIT FOR IT TO ACTUALLY STOP. move_and_verify's read-back happens as
+        # soon as the servo is within tolerance of the goal, which under load is
+        # not the same as finished: on 2026-08-06 a J3 jog reported "settled at
+        # 2796" and the joint was at 2903 moments later -- it had delivered 102
+        # of the requested 200 ticks at the instant of the read and then crept
+        # the rest of the way. Every number downstream inherits that: the script
+        # told the operator the servo had under-travelled by half, which made a
+        # perfectly good move look like a 2.6x scale error in ticks_per_rad.
+        #
+        # Poll until two consecutive reads agree, so what gets reported is where
+        # the joint came to rest rather than where it was passing through.
+        settled_tick = actual_tick
+        deadline = time.time() + SETTLE_TIMEOUT_S
+        while time.time() < deadline:
+            time.sleep(SETTLE_POLL_S)
+            now = bus.read_position_retrying(joint)
+            if abs(now - settled_tick) <= SETTLE_TOL_TICKS:
+                settled_tick = now
+                break
+            settled_tick = now
+        if settled_tick != actual_tick:
+            print(f"  (kept moving after the verify read: {actual_tick} -> "
+                  f"{settled_tick}; using the settled value)")
+        actual_tick = settled_tick
+
         moved = actual_tick - start_tick
         print(f"\n  commanded {target_tick}, servo settled at {actual_tick} "
               f"(moved {moved:+d} ticks of {args.ticks:+d} requested)")
@@ -283,11 +523,52 @@ def main() -> None:
 
         if answer.startswith("m"):
             print(f"\n  J{joint} dir_sign {cal['dir_sign']:+d} is CORRECT. No change needed.")
+
+            # HOW FAR, not just which way. dir_sign is a direction, so a matched
+            # jog says nothing about ticks_per_rad or the link lengths -- and
+            # those are exactly what a differential measurement CAN check, which
+            # nothing else in the repo does. Scaled by the ticks the servo
+            # actually delivered, because it routinely settles short under load:
+            # comparing a full-jog prediction against a half-executed move
+            # manufactures a scale error that is not there.
+            #
+            # Prompted 2026-08-06, when a J3 jog predicted 72.3 mm for +200
+            # ticks, the servo delivered +102, and the operator measured the
+            # claw drop at ~95 mm -- roughly 2.6x the per-tick prediction. Worth
+            # catching at the moment someone has a ruler in their hand.
+            if abs(moved) > 0 and travel_mm > MIN_VISIBLE_MM:
+                expected = travel_mm * abs(moved) / max(abs(args.ticks), 1)
+                print(f"\n  Optional: how far did the claw ACTUALLY travel?")
+                print(f"  Prediction for the {moved:+d} ticks the servo delivered: "
+                      f"{expected:.1f} mm")
+                print(f"  (blank to skip — this checks ticks_per_rad, which the")
+                print(f"   direction test above cannot see)")
+                raw = input("  observed mm > ").strip()
+                if raw:
+                    try:
+                        seen = abs(float(raw))
+                    except ValueError:
+                        seen = None
+                    if seen is not None and expected > 0:
+                        ratio = seen / expected
+                        print(f"    observed {seen:.1f} mm vs predicted {expected:.1f} "
+                              f"mm  (x{ratio:.2f})")
+                        if not 0.75 <= ratio <= 1.33:
+                            print(f"    *** SCALE MISMATCH. The direction is right but the")
+                            print(f"    AMOUNT is not, so ticks_per_rad "
+                                  f"({cal['ticks_per_rad']:.1f}) or the model's link")
+                            print(f"    lengths are off for this joint. dir_sign is still")
+                            print(f"    confirmed — this is a separate fault.")
+                        else:
+                            print(f"    scale agrees; ticks_per_rad looks right for J{joint}.")
+            # Persist the verdict. This is the only evidence that ever settles a
+            # dir_sign, so leaving it in the terminal scrollback loses it.
+            confirm_sign(joint, cal["dir_sign"], moved, prediction)
         elif answer.startswith("o"):
             print(f"\n  J{joint} dir_sign {cal['dir_sign']:+d} is INVERTED — should be "
                   f"{-cal['dir_sign']:+d}.")
             if args.apply_flip:
-                apply_flip(joint)
+                apply_flip(joint, moved, prediction)
             else:
                 print(f"  Re-run with --apply-flip to write it, then jog again to confirm.")
         else:

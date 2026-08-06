@@ -268,7 +268,7 @@ def create_app(
             }), 400
 
         results = accumulator.solve_all()
-        best = select_best(results)
+        best = select_best(results, accumulator)
         agreement_mm = cross_board_agreement_mm(results)
         save_hand_eye(best.t_gripper_camera_tsai, config.HAND_EYE_PATH)
 

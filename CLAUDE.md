@@ -10,7 +10,7 @@ The full path is implemented end-to-end against a **simulated** robot: detect br
 
 See [README.md](README.md) for a quick project overview, setup, and the command list; this file goes deeper on architecture, the data flow, and the merge path onto real hardware. Session narratives live in `SESSION_LOG_2026-07-22.md` (bring-up) and `SESSION_LOG_2026-08-04.md` (hand-eye diagnosis, joint limits, the arm-drop incident).
 
-**Current state in one line:** the vision pipeline is merge-ready and fully tested; the arm's vertical kinematics are validated on hardware; **`data/hand_eye.json` is measurably wrong** (52 mm, see below) and a pick is additionally blocked by ground-derived joint limits capping forward reach at ~180 mm. Both have identified causes and neither is a code defect in the pipeline.
+**Current state in one line:** the vision pipeline is merge-ready and fully tested; the arm's model geometry is now ruler-confirmed and all five `dir_sign` values are confirmed by physical jog; **`data/hand_eye.json` is still wrong and no saved capture can fix it** — every attempt so far rotated about too few axes to observe the camera's position (see "One diagnostic" below), so the open-loop pick path stays blocked. The CLOSED-LOOP path (`scripts/visual_servo.py`) needs no hand-eye and is the way forward; a pick is additionally limited by ground-derived joint limits capping forward reach at ~180 mm.
 
 ## COORDINATE FRAMES — the imported model is upside-down (read before touching kinematics)
 
@@ -67,6 +67,128 @@ in. Both are pose-independent invariants; the absolute numbers are not (they mov
 arm does, which is what made three earlier `TABLE_Z_IN_BASE` values wrong). If the tip reads
 *above* the wrist, or the tabletop lands positive, the conversion seam has been broken.
 
+## The base yaw axis is NOT the model origin — it misses by 81 mm (2026-08-06)
+
+[`scripts/audit_model_axes.py`](scripts/audit_model_axes.py) reads the imported model's kinematics back out of its own FK: rotating joint *k* moves the wrist by `M = A·Rot(θ)·A⁻¹`, a pure rotation about that joint's axis in the base frame, so `geometry.screw_axis(M)` recovers both the axis DIRECTION and WHERE IT IS. Two FK calls per joint, no model file parsing.
+
+**The model is a structurally correct arm.** Yaw ⊥ three parallel pitches ⊥ wrist roll; J2↔J3 = 102.7 mm, J3↔J4 = 136.2 mm, J5→tip = 70.1 mm — **all three ruler-confirmed on the physical arm**, and J5 confirmed by eye as a roll (`init_arm.m` called it "wrist pitch"; that was a comment mislabel, now fixed). J2, J3 and J4 are parallel to **0.0°**, so the arm has only **two independent rotation axes**: the pitch chain and the J5 roll. That matters for hand-eye capture — "jog a different joint" means J5-vs-pitch, not J3-vs-J4.
+
+**But the CAD origin is not the base column.** J1's axis passes **81 mm** from it, while at home the claw tip sits only **25 mm** from that axis. So `tip_xy / |tip_xy|` — "radial", the direction the arm reaches — comes out up to **108° from truly outward**, and `hypot(tip_x, tip_y)` reports 70 mm of reach where there is 25 mm.
+
+That single mistake was live in three places:
+- `jog_joint.describe_motion` announced "1.9 mm left" for pure pitch joints that **cannot move sideways**, which is what the operator caught by watching a J3 jog. It now decomposes about the JOINT'S OWN axis (`screw_axis` of the two predicted poses): a pitch reports out/up with a sideways term of exactly 0.0, and only a yaw reports left/right. `describe_rotation` likewise describes a roll by spin sense about the claw's own direction — base-frame naming called the J5 roll "tilting back/up", a pitch.
+- `planning.visual_servo.radial_tangential` — inside the descent, so a reach correction pushed partly sideways and the sideways correction partly reached. **The two axes of that loop were fighting each other by construction.** `yaw_axis_xy` is now a REQUIRED argument, deliberately with no origin-defaulting overload, and `reach_from_axis` replaces every `hypot(tip)`. The "too close in for Cartesian control" guard was wrong in the dangerous direction — overstating reach, hence reporting better conditioning than the arm had.
+- `MatlabIKClient.base_yaw_axis_xy()` is the one place it is measured (jog J1 4°, read the axis back), cached per session, so it cannot go stale if the model or frame convention changes.
+
+**Also open: at all-zero joints the arm reaches along bearing −89.4°**, not +X, so every Cartesian x/y target is rotated ~90° from the arm's own forward. Stage D only ever validated the VERTICAL axis, which a rotation about Z leaves untouched — which is why nothing has caught it. **Hand-eye is immune** (`AX=XB` uses relative gripper poses, and a fixed base-frame change cancels exactly), so this is not the calibration failure. It does mean `goto_point.py --x` does not drive the direction it names. Unfixed: the visual-servo path does not use base X/Y (it works in radial/tangential, now correct), so it is not blocking a descend run.
+
+## home_tick was wrong by up to 268 ticks, and nothing could see it (2026-08-05)
+
+**`matlab/init_arm.m` defines home as all five joint angles ZERO** (`homeAngles = zeros(1,6)`, `HomePosition` reset to 0 per motor joint). FK there returns claw tip `(+70.0, −0.1, −67.7)` mm — 70 mm in front of the base, dead centre in y, hanging below the wrist. That is the arm's reference frame; `home_tick` in `data/servo_calibration.json` is the tick reading at that physical pose, and nothing else.
+
+The stored values were wrong: **J1 −28, J2 −268 (−23.6°), J3 +179, J4 −126, J5 +250 ticks.** Corrected by parking the arm at the pose and reading `hold_pose.py`.
+
+**Why no check caught it.** A `home_tick` offset cancels out of any *differential* measurement — Stage D's 45 mm lift (FK 40.7 vs ruler 39) is differential, so it validated `ticks_per_rad` and the link lengths while saying nothing about the origin. It does not affect `dir_sign` (a direction) or `ticks_per_rad` (a scale). B3's "home agreement" only compares ticks to the stored number, so a wrong stored number agrees with itself. Every automated check in the repo was blind to it.
+
+**What did catch it, and the test to reuse:** at the operator's home pose the old calibration put the claw tip at z = **−75.5 mm**, against a table plane independently measured at −74.0 mm. *The claw cannot be through the table.* Under the corrected values it sits at −67.7 mm, i.e. **+6.3 mm above the table** — and lands dead centre in y, which a home pose must.
+
+**Consequence:** every absolute Cartesian result taken before 2026-08-05 used a base frame offset by these amounts, **including the 53 hand-eye samples**. But those samples are *recoverable* — see below.
+
+### The hand-eye samples were never bad data, only mislabelled (2026-08-05)
+
+[`scripts/reinterpret_hand_eye.py`](scripts/reinterpret_hand_eye.py). Each sample is a pair, and **only one half was ever wrong**: `T_cam_board` comes from `solvePnP` on the board — camera and board only, no arm, no FK, no joint calibration. `T_base_gripper` came from FK of joint angles computed with a calibration that has since changed twice (`home_tick`, and J5's `dir_sign`). So the arm really was where it was; the code mislabelled which joint angles that pose corresponded to.
+
+**The stored matrices cannot be patched by multiplying them by anything** — a joint-angle change maps to a pose correction that depends on the pose. The angles have to come back first: `T_stored → invert FK → θ_rec → (scale, offset) → θ_true → FK → T_fixed`. The inversion is well posed here, unlike the usual warning about 5-DOF position IK, because these store the full 4×4 **wrist** pose: a 6-DOF pose on the reachable manifold pins the configuration to a discrete set. All 53 recovered, worst reproduction error **0.0008 mm**, each seeded from the previous so the branch stays continuous.
+
+**A calibration change is not always an offset.** `home_tick` *shifts* an angle; `dir_sign` *reflects* it:
+
+```
+θ_true = (d_now/d_cap)·θ_rec  +  d_now·(h_cap − h_now)/ticks_per_rad
+```
+
+Assuming the scale was always 1 made the first run of this fail (145.7 → 151.2 mm, no improvement) and briefly looked like proof the samples were junk. J5 was `dir_sign +1` when the samples were recorded and `−1` eighty minutes later, so its term is a reflection.
+
+**Result — the referee is board spread**, which needs no arm and no ruler: the board never moved, so `T_base_gripper @ T_gripper_camera @ T_cam_board` must land on one base-frame point for every sample.
+
+| | board spread | TSAI vs PARK |
+|---|---|---|
+| as recorded | 145.7 mm | 150 mm / 98° |
+| corrected, stored signs | **15.0 mm** | 2.5 mm / 5.8° |
+| corrected, J3+J4 also flipped | **10.0 mm** | 1.2 mm / 0.2° |
+
+A tenfold collapse, and two independent solvers going from 98° apart to sub-degree. **This is what makes `hand_eye.json` recoverable without a recapture.**
+
+**Do not use this to settle a `dir_sign`.** The rule stands: only a physical jog or a ruler can. `--search` ranking J3/J4-flipped best is a *hypothesis*, not a finding.
+
+#### Solvers agreeing with each other is not evidence (2026-08-05)
+
+The camera offset was measured with a ruler: **24 mm** from the wrist. Every solver OpenCV offers was then run on the corrected samples:
+
+| | stored signs | J3/J4 flipped |
+|---|---|---|
+| TSAI / PARK / HORAUD (separable) | 136–138 mm | 80 mm |
+| DANIILIDIS (dual quaternion, simultaneous) | 138 mm | 83 mm |
+| ANDREFF (simultaneous) | **did not converge** | 72 mm |
+| robot-world `AX=ZB` (different formulation) | 257 mm | 81 mm |
+
+Under the flipped hypothesis five independent methods — including a *different problem formulation* — agree to within 11 mm. **And they are all wrong**: the ruler says 24 mm. Mutual agreement between solvers fed the same badly-conditioned data proves only that they share the same weakness. (The stored-signs column is separately damning: ANDREFF refusing to converge and `AX=ZB` landing 120 mm away means that hypothesis does not describe a rigid transform at all.)
+
+**The root cause is the capture, not the solve.** Median rotation between poses was **15.5°**, with 2–7 mm of gripper translation. The hand-eye literature and [MVTec's HALCON docs](https://www.mvtec.com/doc/halcon/12/en/hand_eye_calibration.html) call for **≥30°, ideally 60°**, over ≥8 poses with ≥2 non-parallel rotation axes. Our axis spread was fine (90°); the rotation *magnitude* was half the minimum. Camera translation is recovered from how far the camera **swings** about the unknown offset, so small rotations leave it barely determined while every residual still looks healthy. Note also that TSAI/PARK/HORAUD are all *separable* (rotation first, then translation), so rotation error propagates straight into translation — `DANIILIDIS` and `ANDREFF` solve both at once and are reported as more noise-robust.
+
+What is now in the code:
+- `hand_eye.BoardResult.solutions` runs all five methods; `method_spread_mm` is their widest disagreement.
+- `hand_eye.capture_health()` judges the **capture** — pose count, rotation magnitude against `config.CALIB_HAND_EYE_MIN_ROTATION_DEG`, axis spread — and is the check that would have caught this on the day.
+- `hand_eye.offset_disagrees_with_ruler()` gates a solve against `config.HAND_EYE_EXPECTED_OFFSET_MM` (24 mm). **This is the only check in the whole pipeline that is independent of the data being solved.**
+
+#### One diagnostic, and the two invariants no solver can flatter (2026-08-06)
+
+[`scripts/hand_eye_report.py`](scripts/hand_eye_report.py) replaces `check_hand_eye.py` and a throwaway pair-residual script. Read-only unless `--fix`, so it is safe to run mid-capture. **Its six sections are in the order to trust them in**, and the ordering is the point: sections 2–4 need no solve at all, and a solver fed inconsistent data returns a confident wrong answer rather than an error.
+
+**Screw congruence (Chen 1991) is the check the repo was missing.** `AX = XB` makes A and B conjugate, and conjugation preserves *both* screw invariants, so for every pose pair — whatever X is:
+
+```
+angle(A) == angle(B)      how far it turned
+pitch(A) == pitch(B)      how far it slid ALONG that same axis
+```
+
+Only the angle half was ever tested. Adding pitch (`geometry.screw_pitch`) immediately caught four pairs the angle check passed cleanly, one of them at **0.06° angle error with 115 mm of pitch error**. Angle is blind to any fault that turns the right amount about the right axis and slides the wrong way — a misdetected board, a stale frame.
+
+**The two halves indict different subsystems, and that is what localises a fault.** Angle depends only on rotations, so every board in one capture must agree on it. Pitch also depends on translations, which are measured per board. Within one 2026-08-06 capture:
+
+| board | n | angle median | pitch rms | pitch correlation | |
+|---|---|---|---|---|---|
+| 1 | 9 | 1.12° | **6.1 mm** | **+0.995** | clean |
+| 2 | 22 | 1.08° | 63.8 mm | +0.631 | inconsistent |
+| 3 | 7 | 0.97° | 147.3 mm | **−0.663** | **mirrored** |
+
+Same arm, same FK, angles agreeing to ~1° as they must — while pitch varies 24× across boards. **A fault that varies board to board while the arm is held constant cannot be in the arm.** A *negative* correlation means the camera's translations run opposite to the arm's, which no rigid transform can do but `solvePnP`'s two-fold planar ambiguity can: it reflects a flat board's normal, preserving rotation magnitude and mirroring translation. `CongruenceQuality.mirrored` reports it.
+
+**`select_best` ranked boards by SAMPLE COUNT, so every tool had been solving the worst board available.** It now takes the accumulator and ranks by consistency first, count second — 22 mutually contradictory samples are worth less than 9 consistent ones, and no solver will tell you which you have. Callers must pass the accumulator or it silently falls back to counting.
+
+**Outliers are named by consensus over ALL pairs, not neighbours** (`congruence_disagreement` / `congruence_outliers`). Congruence holds between *any* two poses, so capture order carries no meaning; worse, an isolated bad consecutive pair implicates both endpoints equally. Scored against every other sample a real culprit disagrees with nearly all of them (`> config.CALIB_HAND_EYE_MAX_DISAGREEMENT`, 0.5) while its innocent neighbour disagrees only with it. This is the model-free reduction of what [ethz-asl/hand_eye_calibration](https://deepwiki.com/ethz-asl/hand_eye_calibration/4.2-ransac-methods) does with RANSAC.
+
+**Observability, from the robot-calibration literature.** `hand_eye.observability()` returns O1–O4 from the singular values of the stacked `(R_a − I)`, the matrix whose conditioning governs translation. Read **O3** (smallest singular value, E-optimality — [Sun & Hollerbach, ICRA 2008](https://cse.usf.edu/~yusun/lab_pub/icra0801.pdf)) rather than the condition number: `‖(R−I)v‖ = 2 sin(θ/2)·|v⊥|` is small when rotations are **small** *or* when they **share an axis**, so O3 catches both failures in one number, while a condition number is scale-invariant and rates a capture of uniformly tiny rotations a perfect 1.0. `CALIB_HAND_EYE_MIN_O3 = 1.5` is what `CALIB_HAND_EYE_MIN_SAMPLES` worth of good poses produces, so the two gates agree rather than contradict.
+
+**The archives hold nothing recoverable.** `preDropSample11` is fully contained in the current file. The 72-sample `112750` archive shares no sample with it and carries 8–18° angle medians on four of six boards — the superseded-calibration signature, exactly what `reinterpret_hand_eye.py` exists for; its two clean boards have 6–7 samples each.
+
+##### Sources
+
+The checks above are not invented here; each implements something standard that this repo had been missing.
+
+- **Screw congruence** — H. Chen, *A screw motion approach to uniqueness analysis of head-eye geometry*, CVPR 1991. A and B are conjugate, hence equal rotation angle and equal pitch. Restated with the dual-quaternion reading (the two invariants are the scalar parts) in K. Daniilidis, [*Hand-Eye Calibration Using Dual Quaternions*, IJRR 18(3), 1999](https://www.cis.upenn.edu/~kostas/mypub.dir/ijrr99.pdf), and in M. Ulrich & C. Steger, [*Hand-Eye Calibration of SCARA Robots Using Dual Quaternions*, OGRW 2014](https://mv.in.tum.de/_media/members/steger/publications/2014/ogrw-2014-ulrich-et-al.pdf) — the latter is also where the degenerate-motion analysis comes from.
+- **Observability indices O1–O4** — Y. Sun & J. Hollerbach, [*Observability Index Selection for Robot Calibration*, ICRA 2008](https://cse.usf.edu/~yusun/lab_pub/icra0801.pdf); compared further in A. Joubair et al., *Comparison of the efficiency of five observability indices for robot calibration*, Mechanism and Machine Theory 70, 2013. O3 (minimum singular value, E-optimality) is their pick as the best single predictor of pose uncertainty, which is why it is the gate here rather than the condition number.
+- **Consensus outlier rejection** — [ethz-asl/hand_eye_calibration](https://deepwiki.com/ethz-asl/hand_eye_calibration/4.2-ransac-methods), whose RANSAC variants classify inliers either by an RMSE threshold after a minimal-sample solve or by *dual-quaternion scalar-part equality* with no model fitted at all. `congruence_disagreement` is the second of those, generalised from a threshold to a vote over every pair.
+- **Capture geometry minima** — [MVTec HALCON hand-eye calibration docs](https://www.mvtec.com/doc/halcon/12/en/hand_eye_calibration.html): ≥8 poses, ≥30° rotation between them (60° better), ≥2 non-parallel rotation axes. These set `CALIB_HAND_EYE_MIN_SAMPLES` and `CALIB_HAND_EYE_MIN_ROTATION_DEG`.
+- **Active pose selection**, not implemented but the obvious next step if capture keeps being the bottleneck — [*Next-Best-View Selection for Robot Eye-in-Hand Calibration*, arXiv:2303.06766](https://arxiv.org/pdf/2303.06766) picks the next pose by predicted information gain, which is the same Fisher-information argument the observability indices approximate offline.
+
+### Named poses, and starting every run from one
+
+`config.SERVO_HOME_TICKS` / `SERVO_HOVER_TICKS` + [`robot_interface/poses.py`](src/vision_pipeline/robot_interface/poses.py) (`goto`, `at_pose`, `describe_move`), driven by [`scripts/goto_pose.py`](scripts/goto_pose.py). Raw ticks, never IK — a recovery pose has to work when the clever paths do not, and IK depends on a hand-eye transform that is known wrong.
+
+**HOVER is where a run should start.** The camera is eye-in-hand, so a brick that is not in view cannot be detected, probed, or servoed to; beginning from an arbitrary pose means hand-positioning the arm until the brick appears, and the probe then measures its gains against whatever geometry that happened to be. `visual_servo.py` drives there automatically (`--no-hover` opts out). Tip lands ~168 mm above the table at ~78 mm reach.
+
+`tests/test_poses.py` pins `SERVO_HOME_TICKS` against each joint's `home_tick` and asserts the home pose converts to exactly 0.0 rad — the two are copies of one measurement, and drift between them silently offsets every angle the arm reports.
+
 ## Commands
 
 ```powershell
@@ -103,6 +225,11 @@ python scripts/run_arm_ui.py --no-camera --overlay   # flags compose freely
 python scripts/check_servo_health.py          # bus, reads, home agreement, FK cross-check
 python scripts/servo_torque.py                # which joints are actually HOLDING
 python scripts/test_pick_dry_run.py --save data/dryrun.png   # whole pick path, commands nothing
+python scripts/audit_model_axes.py            # the model's own joint axes + a ruler sheet
+
+# CALIBRATION ANALYSIS — no arm, no camera, safe to run DURING a capture
+python scripts/hand_eye_report.py             # inventory, per-board quality, outliers, solve, verdict
+python scripts/hand_eye_report.py --fix       # drop the congruence outliers it names
 
 # HARDWARE — these MOVE the arm. Ctrl-C freezes it; power cut is the last resort.
 python scripts/goto_point.py --x 145 --y 35 --z -64 --hover-only   # ruler-driven, no vision
@@ -261,13 +388,59 @@ Measured against the board, which lies flat on the table and so gives an absolut
 
 `ServoBus` capped how FAR one command travelled but had no idea WHERE a joint could go, so small legal steps walked J3 and then J4 into hard stops. `_check_travel_limits` now enforces absolute `min_tick`/`max_tick`; a joint already out of range is not trapped, since moves that *reduce* the violation are allowed. Measure with [`scripts/find_joint_limits.py`](scripts/find_joint_limits.py) (operator-confirmed steps, watches for the 4095→0 wrap); `matlab/init_arm.m` reads the resulting `data/joint_limits_rad.json` so IK stops proposing unreachable solutions. [`scripts/goto_tick.py`](scripts/goto_tick.py) walks one joint to a target in sub-cap increments.
 
-**Recorded: J2 `[2883, 3468]` (51°), J3 `[200, 1096]` (79°). J1/J4/J5/J6 unmeasured.**
+**Recorded: J1 `[1670, 2370]`, J2 `[2600, 3750]`, J3 `[500, 3350]`. J4/J5/J6 unmeasured.** Read `limit_basis` before trusting any of them — **not one of these six numbers is a mechanical stop.** J2's and J3's `max` are ground-collision stops measured at one elbow angle; J3's `min` is pure encoder-seam protection; J1's pair is a deliberate **working envelope** added after two runaways, not a measurement. J3's `max` was raised from 3161 to 3350 because 3161 **excluded the home pose itself** (3298) — the arm was not legally allowed to return to where it starts.
+
+J3's numbers moved twice on 2026-08-05 and neither end means what the field name suggests — read `limit_basis` in the JSON before trusting either. Its encoder was re-centred (every stored tick shifted **+2065**; any J3 tick quoted in an older note or log is in the pre-re-centre numbering and must have +2065 applied to compare). `max_tick` 3161 is still the ground-collision stop. **`min_tick` 500 is not a measurement at all** — it is pure seam protection, deliberately widened from 2128 at operator request once the re-centre left the old value guarding nothing. It permits J3 out to **+230°, some 138° past anything ever measured**; the joint's mechanical stop in that direction has never been found, and the max-delta cap plus the operator watching are the only guards there. `find_joint_limits.py --joint 3` is safe to run for the first time now that the seam is far away, and closing that gap is the outstanding item.
 
 **Both recorded limits are ground-derived, not mechanical** — the joint stopped because the *claw* reached the table at the elbow angle used when measuring. Fold the elbow differently and the same joint angle is safe. They carry a `limit_basis` field saying so. The honest form of that constraint is Cartesian: `config.MIN_CLAW_HEIGHT_M` (5 mm), enforced in `HardwareRobot.send_target_pose`, deliberately below `PICK_Z_OFFSET` (10 mm) so it cannot refuse the pick it exists to protect.
 
 **Consequence, and it bites:** at table height the arm reaches only **~180 mm forward** (220 mm at z = +80), with J2 and J3 both pinned at their minimums. That is the joint limits, not the arm's geometry. Re-measuring the *mechanical* stops with the elbow folded so the claw cannot ground out would give back workspace to ~280 mm.
 
-A limit that lands on the 0/4095 encoder seam is unusable — J3's was first measured at tick 6, the same geometry as the July J1 runaway — so it was pulled in to 200 (~18° of margin). `find_joint_limits.py` now warns when a *measured* limit lands near the seam, not just the starting position.
+##### The 0/4095 encoder seam, and how J3 fell through it (2026-08-05)
+
+A limit that lands on the seam is unusable — J3's travel was first measured to tick 6, the same geometry as the July J1 runaway — so `min_tick` was pulled in to 200 (~18° of margin). On 2026-08-05 that margin was cut to 63 (5°) at operator request, because J3 kept sagging below 200 and the limit was refusing poses the arm genuinely works in. **That was half a fix.** Shrinking the margin is only safe once the seam has been moved; it had not been. J3 subsequently crossed the seam during a visual-servo run and came back reading **4079**.
+
+**A wrapped joint is not "out of range", and the two need opposite responses.** In raw ticks 4079 looks like ~3000 past a maximum of 1096; physically it is 80 ticks *below* a minimum of 63. Everything downstream misread it: `_check_travel_limits`'s "moves back toward range" allowance ran backwards, so the one direction that recovers the joint was the one refused, under a message telling the operator to re-measure a range that was entirely correct. And no goal position fixes it — the servo drives goals linearly and would take the long way round the circle, through every hard stop in between.
+
+- `servo_calibration.unwrap_tick(tick, reference)` / `wrapped_past_seam(tick, lo, hi)` are the shared primitives. Unwrapping produces a *continuous* joint coordinate that may fall outside 0..4095; anything written to a register must come back with `% TICK_SPAN`.
+- `ServoBus._check_travel_limits` now names the wrap and points at the fix. It refuses motion in **both** tick directions (neither is "toward range" across a seam) but still allows **zero-motion holds**, because that is what `freeze`/`hold_pose` write when someone is catching a falling arm — refusing it would rebuild the trap documented one line above it in that function.
+- `scripts/recentre_joint.py --here` is the way out, and it needs **no motion**: the Feetech one-key midpoint redefines the joint's present pose as tick 2048, so the seam moves instead of the arm. It applies `--here` automatically on detecting a wrap, since such a joint cannot be driven to the middle of its travel first. The offset must be measured against the *unwrapped* present position — using the raw reading shifts every stored limit by a whole encoder turn, silently.
+- Re-centring moves the seam, **not the joint**: J3 is 80 ticks under its minimum before and after. What changes is that an ordinary `goto_tick` can then walk it back.
+
+`find_joint_limits.py` warns when a *measured* limit lands near the seam, not just the starting position. The durable lesson: **re-centre first, then measure, then set margins.** A thin margin next to a seam is a countdown, not a setting.
+
+#### The IK solver is redundant for this task, and that redundancy leaks (2026-08-05)
+
+Five actuated joints against a **3-DOF position target** (`weights = [0 0 0 1 1 1]`) leaves a **2-dimensional null space**. A position-only solve has no preference within it: every point is an equally correct answer, so the solver returns whichever its iteration lands on. Seeding from the current angles biases that; it does not constrain it. Since the camera rides on the wrist, redundancy spent on base yaw pans the whole image — feeding straight back into the visual loop trying to correct it.
+
+Two defects found by reading `matlab/ik_fk_server.m`, both fixed:
+
+1. **The random-restart discarded the seeded posture.** When the seeded attempt missed by >2 mm it reseeded with `randomConfiguration` and then accepted whichever candidate had the *lowest position error*, regardless of posture — so a 0.1 mm solution half a workspace away beat a 3 mm one right where the arm stood, well inside the 10 mm `IK_TOL` governing acceptance anyway. Now: among candidates meeting tolerance, take the one **closest in joint space** to the seed. Accuracy beyond `IK_TOL` buys nothing this arm can execute (open-loop error is several mm); posture change is paid for in real motion and a swung camera. The response gained `move_rad` so callers can see posture cost, which a position residual cannot show — the runaway solve reported **0.0 mm**.
+2. **No way to hold a joint.** The `ik` request now takes an optional `lock` list of joint numbers, pinned at their seed angle via `PositionLimits` (the only mechanism `rigidBodyTree` offers), restored on every exit path by `onCleanup` — `robot` is a global handle object, so a leaked pin would silently freeze that joint for the rest of the server's life.
+
+**Measured, live, from one pose:** descents of 5/10/20 mm each needed **1.2 ticks of J1**; a 40 mm descent came back wanting **213 ticks of J1 and 1275 of J5**. So base yaw is *not* geometrically required by a descent — that was redundancy being spent uninstructed. `visual_servo.py` now passes `lock=[1]` on every descent solve (`--no-lock-base` to disable).
+
+**Any change to `matlab/` requires restarting the server (`>> ik_fk_server`) to take effect.**
+
+#### Descending and re-aiming are ONE degree of freedom (2026-08-05)
+
+Lowering the claw and correcting the brick's **vertical** position in the image are not independent. Both ride the shoulder/elbow chain, and the camera is on the wrist, so descending swings the view — **~7 px per mm**, measured. A 20 mm step throws the brick ~140 px up the frame, against a 55 px acceptance box.
+
+Running them as two loops (IK for the descent, a joint jog to re-centre) makes the arm fight itself: the descent throws the brick up, the re-centring jog drags it back *and raises the tip by more than the step gained*, and the next step spends itself undoing that. Observed: four steps, **4 mm of net descent**, then the brick left the frame.
+
+[`DescentModel`](src/vision_pipeline/planning/visual_servo.py) fixes it by modelling both terms — `dpx = a·dz + b·dr` — and issuing **one IK solve per step** whose target descends *and* reaches out by the amount that cancels the swing the descent is about to cause. IK spreads that across J2/J3/J4, which is the whole reason an IK solver is in this loop. Both coefficients are fitted from the descent's own motion (step 1 straight down, step 2 with a radial offset; both descend in full, so neither is a wasted probe), refitted every step because the coupling weakens as the arm unfolds, and rank-checked so two pure descents can't fabricate a `b`.
+
+**The step size is derived, not fixed.** Reach is capped per step (`SERVO_VISUAL_DESCEND_MAX_REACH_MM`), so when a descent would inject more error than the reach can absorb — 20 mm needs 56 mm of reach at the measured coefficients, more than double the cap — `plan_step` shrinks it, to zero if necessary. `dz = 0` is a legitimate outcome: a re-aim at constant height, the one correction that cannot undo a descent. Progress resumes by itself. It never climbs to improve the aim and never descends further than asked.
+
+Sideways error still goes through a J1 jog on purpose: J1 is base yaw, it cannot change tip height, so it cannot undo a descent step and has no business in the combined solve.
+
+**That jog ran J1 away on 2026-08-05 and the operator cut power.** Its gain came from a probe taken *before* the descent, at a different posture; once wrong-signed, each correction enlarged the error and the next was bigger. `centre()` has carried a `ProgressMonitor` against exactly this since it was written — the descent branch was added without one, and J1 has **no measured travel limits**, so `ServoBus` could not refuse it either. Nothing in the system was watching. Three independent bounds now, each separately tested by turning the runaway on and removing the others:
+
+1. the first correction that makes the error worse stops the descent (fires after ~2 moves);
+2. a `ProgressMonitor` across the whole descent;
+3. `SERVO_VISUAL_SIDEWAYS_BUDGET_TICKS` — a hard cumulative ceiling that holds even when the pixel readings themselves are wrong, which is the case where (1) and (2) are blind. `--no-sideways` disables the jog entirely.
+
+**The general lesson: any autonomous correction loop needs a progress check, and a joint with no measured travel limits has no backstop below it.** J1's limits are still unmeasured — the July runaway and this one are the same gap.
 
 **Operator safety convention:** stand by the power cut whenever a commanded move turns any joint more than `config.SERVO_WATCH_POWER_MOVE_DEG` (45°). Both `jog_joint.py` and `validate_ik_roundtrip.py` preview per-joint degree deltas and print a banner when a move crosses it.
 

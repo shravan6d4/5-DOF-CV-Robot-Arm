@@ -70,11 +70,16 @@ while true
                     % Optional seed_rad = the arm's CURRENT joint angles, so the
                     % solver returns the nearest solution rather than any legal
                     % one. Absent -> fall back to homeConfiguration.
-                    if isfield(req, 'seed_rad')
-                        resp = handle_ik_request(req.x, req.y, req.z, req.seed_rad);
-                    else
-                        resp = handle_ik_request(req.x, req.y, req.z, []);
-                    end
+                    %
+                    % Optional lock = joint numbers (1..5) to HOLD at their seed
+                    % angle. A 5-DOF arm solving a 3-DOF position target has a
+                    % 2-dimensional null space, and nothing in a position-only
+                    % solve prefers one point in it over another. Locking spends
+                    % that redundancy deliberately instead of leaving it to the
+                    % solver -- see handle_ik_request.
+                    if isfield(req, 'seed_rad'), sd = req.seed_rad; else, sd = []; end
+                    if isfield(req, 'lock'), lk = req.lock; else, lk = []; end
+                    resp = handle_ik_request(req.x, req.y, req.z, sd, lk);
                 elseif strcmp(req.cmd, 'fk')
                     resp = handle_fk_request(req.angles_rad);
                 else
@@ -102,7 +107,7 @@ while true
     end
 end
 
-function resp = handle_ik_request(x, y, z, seed_rad)
+function resp = handle_ik_request(x, y, z, seed_rad, lockJoints)
     global robot ik motorIdx homeAngles endEffector maxReach IK_TOL
 
     p_robot = [x; y; z];
@@ -115,12 +120,6 @@ function resp = handle_ik_request(x, y, z, seed_rad)
         return;
     end
 
-    % Multi-restart IK (same as IKtrials_v2 Part 3/4), but seeded from the
-    % arm's CURRENT joint angles when the caller supplies them. A solver
-    % seeded elsewhere can return a perfectly valid solution in a completely
-    % different posture — for a 45mm move that showed up as ~2600 ticks
-    % (~227deg) of commanded base rotation. Seeding from where the arm
-    % actually is makes the nearest solution the one it converges on.
     targetPose = trvec2tform(p_robot');
     seed = homeConfiguration(robot);
     if ~isempty(seed_rad)
@@ -128,24 +127,101 @@ function resp = handle_ik_request(x, y, z, seed_rad)
             seed(motorIdx(k)) = seed_rad(k);
         end
     end
+    seed0 = seed;
+
+    %% ---- optional joint locking -----------------------------------------
+    % THIS ARM IS REDUNDANT FOR THE TASK IT IS ASKED TO DO. Five actuated
+    % joints against a 3-DOF position target leaves a 2-dimensional null
+    % space, and a position-only solve has no preference within it: every
+    % point in that space is an equally correct answer, so the solver returns
+    % whichever one its iteration happens to land on. Seeding biases that but
+    % does not constrain it.
+    %
+    % That redundancy is not free, because the camera rides on the wrist.
+    % Base yaw in particular pans the entire image, so a solve that quietly
+    % spends a couple of degrees of J1 to reach the same point disturbs the
+    % visual loop more than the move it was asked for. Locking lets the
+    % CALLER spend the redundancy deliberately: a pure descent can say "hold
+    % J1" and get an answer in the plane the arm is already in.
+    %
+    % Implemented by pinning the joint's PositionLimits around its seed
+    % value, which is the only mechanism rigidBodyTree offers. Restored on
+    % every exit path via onCleanup -- `robot` is a handle object and a
+    % leaked pin would silently narrow the workspace for every later request.
+    restore = {};
+    if ~isempty(lockJoints)
+        if isempty(seed_rad)
+            resp = struct('ok', false, 'error', ...
+                'lock requires seed_rad: a joint can only be held at a known angle');
+            return;
+        end
+        for k = reshape(double(lockJoints), 1, [])
+            if k < 1 || k > 5, continue; end
+            i = motorIdx(k);
+            jnt = robot.Bodies{i}.Joint;
+            restore{end+1} = {i, jnt.PositionLimits}; %#ok<AGROW>
+            v = seed(i);
+            % Clamp the pin INTO the joint's real limits. A seed outside them
+            % (a joint that has sagged past its stop, which happens on this
+            % arm) would otherwise produce an empty interval and an
+            % unsolvable problem reported as "outside workspace".
+            v = min(max(v, jnt.PositionLimits(1)), jnt.PositionLimits(2));
+            jnt.PositionLimits = [v, v];
+        end
+    end
+    cleanupObj = onCleanup(@() restore_joint_limits(restore)); %#ok<NASGU>
+
+    %% ---- multi-restart, preferring the NEAREST posture -------------------
+    % Seeded from the arm's current joint angles: a solver seeded elsewhere
+    % returns a valid solution in a completely different posture -- for a
+    % 45mm move that once showed up as ~2600 ticks (~227deg) of commanded
+    % base rotation.
+    %
+    % The restart fallback used to throw that away. When the seeded attempt
+    % missed by >2mm it reseeded with randomConfiguration and then accepted
+    % whichever candidate had the LOWEST POSITION ERROR, regardless of
+    % posture -- so a 0.1mm solution half a workspace away beat a 3mm one
+    % right where the arm stood, well inside the 10mm tolerance that governs
+    % acceptance anyway. Measured 2026-08-05: a 40mm descent came back
+    % wanting 213 ticks of J1 and 1275 ticks of J5, while 5/10/20mm descents
+    % from the same pose needed 1.2 ticks of J1.
+    %
+    % So: among candidates that MEET the tolerance, take the one closest in
+    % joint space to where the arm actually is. Accuracy beyond IK_TOL buys
+    % nothing this arm can execute -- its open-loop positioning error is
+    % several millimetres -- whereas posture change is paid for in real
+    % motion, real time, and a swung camera.
     weights = [0 0 0 1 1 1];  % position only
-    bestSol = []; bestErr = inf;
+    sols = {}; errs = []; moves = [];
     for attempt = 1:10
         [sol, ~] = ik(endEffector, targetPose, weights, seed);
         T = getTransform(robot, sol, endEffector);
         err = norm(T(1:3,4) - p_robot);
-        if err < bestErr, bestErr = err; bestSol = sol; end
-        if bestErr < 0.002, break; end
+        move = max(abs(sol(motorIdx(1:5)) - seed0(motorIdx(1:5))));
+
+        sols{end+1} = sol; errs(end+1) = err; moves(end+1) = move; %#ok<AGROW>
+
+        % The seeded attempt landing inside tolerance is the answer we want:
+        % it is both accurate enough and, by construction, the nearest
+        % posture. Restarting from there could only find something further
+        % away that scores no better.
+        if attempt == 1 && err <= IK_TOL
+            break;
+        end
         seed = randomConfiguration(robot);
     end
 
-    % Tolerance check
-    if bestErr > IK_TOL
+    good = find(errs <= IK_TOL);
+    if isempty(good)
+        [bestErr, j] = min(errs);
         resp = struct('ok', false, 'error', sprintf(...
             'IK missed by %.1f mm (> %.0f mm tol). Target outside workspace.', ...
             1000*bestErr, 1000*IK_TOL));
         return;
     end
+    [~, jj] = min(moves(good));
+    j = good(jj);
+    bestSol = sols{j}; bestErr = errs(j); bestMove = moves(j);
 
     % Extract J1..J5 angles (J6 always home, manually commanded)
     ik_angles = homeAngles;
@@ -153,7 +229,22 @@ function resp = handle_ik_request(x, y, z, seed_rad)
         ik_angles(k) = bestSol(motorIdx(k));
     end
 
-    resp = struct('ok', true, 'angles_rad', ik_angles(1:5), 'err_mm', 1000*bestErr);
+    % move_rad lets the caller see how much posture this solve costs, which
+    % a position residual cannot show: the 213-tick J1 solve reported 0.0 mm.
+    resp = struct('ok', true, 'angles_rad', ik_angles(1:5), ...
+                  'err_mm', 1000*bestErr, 'move_rad', bestMove);
+end
+
+function restore_joint_limits(restore)
+    % Put back every PositionLimits that locking narrowed. Runs on normal
+    % return AND on error, because `robot` is a global handle object: a
+    % leaked pin would silently freeze that joint for every later request in
+    % this server's lifetime, which would look like an arm that had lost a
+    % degree of freedom for no reason.
+    global robot
+    for n = 1:numel(restore)
+        robot.Bodies{restore{n}{1}}.Joint.PositionLimits = restore{n}{2};
+    end
 end
 
 function resp = handle_fk_request(angles_rad)

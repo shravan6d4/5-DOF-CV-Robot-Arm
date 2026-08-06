@@ -9,8 +9,12 @@ depends on:
   B2  Are the position reads STABLE at rest? (the J1 encoder wrap-seam that
       caused the bring-up runaway shows up here as a reading that jumps
       between ~0 and ~4095 while the arm is physically still)
+  B3a Is every joint inside its measured travel, and on the near side of the
+      0/4095 seam? (a joint that has settled cleanly past the seam reads
+      perfectly stably, so B2 does not see it — J3 did this on 2026-08-05)
   B3  Is the arm actually at the home pose the calibration file describes?
   B4  Does MATLAB FK agree with where the arm physically is?
+  B5  Which joints' dir_sign has a physical jog actually confirmed?
 
 B4 is the real payoff: it is the first physical proof that the MATLAB-absolute
 vs servo-relative zero reconciliation (config.MATLAB_HOME_DEG / home_angle_rad)
@@ -39,6 +43,11 @@ import numpy as np
 
 from vision_pipeline import config
 from vision_pipeline.robot_interface.matlab_client import MatlabIKClient
+from vision_pipeline.robot_interface.servo_calibration import (
+    dir_sign_report,
+    unwrap_tick,
+    wrapped_past_seam,
+)
 from vision_pipeline.robot_interface.servo_driver import ServoBus
 
 JOINTS = range(1, 7)
@@ -109,6 +118,51 @@ def check_stability(bus, present, samples) -> dict:
         print("      seam must be re-centred (Feetech one-key midpoint: write 128")
         print("      to Torque Enable, addr 40, with the joint at home) before use.")
     return medians
+
+
+def check_ranges(bus, medians) -> bool:
+    """B3a: is every joint inside its measured travel, and on the right side of
+    the seam?
+
+    A wrapped reading is the one fault here that invalidates everything printed
+    after it -- FK is computed from these ticks, so B4 would compare MATLAB
+    against an arm pose that is off by a whole encoder turn on that joint and
+    report a large, mysterious disagreement. B2 only catches a wrap that is
+    still FLICKERING across the seam; a joint that has settled cleanly on the
+    far side reads perfectly stably and looks fine. J3 did exactly that on
+    2026-08-05, reading 4079 against a range of [63, 1096].
+    """
+    print("\nB3a travel range")
+    clean = True
+    for j in sorted(medians):
+        limits = bus.travel_limits(j)
+        if limits is None:
+            print(f"      J{j}: read {medians[j]:4d}  range unmeasured")
+            continue
+        lo, hi = limits
+        tick = medians[j]
+        if wrapped_past_seam(tick, lo, hi):
+            clean = False
+            real = unwrap_tick(tick, (lo + hi) // 2)
+            print(f"      J{j}: read {tick:4d}  range [{lo}, {hi}]  *** WRAPPED ***")
+            print(f"           past the 0/4095 seam — really at {real}, "
+                  f"{lo - real} ticks below min.")
+            print(f"           Nothing below this line is trustworthy for J{j}, and")
+            print(f"           no goal position walks it back. Move the seam instead")
+            print(f"           (no motion needed):")
+            print(f"             python scripts/recentre_joint.py --joint {j} --here")
+        elif lo <= tick <= hi:
+            margin = min(tick - lo, hi - tick)
+            print(f"      J{j}: read {tick:4d}  range [{lo}, {hi}]  "
+                  f"ok ({margin} ticks from the nearer end)")
+        else:
+            clean = False
+            print(f"      J{j}: read {tick:4d}  range [{lo}, {hi}]  OUT OF RANGE")
+            print(f"           walk it back with: python scripts/goto_tick.py "
+                  f"--joint {j} --ticks {min(max(tick, lo), hi)}")
+    if clean:
+        print("    PASS: every measured joint is inside its range.")
+    return clean
 
 
 def check_home(bus, medians) -> bool:
@@ -187,6 +241,21 @@ def check_fk(bus, medians) -> None:
     print(f"      (config currently says {1000*config.TABLE_Z_IN_BASE:+.1f} mm)")
 
 
+def check_dir_signs(bus) -> None:
+    """B5: report each joint's dir_sign and whether a physical jog ever confirmed it.
+
+    Read-only and purely informational — there is no measurement to make here.
+    That is precisely the point: a wrong dir_sign is invisible to B2, B3 and B4
+    alike (B4 compares FK against the arm by eye, which only catches a sign
+    error if the arm happens to be far from home on that joint's axis), so the
+    only honest thing to print is what the calibration file claims and how it
+    came to claim it.
+    """
+    print("\nB5  dir_sign provenance")
+    for line in dir_sign_report(bus.calibration, IK_JOINTS):
+        print(f"  {line}")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -215,8 +284,10 @@ def main() -> None:
         medians = check_stability(bus, present, args.samples)
         if not medians:
             sys.exit(1)
+        check_ranges(bus, medians)
         check_home(bus, medians)
         check_fk(bus, medians)
+        check_dir_signs(bus)
 
     print("\nRead-only checks complete. Nothing was commanded to move.")
 
