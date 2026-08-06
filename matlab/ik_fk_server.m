@@ -189,6 +189,20 @@ function resp = handle_ik_request(x, y, z, seed_rad, lockJoints)
             % pattern already proven on this model.
             jnt.PositionLimits = [v - LOCK_EPS, v + LOCK_EPS];
         end
+
+        % RELEASE THE SOLVER, or none of the above has any effect.
+        %
+        % inverseKinematics is a System object: it LOCKS on its first call and
+        % caches its setup, RigidBodyTree included. Every PositionLimits change
+        % made after that first solve is simply not seen. That is why the limits
+        % from data/joint_limits_rad.json work -- init_arm.m applies them before
+        % building the solver -- while the lock, applied per request, never did.
+        %
+        % Measured 2026-08-06 with lock = [1 5]: J1 moved 64.5 ticks and J5 moved
+        % 33.7. Both pins were in place and both were ignored. The earlier
+        % suspicion that a degenerate [v, v] interval was to blame was wrong; a
+        % narrow band behaved identically, because neither was ever consulted.
+        release(ik);
     end
     cleanupObj = onCleanup(@() restore_joint_limits(restore)); %#ok<NASGU>
 
@@ -282,12 +296,18 @@ function restore_joint_limits(restore)
     % PositionLimits first means the home value is legal by the time it is
     % written, so putting it back cannot itself trip the reset-and-warn path
     % that made it necessary.
-    global robot
+    global robot ik
+    if isempty(restore), return; end
     for n = 1:numel(restore)
         jnt = robot.Bodies{restore{n}{1}}.Joint;
         jnt.PositionLimits = restore{n}{2};
         jnt.HomePosition = restore{n}{3};
     end
+    % Release again so the RESTORED limits are the ones the next request sees.
+    % Without this the solver would stay locked around the pinned tree and every
+    % later solve would silently keep the joint frozen -- the leaked-pin failure
+    % this cleanup exists to prevent, just one level further down.
+    release(ik);
 end
 
 function resp = handle_fk_request(angles_rad)
