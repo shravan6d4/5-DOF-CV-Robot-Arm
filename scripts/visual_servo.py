@@ -434,6 +434,36 @@ class CartesianActuator:
         vec = radial if self.direction == "radial" else tangential
         return np.array([vec[0], vec[1], 0.0]), tip
 
+    def locked_joints(self, ctx):
+        """Joints the solver must NOT spend on this nudge.
+
+        Five joints against a 3-DOF position target leaves a 2-dimensional null
+        space, and a position-only solve has no preference inside it -- it takes
+        whatever its iteration lands on. That is free motion as far as the solver
+        is concerned and anything but free here, because THE CAMERA RIDES ON THE
+        WRIST: null-space motion moves the very image this loop measures.
+
+        J5 IS ALWAYS LOCKED. It is the wrist ROLL, so it spins the camera about
+        its own optical axis and ROTATES THE IMAGE, while contributing almost
+        nothing to where the tool is. Measured 2026-08-06: 3 mm radial nudges came
+        back wanting 73-90 ticks of J5 (6-8 deg of roll), which swings a brick
+        100 px off-centre by ~14 px sideways. The run showed exactly that -- "y
+        correction gained -12 px but cost 17 px on x" -- and then stalled, the
+        loop chasing a disturbance it was generating itself.
+
+        J1 IS ALSO LOCKED FOR A RADIAL NUDGE. Radial means "change how far the
+        arm reaches", which happens entirely in the shoulder/elbow plane; base
+        yaw cannot change reach, it can only pan the view. Leaving it free had
+        the pan guard halving every radial nudge two or three times -- a
+        commanded 12 mm arriving as 1.5 mm -- so the loop crept. It stays free
+        for a TANGENTIAL nudge, where swinging the base is the entire point.
+        """
+        # getattr, and defaulting to the SAFE side: a caller that predates the
+        # flag gets the locking rather than the leak.
+        if getattr(ctx.args, "no_lock_null", False):
+            return []
+        return [1, 5] if self.direction == "radial" else [5]
+
     def apply(self, ctx, amount_mm):
         if abs(amount_mm) < config.SERVO_VISUAL_MIN_STEP_MM:
             return 0.0
@@ -463,7 +493,8 @@ class CartesianActuator:
         while True:
             try:
                 solution, err_mm = ctx.ik.request_ik(*(tip + vec * (attempt_mm / 1000.0)),
-                                                     seed_rad=angles)
+                                                     seed_rad=angles,
+                                                     lock=self.locked_joints(ctx))
             except IKUnreachableError as e:
                 raise ServoAbort(
                     f"IK cannot reach a {attempt_mm:+.1f} mm {self.direction} "
@@ -1207,6 +1238,15 @@ def main() -> None:
                          "image's response to reaching out can be told apart "
                          "from its response to descending. The step still "
                          f"descends in full (default {config.SERVO_VISUAL_DESCEND_PROBE_MM:.0f})")
+    ap.add_argument("--no-lock-null", action="store_true",
+                    help="let the IK solver spend null-space freely on the "
+                         "re-centring nudges. Off by default: J5 is the wrist "
+                         "ROLL, so any of it the solver spends rotates the "
+                         "camera about its own axis and moves the image this "
+                         "loop measures — 3 mm nudges came back wanting 8 deg of "
+                         "roll, which cost more pixels than the nudge gained. J1 "
+                         "is additionally locked for RADIAL nudges, where base "
+                         "yaw cannot change reach and only pans the view.")
     ap.add_argument("--no-lock-base", dest="lock_base", action="store_false",
                     help="let the IK solver move J1 during descent steps. Off "
                          "by default: a descent does not ask for base yaw, and "

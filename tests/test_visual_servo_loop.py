@@ -257,6 +257,7 @@ class FakeIK:
         self.bus = bus
         self.j2_min_tick = j2_min_tick
         self.solves = []
+        self.locks = []
 
     def _tip(self):
         # Reach grows with both joints; a purely notional 1 mm per tick each.
@@ -275,7 +276,8 @@ class FakeIK:
         # pins; returning zeros here keeps the fake's own arithmetic honest.
         return np.array([0.0, 0.0])
 
-    def request_ik(self, x, y, z, seed_rad=None):
+    def request_ik(self, x, y, z, seed_rad=None, lock=None):
+        self.locks.append(tuple(lock or ()))
         wanted = (np.array([x, y, z]) - self._tip())[0] * 1000   # mm of extra reach
         j2_room = self.bus.ticks[2] - self.j2_min_tick           # ticks J2 may still give
         from_j2 = max(-j2_room, wanted) if wanted < 0 else wanted
@@ -383,9 +385,9 @@ def test_a_solve_that_swings_the_base_is_refused_not_executed():
     halved a few times and then refused with the reason.
     """
     class YawingIK(FakeIK):
-        def request_ik(self, x, y, z, seed_rad=None):
+        def request_ik(self, x, y, z, seed_rad=None, lock=None):
             # However small the request, insist on swinging the base.
-            super().request_ik(x, y, z, seed_rad)
+            super().request_ik(x, y, z, seed_rad, lock)
             return [self.bus.ticks[1] + 300, self.bus.ticks[2],
                     self.bus.ticks[3], self.bus.ticks[4], self.bus.ticks[5]], 0.0
 
@@ -406,8 +408,8 @@ def test_a_branch_flipping_solve_is_refused():
     190 mm with J2 pinned at its limit; commanding it unsupervised would be a
     violent move."""
     class FlippingIK(FakeIK):
-        def request_ik(self, x, y, z, seed_rad=None):
-            super().request_ik(x, y, z, seed_rad)
+        def request_ik(self, x, y, z, seed_rad=None, lock=None):
+            super().request_ik(x, y, z, seed_rad, lock)
             return [self.bus.ticks[1], self.bus.ticks[2] - 416,
                     self.bus.ticks[3] + 366, self.bus.ticks[4],
                     self.bus.ticks[5]], 0.0
@@ -1147,3 +1149,58 @@ def test_the_reach_conditioning_check_is_made_at_the_hover_pose():
     assert hover < check < go, (
         "reach conditioning must be measured after the hover and reported "
         "before the go-ahead, so the operator can still act on it")
+
+
+# --- null-space locking on the re-centring nudges ----------------------------
+# Five joints against a 3-DOF position target leaves a 2-D null space, and the
+# camera rides on the wrist, so null-space motion moves the very image this loop
+# measures. Observed 2026-08-06: 3 mm radial nudges came back wanting 73-90
+# ticks of J5 (6-8 deg of wrist ROLL), which rotates the image about its optical
+# axis. A brick 100 px off-centre swings ~14 px sideways from that alone -- the
+# run logged "y correction gained -12 px but cost 17 px on x", then stalled with
+# the loop chasing a disturbance it was generating itself.
+
+def _nudge_ctx(**overrides):
+    bus = CartesianBus()
+    world = FakeWorld(bus)
+    args = Namespace(settle=0.0, deadband=12.0, view=False, max_iterations=10,
+                     **overrides)
+    return vs.Context(bus, FakeCamera(world), FakeDetector(world), args, None,
+                      ik=FakeIK(bus))
+
+
+def test_a_radial_nudge_locks_the_wrist_roll_and_the_base():
+    """Radial means 'change how far the arm reaches', which happens entirely in
+    the shoulder/elbow plane. Neither base yaw nor wrist roll can change reach;
+    both only move the camera."""
+    ctx = _nudge_ctx()
+    vs.CartesianActuator("radial").apply(ctx, 6.0)
+    assert ctx.ik.locks, "no IK solve was made"
+    for lock in ctx.ik.locks:
+        assert set(lock) == {1, 5}
+
+
+def test_a_tangential_nudge_locks_the_roll_but_LEAVES_THE_BASE_FREE():
+    """Swinging the base is the entire point of a tangential nudge — locking J1
+    there would disable the axis rather than protect it."""
+    ctx = _nudge_ctx()
+    vs.CartesianActuator("tangential").apply(ctx, 6.0)
+    assert ctx.ik.locks, "no IK solve was made"
+    for lock in ctx.ik.locks:
+        assert set(lock) == {5}
+        assert 1 not in lock
+
+
+def test_the_lock_can_be_turned_off_deliberately():
+    ctx = _nudge_ctx(no_lock_null=True)
+    vs.CartesianActuator("radial").apply(ctx, 6.0)
+    assert all(lock == () for lock in ctx.ik.locks)
+
+
+def test_a_caller_predating_the_flag_still_gets_the_locking():
+    """Defaulting to the SAFE side. The Namespace above has no no_lock_null at
+    all, and the protection must not depend on remembering to set it."""
+    ctx = _nudge_ctx()
+    assert not hasattr(ctx.args, "no_lock_null")
+    assert set(vs.CartesianActuator("radial").locked_joints(ctx)) == {1, 5}
+    assert set(vs.CartesianActuator("tangential").locked_joints(ctx)) == {5}
