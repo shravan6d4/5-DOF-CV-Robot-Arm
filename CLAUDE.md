@@ -185,7 +185,11 @@ The checks above are not invented here; each implements something standard that 
 
 `config.SERVO_HOME_TICKS` / `SERVO_HOVER_TICKS` + [`robot_interface/poses.py`](src/vision_pipeline/robot_interface/poses.py) (`goto`, `at_pose`, `describe_move`), driven by [`scripts/goto_pose.py`](scripts/goto_pose.py). Raw ticks, never IK — a recovery pose has to work when the clever paths do not, and IK depends on a hand-eye transform that is known wrong.
 
-**HOVER is where a run should start.** The camera is eye-in-hand, so a brick that is not in view cannot be detected, probed, or servoed to; beginning from an arbitrary pose means hand-positioning the arm until the brick appears, and the probe then measures its gains against whatever geometry that happened to be. `visual_servo.py` drives there automatically (`--no-hover` opts out). Tip lands ~168 mm above the table at ~78 mm reach.
+**HOVER is where a run should start.** The camera is eye-in-hand, so a brick that is not in view cannot be detected, probed, or servoed to; beginning from an arbitrary pose means hand-positioning the arm until the brick appears, and the probe then measures its gains against whatever geometry that happened to be. `visual_servo.py` drives there automatically (`--no-hover` opts out).
+
+**The go-ahead comes AFTER the hover** (fixed 2026-08-06). It used to be asked first, so the operator approved a view that the very next move threw away — the arm started wherever the last run left it, the brick had to be hand-framed from that posture, and then the hover swung the camera somewhere else. The reach-conditioning warning moved with it, for the same reason: it was measuring a pose the run never visits. `--dry-run` keeps the old order, since it never touches the arm.
+
+Re-measured 2026-08-06: `{1: 2057, 2: 3145, 3: 2205, 4: 1841, 5: 2688}`, tip ~195 mm above the table. **Note it sits only ~7 mm from the base column**, well inside `SERVO_VISUAL_MIN_RADIUS_M` (120 mm). Centring is unaffected — J1 pans the view perfectly well there even though it barely translates the claw — but the GRASP is, because the brick has to end up somewhere the claw can actually reach. J6 is deliberately excluded from the pose so driving to it never opens or closes the gripper.
 
 `tests/test_poses.py` pins `SERVO_HOME_TICKS` against each joint's `home_tick` and asserts the home pose converts to exactly 0.0 rad — the two are copies of one measurement, and drift between them silently offsets every angle the arm reports.
 

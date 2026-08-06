@@ -109,7 +109,7 @@ def load_intrinsics(path: str | Path | None = None) -> CameraIntrinsics:
     if not path.exists():
         return default_intrinsics()
 
-    data = json.loads(path.read_text())
+    data = json.loads(path.read_text(encoding="utf-8"))
     return CameraIntrinsics(
         fx=float(data["fx"]),
         fy=float(data["fy"]),

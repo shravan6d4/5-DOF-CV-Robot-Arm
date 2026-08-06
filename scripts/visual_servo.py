@@ -847,6 +847,25 @@ def yaw_axis_xy(ctx):
     return tuple(ctx.ik.base_yaw_axis_xy())
 
 
+def report_starting_error(ctx, centroid, frame):
+    """Print where the brick sits relative to the aim point. Returns the aim px.
+
+    Shared so the dry-run path and a real run print the same thing, and so a
+    real run can print it AFTER reaching the hover pose rather than before --
+    the numbers are only meaningful for the pose the run actually starts from.
+    """
+    ax, ay = ctx.aim(frame.shape)
+    ex, ey = pixel_error(centroid, frame.shape, (ax, ay))
+    h, w = frame.shape[:2]
+    print(f"\nframe        {w}x{h}, centre ({w // 2}, {h // 2})")
+    print(f"aim point    ({ax:.0f}, {ay:.0f}) px")
+    print(f"brick at     ({centroid[0]:.0f}, {centroid[1]:.0f}) px")
+    print(f"error        {describe(ex, ey)} of the aim point")
+    if abs(ex) <= ctx.args.tolerance_x and abs(ey) <= ctx.args.tolerance_y:
+        print("             (already inside the target box)")
+    return ax, ay
+
+
 def tip_position(ctx):
     """Current claw-tip position in the physical base frame, metres."""
     angles = [ctx.bus.ticks_to_rad(j, ctx.bus.read_position_retrying(j)) for j in IK_JOINTS]
@@ -1305,33 +1324,22 @@ def main() -> None:
             print("\n  NOTE: autofocus could not be disabled. Harmless for centring")
             print("  (no intrinsics are used), but it would matter for calibration.")
 
-        # Wait for the operator to say the view is right BEFORE judging it.
-        try:
-            wait_for_go(ctx)
-        except ViewAborted as e:
-            print(f"\n  Quit before anything moved ({e}).")
-            cv2.destroyAllWindows()
-            return
-
-        centroid, frame = detect_centroid(ctx)
-        if centroid is None:
-            print("\n  NO BRICK DETECTED at the go-ahead. Nothing to servo toward.")
-            print("  Re-run and position until the brick is outlined in green,")
-            print("  or check the detector with: python scripts/run_live_view.py")
-            cv2.destroyAllWindows()
-            sys.exit(1)
-
-        ax, ay = ctx.aim(frame.shape)
-        ex, ey = pixel_error(centroid, frame.shape, (ax, ay))
-        h, w = frame.shape[:2]
-        print(f"\nframe        {w}x{h}, centre ({w // 2}, {h // 2})")
-        print(f"aim point    ({ax:.0f}, {ay:.0f}) px")
-        print(f"brick at     ({centroid[0]:.0f}, {centroid[1]:.0f}) px")
-        print(f"error        {describe(ex, ey)} of the aim point")
-        if abs(ex) <= args.tolerance_x and abs(ey) <= args.tolerance_y:
-            print("             (already inside the target box)")
-
+        # --dry-run touches no hardware, so it keeps the original order: approve
+        # the view as it stands, judge it, stop. A REAL run must reach the hover
+        # pose before asking for the go-ahead -- see the comment at that point.
         if args.dry_run:
+            try:
+                wait_for_go(ctx)
+            except ViewAborted as e:
+                print(f"\n  Quit before anything moved ({e}).")
+                cv2.destroyAllWindows()
+                return
+            centroid, frame = detect_centroid(ctx)
+            if centroid is None:
+                print("\n  NO BRICK DETECTED. Nothing to servo toward.")
+                cv2.destroyAllWindows()
+                sys.exit(1)
+            ax, ay = report_starting_error(ctx, centroid, frame)
             print(f"\n--dry-run: nothing commanded. Axes to be probed: {args.axes}.")
             cv2.destroyAllWindows()
             if args.save:
@@ -1381,30 +1389,6 @@ def main() -> None:
                  else "  (one joint per axis; stops when that joint does)"))
         print("axes        " + ", ".join(f"{a} via {act.label()}" for a, act in axes))
 
-        # Conditioning warning, before anything moves. Cartesian re-centring
-        # degrades badly close to the base axis and it is much cheaper to
-        # reposition the brick now than to watch the loop thrash.
-        if mode == "cartesian" and ik is not None:
-            try:
-                probe_ctx = Context(bus, camera, detector, args, detectors, ik)
-                _a, tip0 = tip_position(probe_ctx)
-                radius = reach_from_axis((tip0[0], tip0[1]), yaw_axis_xy(probe_ctx))
-                print(f"reach       tip is {radius * 1000:.0f} mm from the base axis")
-                if radius < config.SERVO_VISUAL_MIN_RADIUS_M:
-                    print(f"\n  *** WORKING TOO CLOSE IN for good Cartesian control. ***")
-                    print(f"      The claw hangs ~27 mm off the arm's plane, so at "
-                          f"{radius * 1000:.0f} mm the tip's bearing is")
-                    print(f"      hypersensitive to J1 — a 5 mm nudge can cost "
-                          f"several degrees of base")
-                    print(f"      yaw, and the camera rides on the wrist, so that "
-                          f"pans the whole image.")
-                    print(f"      Measured: 6.6 deg of pan at 78 mm, 1.5 at 130 mm, "
-                          f"0.8 at 160 mm.")
-                    print(f"      Move the brick out past ~130 mm, or use "
-                          f"--recentre joint --joint-y 3.")
-            except Exception as e:
-                print(f"  (could not check reach conditioning: {e})")
-
         with bus:
             ctx.bus, ctx.ik = bus, ik
             active = IK_JOINTS if (args.descend or mode == "cartesian") else \
@@ -1449,6 +1433,60 @@ def main() -> None:
                                    or (lambda k, n: print(f"    hop {k}/{n}",
                                                           flush=True)))
                         wait_watching(max(ctx.args.settle, 0.4), ctx, ["at hover"])
+
+                # Conditioning warning, judged AT THE HOVER POSE. It used to run
+                # before the hover, where it measured whatever posture the last
+                # run happened to leave the arm in -- a number about a pose this
+                # run never visits. Cartesian re-centring degrades badly close to
+                # the base axis, and the operator can still reposition the brick
+                # or switch modes at the go-ahead below, which is the whole
+                # reason for warning before asking.
+                if mode == "cartesian" and ik is not None:
+                    try:
+                        _a, tip0 = tip_position(ctx)
+                        radius = reach_from_axis((tip0[0], tip0[1]), yaw_axis_xy(ctx))
+                        print(f"\nreach       claw is {radius * 1000:.0f} mm from the "
+                              f"base axis at the hover pose")
+                        if radius < config.SERVO_VISUAL_MIN_RADIUS_M:
+                            print(f"\n  *** WORKING TOO CLOSE IN for good Cartesian "
+                                  f"control. ***")
+                            print(f"      The claw hangs ~27 mm off the arm's plane, "
+                                  f"so at {radius * 1000:.0f} mm its bearing is")
+                            print(f"      hypersensitive to J1 — a 5 mm nudge can cost "
+                                  f"several degrees of base")
+                            print(f"      yaw, and the camera rides on the wrist, so "
+                                  f"that pans the whole image.")
+                            print(f"      Measured: 6.6 deg of pan at 78 mm, 1.5 at "
+                                  f"130 mm, 0.8 at 160 mm.")
+                            print(f"      Centring still works (J1 PANS the view well "
+                                  f"here even though it barely")
+                            print(f"      translates the claw) — it is the GRASP that "
+                                  f"suffers, since the brick has")
+                            print(f"      to be somewhere the claw can actually reach. "
+                                  f"Consider a hover pose")
+                            print(f"      further out, or --recentre joint "
+                                  f"--joint-y 3.")
+                    except Exception as e:
+                        print(f"  (could not check reach conditioning: {e})")
+
+                # THE GO-AHEAD COMES AFTER THE HOVER, not before. Asking first
+                # made the operator approve a view that the very next move threw
+                # away: the arm started wherever the previous run left it, so the
+                # brick had to be hand-framed from that posture, and then the
+                # hover swung the camera somewhere else entirely. Approving the
+                # pose the run will ACTUALLY start from is the only version of
+                # this that means anything -- and it is what makes probe gains
+                # comparable across runs, since they are then all measured from
+                # one geometry.
+                wait_for_go(ctx)
+                centroid, frame = detect_centroid(ctx)
+                if centroid is None:
+                    print("\n  NO BRICK DETECTED at the go-ahead. Nothing to servo")
+                    print("  toward. The arm is at the hover pose and holding, so")
+                    print("  move the brick into view and re-run — or check the")
+                    print("  detector with: python scripts/run_live_view.py")
+                    return
+                report_starting_error(ctx, centroid, frame)
 
                 estimates = [((a, act), probe_axis(ctx, a, act)) for a, act in axes]
                 centre(ctx, estimates)

@@ -400,7 +400,7 @@ def save_samples(accumulator: HandEyeAccumulator, path: str | Path) -> None:
             for idx, samples in accumulator._samples.items()
         }
     }
-    path.write_text(json.dumps(payload, indent=2))
+    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
 
 def load_samples(
@@ -411,7 +411,7 @@ def load_samples(
     Raises:
         FileNotFoundError: no such file (callers decide whether that's fatal).
     """
-    payload = json.loads(Path(path).read_text())
+    payload = json.loads(Path(path).read_text(encoding="utf-8"))
     acc = HandEyeAccumulator(min_samples=min_samples)
     for idx_str, samples in payload.get("boards", {}).items():
         acc._samples[int(idx_str)] = [

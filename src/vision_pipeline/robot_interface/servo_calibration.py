@@ -83,10 +83,17 @@ def load_calibration(path: Optional[str] = None) -> dict:
     calibration_path = Path(path or config.SERVO_CALIBRATION_PATH)
     if calibration_path.exists():
         try:
-            with open(calibration_path) as f:
+            # encoding= is NOT optional. Python on Windows defaults to the
+            # system ANSI codepage (cp1252 here), and this file carries prose:
+            # the *_basis provenance fields hold em-dashes and degree signs. The
+            # same bug was fixed in ServoBus's own loader and missed here, so
+            # this twin crashed with UnicodeDecodeError the moment a basis note
+            # was written with a non-ASCII character -- taking down every caller
+            # that does not go through ServoBus, MockJointController included.
+            with open(calibration_path, encoding="utf-8") as f:
                 calibration = json.load(f)
             logger.info(f"Loaded servo calibration from {calibration_path}")
-        except (json.JSONDecodeError, IOError) as e:
+        except (json.JSONDecodeError, IOError, UnicodeDecodeError) as e:
             logger.warning(f"Failed to load {calibration_path}, using fallback: {e}")
             calibration = config.SERVO_CALIBRATION_FALLBACK
     else:

@@ -50,7 +50,7 @@ def load_hand_eye(path: str | Path | None = None) -> np.ndarray:
     if not path.exists():
         return np.eye(4)
 
-    matrix = np.array(json.loads(path.read_text()), dtype=float)
+    matrix = np.array(json.loads(path.read_text(encoding="utf-8")), dtype=float)
     if matrix.shape != (4, 4):
         raise ValueError(f"Hand-eye file {path} must contain a 4x4 matrix, got {matrix.shape}.")
     return matrix
@@ -60,7 +60,8 @@ def save_hand_eye(t_gripper_camera: np.ndarray, path: str | Path) -> None:
     """Write a 4x4 gripper->camera transform to JSON (after calibrating it)."""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(np.asarray(t_gripper_camera, dtype=float).tolist(), indent=2))
+    path.write_text(json.dumps(np.asarray(t_gripper_camera, dtype=float).tolist(), indent=2),
+                    encoding="utf-8")
 
 
 @dataclass

@@ -861,11 +861,17 @@ HAND_EYE_MAX_TSAI_PARK_ROT_DEG = 5.0
 # first makes a run reproducible -- the same starting geometry every time, which
 # is also what makes the probe gains comparable between runs.
 #
-# Measured 2026-08-05 by parking the arm where the brick was comfortably in
-# frame and reading hold_pose.py. Tip lands ~168 mm above the table at ~78 mm
-# reach, looking down at the work area.
+# Re-measured 2026-08-06 by the operator parking the arm where the brick sits
+# comfortably in frame and reading hold_pose.py. Supersedes the 2026-08-05
+# values {1: 2021, 2: 2873, 3: 2448, 4: 1749, 5: 2744}, which framed the work
+# area worse.
+#
+# J1..J5 only, matching HOME: these are the IK joints. hold_pose also reports J6
+# (the gripper, 3094 at this pose) and it is deliberately NOT included -- driving
+# to a viewing pose must never open or close the claw, which could drop or crush
+# whatever is already held.
 SERVO_HOME_TICKS = {1: 2020, 2: 2683, 3: 3298, 4: 1547, 5: 2744}
-SERVO_HOVER_TICKS = {1: 2021, 2: 2873, 3: 2448, 4: 1749, 5: 2744}
+SERVO_HOVER_TICKS = {1: 2057, 2: 3145, 3: 2205, 4: 1841, 5: 2688}
 # J6 is deliberately absent: it is the gripper, not part of positioning, and
 # pinning it here would make every goto_pose call quietly open or close the jaw.
 

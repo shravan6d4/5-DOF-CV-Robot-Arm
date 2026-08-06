@@ -1076,3 +1076,74 @@ def test_radial_is_undefined_when_the_tool_sits_on_the_yaw_axis_not_the_origin()
     assert np.hypot(*radial) == pytest.approx(1.0)
     with pytest.raises(ValueError):
         vs.radial_tangential(axis, axis)                    # on the axis: not
+
+
+# --- the go-ahead must come AFTER the hover ---------------------------------
+# Asking first made the operator approve a view the very next move threw away:
+# the arm started wherever the previous run left it, the brick had to be
+# hand-framed from that posture, and then the hover swung the camera elsewhere.
+# This pins the order rather than the code that happens to implement it.
+
+def _source_of(func):
+    import inspect
+    return inspect.getsource(func)
+
+
+def test_the_hover_is_commanded_before_the_go_ahead_is_requested():
+    src = _source_of(vs.main)
+    hover = src.index('poses.goto(bus, "hover"')
+    # The go-ahead inside the real-run branch, i.e. the one that is NOT guarded
+    # by --dry-run. Take the LAST occurrence: dry-run's copy comes earlier.
+    go = src.rindex("wait_for_go(ctx)")
+    assert hover < go, (
+        "wait_for_go must not run before the arm reaches the hover pose; "
+        "approving a view the hover then destroys is what this ordering fixes")
+
+
+def test_the_dry_run_go_ahead_still_precedes_any_arm_contact():
+    """--dry-run must remain hardware-free: it approves the view as it stands
+    and never opens the bus, so its go-ahead necessarily comes first."""
+    src = _source_of(vs.main)
+    dry = src.index("if args.dry_run:")
+    first_go = src.index("wait_for_go(ctx)")
+    bus_open = src.index("bus = ServoBus(")
+    assert dry < first_go < bus_open
+
+
+def test_no_brick_at_the_go_ahead_leaves_the_arm_holding_at_hover():
+    """It must not sys.exit out of the `with bus:` block -- that would drop the
+    context manager mid-run. Returning keeps the arm powered and holding."""
+    src = _source_of(vs.main)
+    go = src.rindex("wait_for_go(ctx)")
+    after = src[go:go + 900]
+    assert "NO BRICK DETECTED at the go-ahead" in after
+    assert "sys.exit" not in after.split("estimates =")[0]
+
+
+def test_the_hover_pose_is_the_one_the_operator_measured():
+    """SERVO_HOVER_TICKS is a measurement, not a preference. Pinning it here
+    means a silent edit shows up as a test failure rather than as an arm that
+    quietly starts somewhere else."""
+    from vision_pipeline import config
+    from vision_pipeline.robot_interface import poses
+    assert config.SERVO_HOVER_TICKS == {1: 2057, 2: 3145, 3: 2205, 4: 1841, 5: 2688}
+    assert poses.HOVER == config.SERVO_HOVER_TICKS
+
+
+def test_the_hover_pose_does_not_touch_the_gripper():
+    """Driving to a viewing pose must never open or close the claw -- it could
+    drop or crush whatever is already held. hold_pose reports J6; HOVER omits it."""
+    from vision_pipeline import config
+    assert 6 not in config.SERVO_HOVER_TICKS
+
+
+def test_the_reach_conditioning_check_is_made_at_the_hover_pose():
+    """It used to run before the hover, measuring whatever posture the previous
+    run left behind -- a number about a pose this run never visits."""
+    src = _source_of(vs.main)
+    hover = src.index('poses.goto(bus, "hover"')
+    check = src.index("SERVO_VISUAL_MIN_RADIUS_M")
+    go = src.rindex("wait_for_go(ctx)")
+    assert hover < check < go, (
+        "reach conditioning must be measured after the hover and reported "
+        "before the go-ahead, so the operator can still act on it")
