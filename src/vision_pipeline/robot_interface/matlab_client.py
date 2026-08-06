@@ -17,6 +17,7 @@ Cartesian flip and pass through unchanged. Do not convert anywhere else.
 """
 
 import json
+import logging
 import socket
 import numpy as np
 
@@ -31,12 +32,20 @@ class IKUnreachableError(Exception):
     pass
 
 
+logger = logging.getLogger(__name__)
+
+
 class MatlabIKClient:
     """TCP JSON client for IK/FK requests to the MATLAB server.
 
     Connects to a persistent ik_fk_server.m running on localhost.
     Requests are stateless: same inputs always produce the same outputs.
     """
+
+    # A locked joint drifting more than this means the pin did not hold. 0.5 deg
+    # is comfortably above solver noise and far below anything that matters to
+    # the image (the failure being guarded against was 8 degrees of wrist roll).
+    LOCK_DRIFT_WARN_RAD = 0.0087
 
     def __init__(self, host: str = "localhost", port: int = 9999):
         """Connect to the MATLAB server.
@@ -142,6 +151,21 @@ class MatlabIKClient:
         resp = self._send_request(req)
         angles_rad = resp["angles_rad"]  # list of 5 floats
         err_mm = resp["err_mm"]  # float
+
+        # A LOCK THAT SILENTLY FAILS IS WORSE THAN NO LOCK: the caller believes
+        # a disturbance is suppressed and tunes its gains against that belief.
+        # Observed 2026-08-06 -- a run locking J5 came back moving it 94 ticks,
+        # because the server pinned it with a degenerate [v, v] interval the
+        # solver did not honour, and nothing in the protocol could report it.
+        # Older servers omit the field entirely, so absence is not a failure.
+        drift = resp.get("lock_drift_rad")
+        if lock and drift is not None and drift > self.LOCK_DRIFT_WARN_RAD:
+            logger.warning(
+                "IK was asked to hold joint(s) %s but moved one by %.1f deg "
+                "(%.0f ticks). The lock is not holding — treat any gain measured "
+                "through this solve as unreliable, and check that MATLAB was "
+                "restarted after the last change to matlab/.",
+                list(lock), np.degrees(drift), drift * 651.89)
         return angles_rad, err_mm
 
     def request_fk(self, angles_rad: list[float]) -> np.ndarray:

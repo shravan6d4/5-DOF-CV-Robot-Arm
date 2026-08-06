@@ -155,18 +155,39 @@ function resp = handle_ik_request(x, y, z, seed_rad, lockJoints)
                 'lock requires seed_rad: a joint can only be held at a known angle');
             return;
         end
+        LOCK_EPS = 1e-6;
         for k = reshape(double(lockJoints), 1, [])
             if k < 1 || k > 5, continue; end
             i = motorIdx(k);
             jnt = robot.Bodies{i}.Joint;
-            restore{end+1} = {i, jnt.PositionLimits}; %#ok<AGROW>
+            % HomePosition is saved TOO, and that is not bookkeeping padding.
+            % See below: pinning mutates it, and restoring PositionLimits alone
+            % leaves the mutation in place for the rest of the server's life.
+            restore{end+1} = {i, jnt.PositionLimits, jnt.HomePosition}; %#ok<AGROW>
             v = seed(i);
             % Clamp the pin INTO the joint's real limits. A seed outside them
             % (a joint that has sagged past its stop, which happens on this
             % arm) would otherwise produce an empty interval and an
             % unsolvable problem reported as "outside workspace".
             v = min(max(v, jnt.PositionLimits(1)), jnt.PositionLimits(2));
-            jnt.PositionLimits = [v, v];
+
+            % HOME FIRST, THEN LIMITS. Setting PositionLimits to a band that
+            % excludes the joint's current HomePosition makes rigidBodyJoint
+            % warn and silently reset HomePosition to the band centre -- and
+            % that reset is NOT undone by putting PositionLimits back. Every
+            % locked solve was leaving a motor joint's HomePosition wherever
+            % the arm happened to be, so homeConfiguration(robot) stopped
+            % returning the arm's real zero. Setting it deliberately first
+            % makes the change ours, and it is restored on the way out.
+            jnt.HomePosition = v;
+
+            % A NARROW BAND, NOT A POINT. [v, v] is a degenerate interval and
+            % the solver does not reliably respect it -- observed 2026-08-06,
+            % a run that locked J5 still came back wanting 94 and then -100
+            % ticks of it. init_arm.m freezes the idler disks with
+            % [h - eps, h + eps] for exactly this reason; matching that is the
+            % pattern already proven on this model.
+            jnt.PositionLimits = [v - LOCK_EPS, v + LOCK_EPS];
         end
     end
     cleanupObj = onCleanup(@() restore_joint_limits(restore)); %#ok<NASGU>
@@ -231,19 +252,41 @@ function resp = handle_ik_request(x, y, z, seed_rad, lockJoints)
 
     % move_rad lets the caller see how much posture this solve costs, which
     % a position residual cannot show: the 213-tick J1 solve reported 0.0 mm.
+    %
+    % lock_drift_rad is how far the LOCKED joints actually moved, and it exists
+    % because a lock that silently fails is worse than no lock: the caller
+    % believes a disturbance is suppressed and tunes against that belief. On
+    % 2026-08-06 a run locking J5 came back moving it 94 ticks and nothing in
+    % the protocol could say so -- the pin was a degenerate [v, v] interval the
+    % solver did not honour. Callers should treat a non-trivial value here as a
+    % failed lock, not as noise.
+    lockDrift = 0;
+    for k = reshape(double(lockJoints), 1, [])
+        if k < 1 || k > 5, continue; end
+        lockDrift = max(lockDrift, abs(bestSol(motorIdx(k)) - seed0(motorIdx(k))));
+    end
+
     resp = struct('ok', true, 'angles_rad', ik_angles(1:5), ...
-                  'err_mm', 1000*bestErr, 'move_rad', bestMove);
+                  'err_mm', 1000*bestErr, 'move_rad', bestMove, ...
+                  'lock_drift_rad', lockDrift);
 end
 
 function restore_joint_limits(restore)
-    % Put back every PositionLimits that locking narrowed. Runs on normal
-    % return AND on error, because `robot` is a global handle object: a
-    % leaked pin would silently freeze that joint for every later request in
+    % Put back every PositionLimits AND HomePosition that locking touched. Runs
+    % on normal return AND on error, because `robot` is a global handle object:
+    % a leaked pin would silently freeze that joint for every later request in
     % this server's lifetime, which would look like an arm that had lost a
     % degree of freedom for no reason.
+    %
+    % HomePosition is restored SECOND, and the order matters: widening
+    % PositionLimits first means the home value is legal by the time it is
+    % written, so putting it back cannot itself trip the reset-and-warn path
+    % that made it necessary.
     global robot
     for n = 1:numel(restore)
-        robot.Bodies{restore{n}{1}}.Joint.PositionLimits = restore{n}{2};
+        jnt = robot.Bodies{restore{n}{1}}.Joint;
+        jnt.PositionLimits = restore{n}{2};
+        jnt.HomePosition = restore{n}{3};
     end
 end
 

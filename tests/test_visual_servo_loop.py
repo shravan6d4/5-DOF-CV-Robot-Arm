@@ -1204,3 +1204,58 @@ def test_a_caller_predating_the_flag_still_gets_the_locking():
     assert not hasattr(ctx.args, "no_lock_null")
     assert set(vs.CartesianActuator("radial").locked_joints(ctx)) == {1, 5}
     assert set(vs.CartesianActuator("tangential").locked_joints(ctx)) == {5}
+
+
+def test_a_lock_that_did_not_hold_is_reported_not_swallowed(caplog):
+    """A silently failing lock is worse than no lock: the caller believes a
+    disturbance is suppressed and tunes its gains against that belief. This is
+    the 2026-08-06 case -- J5 locked, 94 ticks of drift, nothing said."""
+    import logging
+    from vision_pipeline.robot_interface.matlab_client import MatlabIKClient
+
+    class Wire(MatlabIKClient):
+        def __init__(self, drift):
+            self.drift = drift          # no socket; _send_request is stubbed
+
+        def _send_request(self, req):
+            return {"ok": True, "angles_rad": [0.0] * 5, "err_mm": 0.0,
+                    "lock_drift_rad": self.drift}
+
+    with caplog.at_level(logging.WARNING):
+        Wire(np.deg2rad(8.0)).request_ik(0.1, 0.0, 0.1, seed_rad=[0.0] * 5, lock=[5])
+    assert "not holding" in caplog.text
+
+
+def test_a_lock_that_held_says_nothing(caplog):
+    import logging
+    from vision_pipeline.robot_interface.matlab_client import MatlabIKClient
+
+    class Wire(MatlabIKClient):
+        def __init__(self):
+            pass
+
+        def _send_request(self, req):
+            return {"ok": True, "angles_rad": [0.0] * 5, "err_mm": 0.0,
+                    "lock_drift_rad": 1e-7}
+
+    with caplog.at_level(logging.WARNING):
+        Wire().request_ik(0.1, 0.0, 0.1, seed_rad=[0.0] * 5, lock=[5])
+    assert caplog.text == ""
+
+
+def test_an_older_server_without_the_field_is_not_treated_as_a_failure(caplog):
+    """matlab/ changes need a server restart; until then the field is absent.
+    Absence must not masquerade as a held lock OR as a broken one."""
+    import logging
+    from vision_pipeline.robot_interface.matlab_client import MatlabIKClient
+
+    class Wire(MatlabIKClient):
+        def __init__(self):
+            pass
+
+        def _send_request(self, req):
+            return {"ok": True, "angles_rad": [0.0] * 5, "err_mm": 0.0}
+
+    with caplog.at_level(logging.WARNING):
+        Wire().request_ik(0.1, 0.0, 0.1, seed_rad=[0.0] * 5, lock=[5])
+    assert caplog.text == ""
