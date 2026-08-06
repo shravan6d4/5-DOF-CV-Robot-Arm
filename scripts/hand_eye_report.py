@@ -33,7 +33,11 @@ THE ORDER OF THE SECTIONS IS THE ORDER TO TRUST THEM IN, and it is deliberate:
      cannot observe the camera offset produces a beautiful residual and a wrong
      number; this is the section that says so.
   5. SOLVE          -- five methods, three formulations, and the gates.
-  6. VERDICT        -- what to actually do next.
+  6. POOLED SOLVE   -- every board and every pair in one solve. A board's
+     placement cancels out of the camera motion, so pairs from different
+     boards constrain the same X; and any two poses pair up, not just
+     consecutive ones. 390 constraints where the per-board path used 11.
+  7. VERDICT        -- what to actually do next.
 
 THE HISTORY THIS ENCODES. Every check here exists because something got past
 the checks that came before it:
@@ -62,6 +66,7 @@ import numpy as np
 
 from vision_pipeline import config
 from vision_pipeline.calibration import geometry, hand_eye
+from vision_pipeline.calibration import hand_eye_pairs as hep
 
 RULE = "=" * 78
 
@@ -313,8 +318,53 @@ def report_solve(acc, board: int) -> None:
               f"data can give on its own")
 
 
+def report_pooled(acc) -> None:
+    """Solve from motion pairs pooled across every board.
+
+    Adds constraints the per-board path structurally cannot reach: a board's own
+    placement cancels out of B = T_cam_board(i) @ inv(T_cam_board(j)), so pairs
+    from different boards constrain the same X, and any two poses pair up rather
+    than only consecutive ones. On the 2026-08-06 capture that is 390 available
+    pairs against the 11 the per-board solve was using.
+    """
+    print(f"\n{RULE}\n6.  POOLED SOLVE — every board, every pair\n{RULE}\n")
+    raw = hep.all_pairs(acc, filter_congruence=False)
+    clean = hep.all_pairs(acc, filter_congruence=True)
+    if len(clean) < 3:
+        print("  Too few congruent pairs to solve.")
+        return
+
+    print(f"  {len(raw)} pairs available, {len(clean)} survive congruence "
+          f"({100 * (1 - len(clean) / max(len(raw), 1)):.0f}% rejected)\n")
+    print(f"  {'set':<34} {'n':>5} {'|t| mm':>8}   {'O3':>5} {'cond':>5}")
+    rows = [("congruent, all boards pooled", clean),
+            ("all pairs, unfiltered", raw)]
+    for k in (20, 40, 80):
+        if k < len(clean):
+            rows.append((f"congruent + D-optimal k={k}",
+                         hep.select_d_optimal(clean, k=k)))
+    offsets = []
+    for label, pairs in rows:
+        t = hep.solve(pairs)[:3, 3] * 1000
+        o3, cond = hep.observability_of(pairs)
+        offsets.append(float(np.linalg.norm(t)))
+        print(f"  {label:<34} {len(pairs):5d} {np.linalg.norm(t):8.1f}   "
+              f"{o3:5.2f} {cond:5.2f}")
+
+    print(f"\n  ruler says {config.HAND_EYE_EXPECTED_OFFSET_MM:.0f} mm.")
+    if min(offsets) > config.HAND_EYE_EXPECTED_OFFSET_MM + \
+            config.HAND_EYE_OFFSET_TOLERANCE_MM:
+        print("  EVERY variant disagrees with the ruler. Pooling raises")
+        print("  observability, which is what it is for — it cannot correct a")
+        print("  SYSTEMATIC error, and well-observed data converging confidently")
+        print("  on a wrong answer is the signature of one. Suspect the two ends")
+        print("  of the comparison first: FK reports Body08, a CAD frame origin")
+        print("  with no physical landmark on it, while the ruler was laid")
+        print("  against something visible. They may not be the same point.")
+
+
 def report_verdict(acc, board: int, outliers: list[int], path: Path) -> bool:
-    print(f"\n{RULE}\n6.  VERDICT\n{RULE}\n")
+    print(f"\n{RULE}\n7.  VERDICT\n{RULE}\n")
     warnings = hand_eye.capture_health(acc, board)
     results = acc.solve_all()
     complaints = hand_eye.solve_complaints(results[board]) if board in results else \
@@ -390,6 +440,7 @@ def main() -> None:
     outliers = report_congruence(acc, board)
     report_observability(acc, board)
     report_solve(acc, board)
+    report_pooled(acc)
     ok = report_verdict(acc, board, outliers, target)
 
     if args.fix and outliers:
