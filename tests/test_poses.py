@@ -249,3 +249,47 @@ def test_both_named_poses_are_reachable_by_the_script(monkeypatch):
         bus = run_script(monkeypatch, ScriptBus({j: 2000 for j in IK_JOINTS}),
                          ["--pose", name, "--yes"])
         assert bus.ticks == {j: poses.POSES[name][j] for j in poses.POSES[name]}
+
+
+# --- step size is a caller's choice -----------------------------------------
+# The move was always broken into hops; nothing said so, and a preview showing
+# "92.1 deg" on one joint reads as a single lunge. Smaller hops mean more points
+# at which the travel limits are re-checked and more moments at which Ctrl-C can
+# freeze the arm partway -- which is what an operator standing over a big
+# reconfiguration actually wants control of.
+
+class _RecordingBus:
+    def __init__(self, start):
+        self.ticks = dict(start)
+        self.stepped = []
+
+    def read_position_retrying(self, j):
+        return self.ticks[j]
+
+    def move_joints_stepped(self, targets, step_ticks, pause_s, progress=None):
+        self.stepped.append({"targets": dict(targets), "step_ticks": step_ticks,
+                             "pause_s": pause_s})
+        self.ticks.update({j: int(t) for j, t in targets.items()})
+
+
+def test_goto_defaults_to_the_configured_step_size():
+    bus = _RecordingBus({j: 2000 for j in range(1, 6)})
+    poses.goto(bus, "home")
+    assert bus.stepped[0]["step_ticks"] == config.PICK_STEP_TICKS
+    assert bus.stepped[0]["pause_s"] == config.PICK_STEP_PAUSE_S
+
+
+def test_goto_honours_an_explicit_step_size_and_pause():
+    bus = _RecordingBus({j: 2000 for j in range(1, 6)})
+    poses.goto(bus, "home", step_ticks=15, pause_s=1.25)
+    assert bus.stepped[0]["step_ticks"] == 15
+    assert bus.stepped[0]["pause_s"] == 1.25
+
+
+def test_a_smaller_step_does_not_change_where_the_arm_ends_up():
+    """Step size is about how the journey is made, never about the destination."""
+    coarse = _RecordingBus({j: 2000 for j in range(1, 6)})
+    fine = _RecordingBus({j: 2000 for j in range(1, 6)})
+    poses.goto(coarse, "home", step_ticks=60)
+    poses.goto(fine, "home", step_ticks=5)
+    assert coarse.ticks == fine.ticks == {j: int(t) for j, t in poses.HOME.items()}

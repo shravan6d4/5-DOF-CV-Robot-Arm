@@ -36,6 +36,15 @@ def main() -> None:
     ap.add_argument("--dry-run", action="store_true",
                     help="show the move and command nothing")
     ap.add_argument("--yes", action="store_true", help="skip the confirmation")
+    ap.add_argument("--step", type=int, default=config.PICK_STEP_TICKS,
+                    help=f"ticks per hop (default {config.PICK_STEP_TICKS}, "
+                         f"~{config.PICK_STEP_TICKS / 651.89 * 57.3:.1f} deg). "
+                         f"The move is ALWAYS broken into hops of at most this, "
+                         f"with the travel limits re-checked at each one — "
+                         f"smaller means more chances to Ctrl-C partway.")
+    ap.add_argument("--pause", type=float, default=config.PICK_STEP_PAUSE_S,
+                    help=f"seconds to settle between hops "
+                         f"(default {config.PICK_STEP_PAUSE_S})")
     ap.add_argument("--port", default=config.SERVO_PORT)
     ap.add_argument("--baud", type=int, default=config.SERVO_BAUD)
     args = ap.parse_args()
@@ -58,6 +67,20 @@ def main() -> None:
         for line in poses.describe_move(bus, poses.POSES[args.pose]):
             print(line)
 
+        # SAY THAT IT STEPS, and how far each step goes. The per-joint totals
+        # above are the whole journey, not one command -- but printed alone they
+        # read as a single lunge, which is alarming for a 90 deg reconfiguration
+        # and gives the operator no idea how long they will be standing over it.
+        biggest = max((abs(int(t) - bus.read_position_retrying(j))
+                       for j, t in poses.POSES[args.pose].items()), default=0)
+        hops = max(1, -(-biggest // max(args.step, 1)))     # ceiling division
+        print(f"\n  In {hops} hop(s) of at most {args.step} ticks "
+              f"(~{args.step / 651.89 * 57.3:.1f} deg), "
+              f"{args.pause:.1f}s apart — about {hops * args.pause:.0f}s.")
+        print("  Every joint moves together and the travel limits are re-checked")
+        print("  at each hop. Ctrl-C between hops freezes the arm where it is,")
+        print("  torque on, so it stops without falling.")
+
         if args.dry_run:
             print("\n--dry-run: nothing commanded.")
             return
@@ -71,6 +94,7 @@ def main() -> None:
 
         try:
             final = poses.goto(bus, args.pose, label=args.pose,
+                               step_ticks=args.step, pause_s=args.pause,
                                progress=lambda k, n: print(f"    hop {k}/{n}",
                                                            flush=True))
         except ServoSafetyError as e:

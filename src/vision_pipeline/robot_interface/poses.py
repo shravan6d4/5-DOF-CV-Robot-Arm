@@ -61,7 +61,8 @@ def describe_move(bus, targets: dict) -> list[str]:
     return lines
 
 
-def goto(bus, pose, label: str = "", progress=None) -> dict:
+def goto(bus, pose, label: str = "", progress=None,
+         step_ticks: int | None = None, pause_s: float | None = None) -> dict:
     """Drive the arm to a named pose (or an explicit tick dict). MOVES THE ARM.
 
     Steps every joint together in sub-cap increments via move_joints_stepped, so
@@ -71,6 +72,11 @@ def goto(bus, pose, label: str = "", progress=None) -> dict:
     Args:
         pose: "home", "hover", or a {joint: tick} dict.
         label: what to call this move in log output.
+        step_ticks: ticks per hop; defaults to config.PICK_STEP_TICKS. Smaller
+            hops mean more points at which the travel limits are re-checked and
+            more moments at which Ctrl-C can freeze the arm partway, which is
+            what an operator standing over a 90-degree reconfiguration wants.
+        pause_s: settle time between hops; defaults to config.PICK_STEP_PAUSE_S.
 
     Returns:
         {joint: tick} actually read back afterwards.
@@ -87,8 +93,8 @@ def goto(bus, pose, label: str = "", progress=None) -> dict:
 
     bus.move_joints_stepped(
         targets,
-        step_ticks=config.PICK_STEP_TICKS,
-        pause_s=config.PICK_STEP_PAUSE_S,
+        step_ticks=config.PICK_STEP_TICKS if step_ticks is None else step_ticks,
+        pause_s=config.PICK_STEP_PAUSE_S if pause_s is None else pause_s,
         progress=progress,
     )
     return {j: bus.read_position_retrying(j) for j in sorted(targets)}
