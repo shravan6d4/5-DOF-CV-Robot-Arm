@@ -91,10 +91,13 @@ def main() -> None:
                 print(f"  lock {locked}: IK refused — {exc}")
                 continue
 
-            if "lock_drift_rad" not in resp:
-                print("  *** OLD SERVER: no lock_drift_rad field. matlab/ has")
-                print("      changed since this server started. Restart it:")
-                print("      >> ik_fk_server")
+            build = resp.get("server_build")
+            if build != MatlabIKClient.SERVER_BUILD:
+                print(f"  *** STALE SERVER. It reports build "
+                      f"{build or '(none — predates the marker)'}, this repo is "
+                      f"{MatlabIKClient.SERVER_BUILD}.")
+                print("      MATLAB keeps running the code it was started with.")
+                print("      Restart it and run this again:  >> ik_fk_server")
                 ok = False
                 break
 

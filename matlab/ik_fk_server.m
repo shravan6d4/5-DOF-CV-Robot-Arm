@@ -280,9 +280,17 @@ function resp = handle_ik_request(x, y, z, seed_rad, lockJoints)
         lockDrift = max(lockDrift, abs(bestSol(motorIdx(k)) - seed0(motorIdx(k))));
     end
 
+    % server_build makes STALENESS VISIBLE. A MATLAB server keeps running the
+    % code it was started with, and nothing at the protocol level distinguishes
+    % that from a current one -- which cost two rounds of "restart it and try
+    % again" where the operator had restarted and the diagnosis was simply
+    % wrong. Bump this string with any behavioural change to this file; the
+    % Python side compares it against SERVER_BUILD in matlab_client.py and says
+    % so when they differ.
     resp = struct('ok', true, 'angles_rad', ik_angles(1:5), ...
                   'err_mm', 1000*bestErr, 'move_rad', bestMove, ...
-                  'lock_drift_rad', lockDrift);
+                  'lock_drift_rad', lockDrift, ...
+                  'server_build', '2026-08-06-lockrelease');
 end
 
 function restore_joint_limits(restore)

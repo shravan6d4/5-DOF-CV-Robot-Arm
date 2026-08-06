@@ -47,6 +47,13 @@ class MatlabIKClient:
     # the image (the failure being guarded against was 8 degrees of wrist roll).
     LOCK_DRIFT_WARN_RAD = 0.0087
 
+    # What ik_fk_server.m reports when it is running the same code as this repo.
+    # A MATLAB server keeps executing whatever it was started with, and nothing
+    # else at the protocol level tells you so -- which cost two rounds of
+    # "restart it and try again" against a server that HAD been restarted.
+    # Bump both this and the string in ik_fk_server.m together.
+    SERVER_BUILD = "2026-08-06-lockrelease"
+
     def __init__(self, host: str = "localhost", port: int = 9999):
         """Connect to the MATLAB server.
 

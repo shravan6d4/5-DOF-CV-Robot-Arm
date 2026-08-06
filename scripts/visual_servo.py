@@ -504,10 +504,68 @@ class CartesianActuator:
 
             targets = {j: ctx.bus.rad_to_ticks(j, a)
                        for j, a in zip(IK_JOINTS, solution)}
+
+            # ENFORCE THE LOCK HERE, not only by asking MATLAB nicely.
+            #
+            # The server's `lock` had no effect at all: with lock=[5], lock=[1]
+            # and lock=[1,5] the returned solution was byte-identical, J1+64.5
+            # and J5+33.7 ticks in every case (measured 2026-08-06, reproduce
+            # with scripts/check_ik_lock.py). Three separate attempts to fix it
+            # inside rigidBodyJoint.PositionLimits failed, so the request is now
+            # belt-and-braces and this is the brace: a locked joint is simply
+            # NOT COMMANDED, whatever the solver returned.
+            #
+            # The tool therefore does not land exactly on the requested point,
+            # and that is fine HERE in a way it would not be in an open-loop
+            # move: this module measures the pixel response of whatever the arm
+            # actually did and derives its gain from that. An unrequested joint
+            # motion is not a small error to be tolerated, it is a disturbance
+            # to the very image the loop reads -- the camera is on the wrist --
+            # so dropping it is strictly better than executing it, even at the
+            # cost of a less accurate nudge.
+            held = set(self.locked_joints(ctx))
+            dropped = {}
+            if held:
+                current = {j: ctx.bus.rad_to_ticks(j, a)
+                           for j, a in zip(IK_JOINTS, angles)}
+                dropped = {j: targets[j] - current[j]
+                           for j in held if abs(targets[j] - current[j]) > 2}
+                for j in held:
+                    targets[j] = current[j]
+                if dropped:
+                    print(f"      held {sorted(held)}: dropped "
+                          + ", ".join(f"J{j}{d:+d}" for j, d in sorted(dropped.items()))
+                          + " ticks the solver wanted but was told not to spend")
+
             moved = {j: targets[j] - ctx.bus.rad_to_ticks(j, a)
                      for j, a in zip(IK_JOINTS, angles)}
             pan_deg = abs(moved[1]) / 651.89 * 180 / np.pi
             biggest = max(abs(d) for d in moved.values())
+
+            # HOLDING A JOINT CAN LEAVE NOTHING TO MOVE WITH. If the solver's
+            # whole answer was the joint we refused to spend, dropping it turns
+            # the nudge into a no-op that still returns amount_mm -- and the
+            # probe would then divide a pixel shift by a move that never
+            # happened, manufacturing a gain out of detection noise. Shrinking
+            # cannot rescue it either: a smaller request needs even less of the
+            # joints that remain free.
+            # `dropped` is the qualifier that matters: complain only when the
+            # lock actually took motion away and nothing was left. A solve that
+            # was already a no-op is a different situation (too small a request,
+            # or an axis with nothing to do) and is handled downstream.
+            if held and dropped and biggest < 2:
+                raise ServoAbort(
+                    f"A {self.direction} nudge here is only reachable through "
+                    f"joint(s) {sorted(held)}, which this axis holds. Dropping "
+                    f"them leaves no motion at all, so the axis cannot act from "
+                    f"this posture.\n"
+                    f"      J5 is the wrist ROLL and J1 is base yaw: neither "
+                    f"changes how far the arm reaches, so needing them for a "
+                    f"radial move means the shoulder/elbow chain is against its "
+                    f"limits or the tool is on the base axis.\n"
+                    f"      Re-run with --no-lock-null to allow it (accepting "
+                    f"that the camera will move), or --recentre joint."
+                )
 
             if (pan_deg <= config.SERVO_VISUAL_MAX_PAN_DEG
                     and biggest <= config.SERVO_VISUAL_MAX_SOLVE_TICKS):

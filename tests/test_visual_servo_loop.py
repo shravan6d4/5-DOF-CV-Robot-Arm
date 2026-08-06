@@ -397,9 +397,63 @@ def test_a_solve_that_swings_the_base_is_refused_not_executed():
     ctx = vs.Context(bus, FakeCamera(world), FakeDetector(world), args, None,
                      ik=YawingIK(bus))
 
+    # TANGENTIAL, because that is the axis where J1 is legitimately free: a
+    # radial nudge now HOLDS J1 (base yaw cannot change reach), so the pan guard
+    # has nothing left to catch there. The guard still matters here, where
+    # swinging the base is the intended action and can still overshoot.
     with pytest.raises(vs.ServoAbort, match="poorly conditioned"):
-        vs.CartesianActuator("radial").apply(ctx, 10.0)
+        vs.CartesianActuator("tangential").apply(ctx, 10.0)
     assert bus.stepped == [], "nothing should have been commanded"
+
+
+def test_a_radial_nudge_reachable_only_through_a_held_joint_is_refused():
+    """The failure mode holding a joint introduces. If the solver's whole answer
+    was the joint we refuse to spend, dropping it leaves NO motion -- and
+    returning the requested amount for a move that never happened would have the
+    probe divide a pixel shift by zero travel and invent a gain from noise."""
+    class OnlyYawIK(FakeIK):
+        def request_ik(self, x, y, z, seed_rad=None, lock=None):
+            super().request_ik(x, y, z, seed_rad, lock)
+            return [self.bus.ticks[1] + 40, self.bus.ticks[2],
+                    self.bus.ticks[3], self.bus.ticks[4], self.bus.ticks[5]], 0.0
+
+    bus = CartesianBus()
+    world = FakeWorld(bus)
+    args = Namespace(settle=0.0, deadband=12.0, view=False, max_iterations=10)
+    ctx = vs.Context(bus, FakeCamera(world), FakeDetector(world), args, None,
+                     ik=OnlyYawIK(bus))
+
+    with pytest.raises(vs.ServoAbort, match="cannot act"):
+        vs.CartesianActuator("radial").apply(ctx, 10.0)
+    assert bus.stepped == [], "a no-op must not be commanded or reported as a move"
+
+
+def test_a_held_joint_is_not_commanded_even_when_the_solver_asks_for_it():
+    """The brace behind the server's `lock`, which had no effect whatsoever:
+    with lock=[5], [1] and [1,5] the returned solution was identical every time.
+    Whatever the solver says, a held joint keeps its current tick."""
+    class GreedyIK(FakeIK):
+        def request_ik(self, x, y, z, seed_rad=None, lock=None):
+            super().request_ik(x, y, z, seed_rad, lock)
+            # +20 not -20: CartesianBus refuses J2 below its travel limit, and
+            # this test is about the LOCK, not about the limit guard.
+            return [self.bus.ticks[1] + 30, self.bus.ticks[2] + 20,
+                    self.bus.ticks[3], self.bus.ticks[4],
+                    self.bus.ticks[5] + 90], 0.0
+
+    bus = CartesianBus()
+    world = FakeWorld(bus)
+    args = Namespace(settle=0.0, deadband=12.0, view=False, max_iterations=10)
+    ctx = vs.Context(bus, FakeCamera(world), FakeDetector(world), args, None,
+                     ik=GreedyIK(bus))
+    before = dict(bus.ticks)
+
+    vs.CartesianActuator("radial").apply(ctx, 10.0)
+
+    commanded = bus.stepped[-1]          # CartesianBus records the target dict
+    assert commanded[1] == before[1], "J1 was held and must not have been commanded"
+    assert commanded[5] == before[5], "J5 was held and must not have been commanded"
+    assert commanded[2] != before[2], "the free joints must still do the work"
 
 
 def test_a_branch_flipping_solve_is_refused():
