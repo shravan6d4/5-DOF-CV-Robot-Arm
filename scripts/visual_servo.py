@@ -858,7 +858,16 @@ def two_view_survey(ctx):
             return
         print(f"    -> {label}")
         offset += actuator.apply(ctx, delta)
-        wait_watching(max(ctx.args.settle, 0.3), ctx, [f"two-view: {label}"])
+        # STAND STILL LONGER HERE THAN ANYWHERE ELSE IN THE RUN. A 7.5 deg base
+        # swing at 205 mm of reach leaves the forearm ringing after the servo
+        # reports it has arrived, and the camera is bolted to the wrist, so what
+        # shakes is the picture. A centring step that reads a blurred frame
+        # corrects itself next iteration; a survey pose that reads one either
+        # misses the brick or hands triangulation a centroid from a camera that
+        # was not where FK says it was, and there is no next iteration.
+        settle_s = max(ctx.args.settle, config.SERVO_VISUAL_TWO_VIEW_SETTLE_S)
+        print(f"       settling {settle_s:.1f} s")
+        wait_watching(settle_s, ctx, [f"two-view: {label}", "settling"])
 
     def capture(label):
         detection, frame = detect_brick(ctx)

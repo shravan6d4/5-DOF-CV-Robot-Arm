@@ -2495,3 +2495,36 @@ def test_the_two_views_end_up_double_the_baseline_apart():
         "if a single move of the full baseline fits the budget, the symmetry "
         "is buying nothing and this test is the wrong shape")
     assert both > 2 * config.TWO_VIEW_MIN_PARALLAX_DEG
+
+
+def test_each_survey_pose_settles_longer_than_an_ordinary_step():
+    """The arm has to stop RINGING, not just stop travelling. A centring step
+    that reads a blurred frame corrects itself next iteration; a survey pose
+    that reads one hands triangulation a centroid from a camera that was not
+    where FK says it was, and there is no next iteration."""
+    src = _source_of(vs.two_view_survey)
+    assert "SERVO_VISUAL_TWO_VIEW_SETTLE_S" in src
+    assert "max(ctx.args.settle" in src, (
+        "the survey settle must be a FLOOR against --settle, not a replacement "
+        "-- raising --settle for a shaky rig should raise this too")
+    assert config.SERVO_VISUAL_TWO_VIEW_SETTLE_S >= 1.0
+
+
+def test_the_survey_settles_at_every_pose_including_the_returns():
+    """Four moves, four settles. The returns matter too: view 2 is taken right
+    after coming back through centre and swinging out again."""
+    ctx, _bus = _survey_ctx()
+    waits = []
+    real_wait = vs.wait_watching
+    real_apply = vs.CartesianActuator.apply
+
+    vs.wait_watching = lambda s, c, lines=None: waits.append(s)
+    vs.CartesianActuator.apply = lambda self, c, mm: mm
+    try:
+        vs.two_view_survey(ctx)
+    finally:
+        vs.wait_watching = real_wait
+        vs.CartesianActuator.apply = real_apply
+
+    assert len(waits) == 4, f"expected a settle per move, got {waits}"
+    assert all(w >= config.SERVO_VISUAL_TWO_VIEW_SETTLE_S for w in waits)

@@ -1014,6 +1014,25 @@ SERVO_VISUAL_BLIND_DROP_MAX_MM = 60.0
 # Measured 2026-08-07: a 24 mm tangential nudge came back as J1 +85 ticks,
 # 7.47 deg of camera pan, and moved the brick 165 px across the frame.
 SERVO_VISUAL_TWO_VIEW_BASELINE_MM = 24.0
+#
+# How long to stand still at each survey pose before looking.
+#
+# LONGER THAN THE LOOP'S ORDINARY SETTLE, and for a different reason. Elsewhere
+# the settle exists so the arm has stopped travelling; here the arm also has to
+# have stopped RINGING. A 7.5 deg base swing at 205 mm of reach leaves the whole
+# forearm oscillating for a moment after the servo reports it has arrived, and
+# the camera is bolted to the wrist, so it is the picture that shakes.
+#
+# That matters more here than anywhere else in the run. A centring step that
+# reads a blurred frame gets a slightly wrong pixel and corrects it next
+# iteration; a survey pose that reads one either misses the brick outright or
+# feeds triangulation a centroid from a camera that was not where FK says it
+# was -- and triangulation has no next iteration to fix it in.
+#
+# Set to 1.0 s at the operator's request 2026-08-07, after watching the survey
+# fail to detect at both poses. Taken as a FLOOR against --settle, not a
+# replacement, so raising --settle for a shaky rig still raises this too.
+SERVO_VISUAL_TWO_VIEW_SETTLE_S = 1.0
 
 # Sideways companion to AIM_OFFSET_Y, and the same kind of quantity: the claw
 # does not sit under the pixel the camera calls centre, so the aim point is the

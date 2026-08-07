@@ -15,3 +15,7 @@ pyserial>=3.5
 
 # Arm observation/jog web dashboard (scripts/run_arm_ui.py, webui/).
 flask>=3.0
+
+# Camera + terminal dashboard (scripts/run_dashboard.py) -- real ConPTY shell
+# in the browser via winpty. Windows-only.
+pywinpty>=2.0; sys_platform == "win32"
