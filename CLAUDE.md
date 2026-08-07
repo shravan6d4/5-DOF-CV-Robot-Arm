@@ -818,7 +818,17 @@ Sideways error still goes through a J1 jog on purpose: J1 is base yaw, it cannot
 
 **Servo speed is capped in software, not by the servos.** `config.SERVO_MOVE_SPEED_TICKS_S` / `SERVO_MOVE_ACCEL` are written via `ServoBus.set_motion_profile`; without them every move runs at the servo's full default speed, which ends each step in a hard stop and puts peak torque far above what the pose needs statically. They live in the servo's SRAM, so they reset on every power cycle and must be re-applied per run — `goto_point.py` does this at startup and prints the limit.
 
-**Speed and pacing are ONE setting.** `SERVO_MOVE_SPEED_TICKS_S` caps how fast a single hop runs; `PICK_STEP_PAUSE_S` is the rest between hops. On 2026-08-07 the pause was halved (0.5 → 0.25 s) at the operator's request — a long paced move was mostly dead time — and the speed dropped with it (200 → 160), so a 60-tick hop goes from 0.30 + 0.50 s to 0.375 + 0.25 s: **×1.28 overall, with the stops cut in half.** Shortening the pause alone would have been ×1.6. The pause is not idle time, it is the window in which a wrong move gets caught by hand, and slowing the hop buys part of that window back in a better form — during a pause the arm is already wherever the bad command put it, whereas during travel it is still on its way and a freeze still helps.
+**Speed and pacing are ONE setting, and it was walked up twice on 2026-08-07** at the operator's request. `SERVO_MOVE_SPEED_TICKS_S` caps how fast a single hop runs; `PICK_STEP_TICKS` bounds how far one goes; `PICK_STEP_PAUSE_S` is the rest between them.
+
+| ticks/hop | speed | pause | travel + pause | effective | deg/hop | |
+|---|---|---|---|---|---|---|
+| 60 | 200 | 0.50 s | 0.300 + 0.50 | 75 t/s | 5.3 | original |
+| 60 | 160 | 0.25 s | 0.375 + 0.25 | 96 t/s | 5.3 | ×1.28 |
+| **90** | **160** | **0.15 s** | 0.562 + 0.15 | **126 t/s** | **7.9** | ×1.68 |
+
+**What is being spent:** the pause is the window in which a wrong move gets caught by hand, and the hop size bounds how far a wrong move gets before the next such window. At 0.15 s the pauses are no longer a meaningful stopping opportunity — what still protects the arm is the per-hop travel-limit check (unchanged, now checked 1.5× less often per unit of travel), the Cartesian floor guard, and Ctrl-C, which freezes mid-hop.
+
+**`SERVO_MOVE_SPEED_TICKS_S` deliberately stayed at 160 through both changes.** It is the one number bounding how fast the arm is actually MOVING rather than how often it stops, and raising it is the change that would make a wrong move genuinely hard to react to. Take further speed from the pause before the speed.
 
 ## Tuning is centralized in config.py
 

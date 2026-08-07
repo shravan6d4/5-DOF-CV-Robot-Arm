@@ -621,24 +621,29 @@ SERVO_MOVE_ACCEL = 10
 # the arm and overloaded J3 (2026-08-04): the pause is what makes a wrong move
 # stoppable by hand. Distinct from SERVO_MOVE_SPEED_TICKS_S, which caps how fast
 # a single hop runs -- these cap how far it goes and how long the arm rests.
-PICK_STEP_TICKS = 60           # ~5.3 deg per hop on J1-J5
+PICK_STEP_TICKS = 90           # ~7.9 deg per hop on J1-J5
 #
-# HALVED 0.5 -> 0.25 on 2026-08-07 at the operator's request: the arm spent most
-# of a paced move standing still, and a long run of hops is mostly dead time.
-# SERVO_MOVE_SPEED_TICKS_S dropped 200 -> 160 in the same change, so the arm
-# ends up only a little quicker overall while the STOPS get much shorter:
+# WALKED UP TWICE ON 2026-08-07, both times at the operator's request, and the
+# whole history is here because the trend matters more than any one value:
 #
-#     per 60-tick hop     travel      pause      total     effective
-#     before              0.30 s      0.50 s     0.80 s    75 ticks/s
-#     after               0.375 s     0.25 s     0.625 s   96 ticks/s   (x1.28)
+#     ticks/hop   speed   pause     travel + pause    effective   deg/hop
+#      60          200    0.50 s    0.300 + 0.50      75 t/s       5.3     original
+#      60          160    0.25 s    0.375 + 0.25      96 t/s       5.3     x1.28
+#      90          160    0.15 s    0.562 + 0.15     126 t/s       7.9     x1.68
 #
-# The two are one setting and should be changed together. Shortening the pause
-# alone would have made it x1.6, and the pause is not idle time -- it is the
-# window in which a wrong move can be caught by hand. Slowing the hop itself
-# buys back part of that window in a better form: during a pause the arm is
-# already where the bad command put it, whereas during the travel it is still
-# on its way there and a freeze still helps.
-PICK_STEP_PAUSE_S = 0.25
+# WHAT IS BEING SPENT. The pause is not idle time -- it is the window in which a
+# wrong move gets caught by hand, and the hop size bounds how far a wrong move
+# gets before the next such window. At 0.15 s the pauses are no longer a
+# meaningful stopping opportunity; what still protects the arm is the per-hop
+# travel-limit check (unchanged, and now checked 1.5x less often per unit of
+# travel), the floor guard, and Ctrl-C, which freezes mid-hop.
+#
+# SERVO_MOVE_SPEED_TICKS_S deliberately stayed at 160 through both changes. It
+# is the one number that bounds how fast the arm is actually MOVING, as opposed
+# to how often it stops, and raising it is the change that would make a wrong
+# move genuinely hard to react to. If the arm needs to be quicker again, take it
+# from the pause before the speed.
+PICK_STEP_PAUSE_S = 0.15
 
 # --- Gripper (J6) -----------------------------------------------------------
 #
