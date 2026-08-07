@@ -792,17 +792,27 @@ SERVO_VISUAL_TOLERANCE_Y_PX = 55
 # frame centre pushed by the camera-to-claw offset. Y covers the "camera is
 # above and behind" part; this covers the sideways part.
 #
-# Set 2026-08-07 at the operator's request, from watching a run: TWO box lengths
-# LEFT of the detection (-90 after the first look, -180 after the second).
+# Set 2026-08-07 at the operator's request, from watching runs: THREE box
+# lengths LEFT of the detection, walked out one at a time (-90, -180, -270).
 # TOLERANCE_X is a HALF-width, so the box is 90 px across and one box length is
 # 90 px, negative being left in image coordinates. Written as a plain pixel
 # count rather than derived from TOLERANCE_X, so that widening the acceptance
 # box later does not silently move the aim point with it -- those are two
 # separate decisions and coupling them would hide one inside the other.
 #
-# Room left: the box spans x 95-185 of 640, so it is comfortably on screen and
-# report_aim_reachability stays quiet. It would start clipping at -275.
-SERVO_VISUAL_AIM_OFFSET_X_PX = -180
+# THIS IS THE LAST FULL BOX LENGTH AVAILABLE. The box now spans x 5-95 of 640,
+# five pixels off the left edge; -275 clips it and report_aim_reachability will
+# say so. A fourth step is not available at this tolerance, and shrinking
+# TOLERANCE_X to buy room would be the wrong trade -- it tightens the acceptance
+# test below what the joints can resolve (~30 px, see SERVO_VISUAL_MIN_STEP_TICKS).
+#
+# And note what 270 px means: 42% of the frame width, for what is nominally the
+# sideways camera-to-claw offset. That is large for a lens sitting next to the
+# claw. If a further step is ever wanted, suspect the cause rather than the
+# number -- a rotated camera mount, or the sideways axis carrying a scale error
+# -- because at some point this stops being an offset and starts being a lever
+# arm that no fixed pixel count can describe.
+SERVO_VISUAL_AIM_OFFSET_X_PX = -270
 
 # --- Hand-eye: the acceptance test, and why capture geometry decides it ------
 #
