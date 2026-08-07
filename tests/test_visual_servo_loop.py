@@ -2507,12 +2507,16 @@ def test_each_survey_pose_settles_longer_than_an_ordinary_step():
     assert "max(ctx.args.settle" in src, (
         "the survey settle must be a FLOOR against --settle, not a replacement "
         "-- raising --settle for a shaky rig should raise this too")
-    assert config.SERVO_VISUAL_TWO_VIEW_SETTLE_S >= 1.0
+    assert config.SERVO_VISUAL_TWO_VIEW_SETTLE_S >= 2.0
 
 
 def test_the_survey_settles_at_every_pose_including_the_returns():
-    """Four moves, four settles. The returns matter too: view 2 is taken right
-    after coming back through centre and swinging out again."""
+    """Four moves, four settles, and the CENTRE stops count.
+
+    They are where the next swing starts, so an arm still ringing when it leaves
+    centre is an arm still ringing when it arrives at the pose being
+    photographed. Settling only where the shutter fires moves the problem one
+    move upstream rather than fixing it."""
     ctx, _bus = _survey_ctx()
     waits = []
     real_wait = vs.wait_watching

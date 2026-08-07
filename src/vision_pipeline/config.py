@@ -1046,10 +1046,23 @@ SERVO_VISUAL_TWO_VIEW_BASELINE_MM = 24.0
 # feeds triangulation a centroid from a camera that was not where FK says it
 # was -- and triangulation has no next iteration to fix it in.
 #
-# Set to 1.0 s at the operator's request 2026-08-07, after watching the survey
-# fail to detect at both poses. Taken as a FLOOR against --settle, not a
-# replacement, so raising --settle for a shaky rig still raises this too.
-SERVO_VISUAL_TWO_VIEW_SETTLE_S = 1.0
+# Set to 1.0 s at the operator's request 2026-08-07 after watching the survey
+# fail to detect at both poses, then to 2.0 the same day because 1.0 was still
+# not enough. Taken as a FLOOR against --settle, not a replacement, so raising
+# --settle for a shaky rig still raises this too.
+#
+# APPLIED AT ALL FOUR SURVEY POSITIONS, the two outer poses AND both returns to
+# centre -- not just the ones a picture is taken at. The centre stops are where
+# the NEXT swing starts, so an arm still ringing when it leaves centre is an arm
+# still ringing when it arrives at the pose being photographed. Settling only
+# where the shutter fires would move the problem one move upstream rather than
+# fixing it.
+#
+# The survey therefore costs ~8 s of standing still. That is the price of the
+# only measurement in the run that has no second chance: the descent re-reads
+# the brick every step and corrects, while triangulation gets two frames and is
+# scored on them.
+SERVO_VISUAL_TWO_VIEW_SETTLE_S = 2.0
 
 # Sideways companion to AIM_OFFSET_Y, and the same kind of quantity: the claw
 # does not sit under the pixel the camera calls centre, so the aim point is the
