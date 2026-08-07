@@ -49,6 +49,8 @@ class GripResult:
     outcome: str
     ticks: int              # where J6 ended up
     message: str
+    contact_ticks: int = -1     # where the jaws first met the object
+    commanded_past: int = 0     # goal error accumulated beyond contact
 
     @property
     def holding(self) -> bool:
@@ -119,6 +121,129 @@ def settled(bus, timeout_s: float = 3.0, sleep=None) -> int:
         if now() >= deadline:
             return current
         sleep(0.15)
+
+
+def open_fully(bus, say: Callable[[str], None], step: int = None,
+               settle=None) -> GripResult:
+    """Drive the claw to the fully-open position. No approval, no questions.
+
+    Run at the hover, before a descent: the claw has to be open before it can
+    close on anything, and a run that arrives at grasp height with the jaws
+    already shut has spent the whole descent unable to do the one thing it came
+    for. Doing it at the TOP is also the safe place -- the jaws swing open
+    ~490 ticks, and there is nothing near them up there.
+
+    Unconditionally safe to call: if the claw is already open this is a no-op.
+    """
+    return close_in_jogs(
+        bus, config.SERVO_GRIPPER_OPEN_TICKS,
+        config.SERVO_GRIPPER_JOG_TICKS if step is None else step,
+        lambda _prompt: True, say,
+        **({} if settle is None else {"settle": settle}))
+
+
+def auto_close(bus, say: Callable[[str], None], settle=None) -> "GripResult":
+    """Close on whatever is there, detecting contact from the motion itself.
+
+    NO APPROVALS. The claw is at grasp height with the brick between the jaws;
+    asking per jog was right while nobody had ever driven J6 and is now just
+    friction. What replaces the operator's eye is the servo's own position
+    read-back, which is a better sensor for this one question anyway.
+
+    TWO PHASES, and they are asking different things of the same measurement:
+
+      SEARCH -- close in SERVO_GRIPPER_AUTO_CLOSE_TICKS steps. Each step should
+        deliver its full travel while the jaws are moving through air. A step
+        that delivers less than SERVO_GRIPPER_CONTACT_TICKS has met something.
+
+      FIRM UP -- from contact, squeeze in SERVO_GRIPPER_SQUEEZE_TICKS steps.
+        The first squeezes often still move a little as the jaws seat on the
+        brick and it settles between them; when SERVO_GRIPPER_FIRM_STEPS in a
+        row deliver almost nothing, the grip is loaded rather than merely
+        touching.
+
+    THE SEARCH FLOOR IS THE MEASURED GRIP POSITION, not the full-close stop.
+    Contact should happen at or before 3003 for the brick this was measured on,
+    so reaching it with the jaws still moving freely means there is nothing
+    between them -- and closing further on nothing is the case the operator
+    named as "it should never be this much". So that is reported as a MISS and
+    the claw stops there, rather than continuing to shut on air.
+
+    Returns a GripResult: GRIPPED with contact_ticks set, or REACHED for a miss.
+    """
+    from vision_pipeline.robot_interface.servo_driver import ServoSafetyError
+
+    if settle is None:
+        settle = settled
+
+    try:
+        current = bus.read_position(GRIPPER_JOINT)
+    except Exception as e:                                        # noqa: BLE001
+        return GripResult(FAILED, -1, f"could not read J6: {e}")
+
+    try:
+        bus.set_motion_profile([GRIPPER_JOINT], config.SERVO_MOVE_SPEED_TICKS_S,
+                               config.SERVO_MOVE_ACCEL)
+    except Exception:                                             # noqa: BLE001
+        say("    (could not set J6's speed profile; it will move at its default)")
+
+    floor = config.SERVO_GRIPPER_GRIP_TICKS
+    step = config.SERVO_GRIPPER_AUTO_CLOSE_TICKS
+    contact = None
+
+    say(f"    closing from {current} in {step}-tick steps; contact is a step "
+        f"that moves less than {config.SERVO_GRIPPER_CONTACT_TICKS}")
+
+    while contact is None and current > floor:
+        target = max(current - step, floor)
+        try:
+            bus.move_and_verify(GRIPPER_JOINT, target)
+        except ServoSafetyError as e:
+            return GripResult(REFUSED, current, f"refused by the servo bus: {e}")
+        except Exception as e:                                    # noqa: BLE001
+            return GripResult(FAILED, current, f"move failed: {e}")
+
+        arrived = settle(bus)
+        moved = abs(arrived - current)
+        asked = current - target
+        current = arrived
+
+        if moved < min(config.SERVO_GRIPPER_CONTACT_TICKS, asked):
+            contact = current
+            say(f"    {current}: asked {asked}, moved {moved} -- CONTACT")
+        else:
+            say(f"    {current}: asked {asked}, moved {moved}")
+
+    if contact is None:
+        return GripResult(
+            REACHED, current,
+            f"closed to {current} ({describe(current)}) without meeting "
+            f"anything. The jaws are shutting on AIR -- the claw is not where "
+            f"the brick is. Not closing further: past here is the full-close "
+            f"stop, which is not a position to drive to with nothing in the "
+            f"jaws.")
+
+    # FIRM UP.
+    past = 0
+    quiet = 0
+    while quiet < config.SERVO_GRIPPER_FIRM_STEPS:
+        squeeze = squeeze_once(bus, contact, past,
+                               config.SERVO_GRIPPER_SQUEEZE_TICKS, settle=settle)
+        past = squeeze.commanded_past
+        if squeeze.refused:
+            say(f"    {squeeze.message}")
+            break
+        say(f"    {squeeze.message}")
+        quiet = quiet + 1 if abs(squeeze.moved) < STALL_TICKS else 0
+
+    final = bus.read_position(GRIPPER_JOINT)
+    result = GripResult(
+        GRIPPED, final,
+        f"GRIPPED. Met the brick at {contact}, then loaded onto it for "
+        f"{past} ticks; J6 is holding at {final} ({describe(final)}).")
+    result.contact_ticks = contact
+    result.commanded_past = past
+    return result
 
 
 @dataclass

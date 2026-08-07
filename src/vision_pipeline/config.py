@@ -697,6 +697,30 @@ SERVO_GRIPPER_SQUEEZE_TICKS = 20
 # of commanded error, well past what a Lego brick needs and well short of the
 # ~271 ticks between the grip position and the jaws touching.
 SERVO_GRIPPER_MAX_SQUEEZE_TICKS = 120
+#
+# --- closing automatically, with the servo as its own contact sensor ---------
+#
+# The claw is at grasp height with the brick between the jaws, so asking the
+# operator per jog is friction rather than safety. What replaces their eye is
+# the servo's position read-back, which is a better sensor for this one question
+# anyway: a step that does not deliver its travel has met something.
+#
+# Step size for the SEARCH phase, while the jaws are still moving through air.
+# Smaller than the manual jog because nothing is confirming it, and because the
+# resolution of "where did contact happen" is exactly this number.
+SERVO_GRIPPER_AUTO_CLOSE_TICKS = 25
+#
+# A search step that delivers less than this has met something. Well above
+# ordinary servo settling (a couple of ticks), well below a full free step, so
+# there is no ambiguous band in between. Compared against min(step, this), so
+# the last, clamped step of a search cannot register as false contact.
+SERVO_GRIPPER_CONTACT_TICKS = 8
+#
+# How many consecutive near-zero squeezes mean the grip is LOADED rather than
+# merely touching. The first squeezes after contact often still move a little
+# as the jaws seat and the brick settles between them; two in a row that
+# deliver nothing is the servo holding position error, which is force.
+SERVO_GRIPPER_FIRM_STEPS = 2
 
 # Total servos on the bus: J1..J5 (arm) + J6 (gripper).
 NUM_JOINTS = 6

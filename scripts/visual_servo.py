@@ -679,102 +679,83 @@ def hover_residual(bus):
 
 
 def go_to_hover(ctx):
-    """Drive to the hover pose, then ASK whether to do it again. MOVES THE ARM.
+    """Drive to the hover pose and open the claw there. MOVES THE ARM.
 
-    THE AUTOMATIC MOVE IS NOT ALWAYS THE WHOLE MOVE, which is the reason for the
-    prompt. `poses.goto` walks every joint together in sub-cap hops and each hop
-    is re-checked against the travel limits, so a joint that is out of range --
+    ASKS NOTHING. The only two questions this script puts to the operator are
+    the go-ahead ('g') and the further-close prompt at the grip; everything
+    between them runs.
+
+    THE MOVE IS NOT ALWAYS THE WHOLE MOVE, which is why the residual is printed.
+    `poses.goto` walks every joint together in sub-cap hops and each hop is
+    re-checked against the travel limits, so a joint that is out of range --
     back-driven by a power cut, or left there by a descent that stalled -- gets
     refused part-way while the others arrive. The run then continues from a pose
-    that LOOKS like the hover in the log because the move was commanded, and is
-    not one. Re-running the move is what recovers it: the second attempt starts
-    from wherever the first got to, so it makes progress the first could not.
-
-    It is also the natural moment to reposition the brick. The hover swings the
-    camera somewhere the operator did not choose, and the go-ahead that follows
-    asks them to approve that view -- so the useful order is "look, adjust the
-    brick or the arm, hover again, then approve".
-
-    Repeating is bounded by the operator answering, not by a count: every
-    iteration is a fresh explicit yes, and the move itself is the same paced,
-    limit-checked, Ctrl-C-freezable one either way.
-
-    Skipped entirely under --no-wait, which is the flag that means "ask me
-    nothing", the same one that skips the go-ahead.
+    that LOOKS like the hover in the log, because the move was commanded, and is
+    not one. Naming the joint and its limits turns that from silent into
+    obvious, and the go-ahead immediately below is the moment to act on it.
     """
     bus = ctx.bus
-    attempt = 0
 
-    while True:
-        attempt += 1
-        already = poses.at_pose(bus, "hover")
+    if poses.at_pose(bus, "hover"):
+        print("\nAlready at the hover pose.")
+    else:
+        print("\n--- TO HOVER ---")
+        for line in poses.describe_move(bus, poses.HOVER):
+            print(line)
+        print("  This is where runs start: brick in view, same")
+        print("  geometry every time. --no-hover skips it.")
+        poses.goto(bus, "hover", label="hover",
+                   progress=live_progress(ctx, "to hover")
+                   or (lambda k, n: print(f"    hop {k}/{n}", flush=True)))
+        wait_watching(max(ctx.args.settle, 0.4), ctx, ["at hover"])
 
-        if already:
-            print("\nAlready at the hover pose." if attempt == 1
-                  else "\n  Already at the hover pose; nothing to command.")
-        else:
-            print("\n--- TO HOVER ---" if attempt == 1
-                  else f"\n--- TO HOVER (attempt {attempt}) ---")
-            for line in poses.describe_move(bus, poses.HOVER):
-                print(line)
-            if attempt == 1:
-                print("  This is where runs start: brick in view, same")
-                print("  geometry every time. --no-hover skips it.")
-            poses.goto(bus, "hover", label="hover",
-                       progress=live_progress(ctx, "to hover")
-                       or (lambda k, n: print(f"    hop {k}/{n}", flush=True)))
-            wait_watching(max(ctx.args.settle, 0.4), ctx, ["at hover"])
+    residual = hover_residual(bus)
+    short = [(j, landed, want, d) for j, landed, want, d in residual
+             if abs(d) > config.SERVO_VISUAL_HOVER_TOLERANCE_TICKS]
+    print("\n  hover:  " + "   ".join(
+        f"J{j} {landed}" + (f" ({d:+d})" if abs(d) > 2 else "")
+        for j, landed, _want, d in residual))
+    if short:
+        print(f"  *** {len(short)} joint{'s' if len(short) > 1 else ''} did "
+              f"not arrive:")
+        for j, landed, want, d in short:
+            print(f"      J{j} is at {landed}, wanted {want} ({d:+d} ticks). "
+                  f"Limits {bus.travel_limits(j)}")
+        print("      The go-ahead below is the moment to fix it: re-run, or walk")
+        print("      the joint back with scripts/goto_tick.py from another")
+        print("      terminal. A joint against a stop or outside its recorded")
+        print("      range will not be moved by repeating this.")
 
-        residual = hover_residual(bus)
-        short = [(j, landed, want, d) for j, landed, want, d in residual
-                 if abs(d) > config.SERVO_VISUAL_HOVER_TOLERANCE_TICKS]
-        print("\n  hover:  " + "   ".join(
-            f"J{j} {landed}" + (f" ({d:+d})" if abs(d) > 2 else "")
-            for j, landed, _want, d in residual))
-        if short:
-            print(f"  *** {len(short)} joint{'s' if len(short) > 1 else ''} did "
-                  f"not arrive:")
-            for j, landed, want, d in short:
-                print(f"      J{j} is at {landed}, wanted {want} ({d:+d} ticks). "
-                      f"Limits {bus.travel_limits(j)}")
-            print("      Driving to hover again usually closes this -- the next")
-            print("      attempt starts from here, so it can make progress this")
-            print("      one could not. If it does not, the joint is against a")
-            print("      stop or outside its recorded range: scripts/goto_tick.py")
-
-        if ctx.args.no_wait:
-            return
-        try:
-            again = input("\n  Drive to hover again? [y/N] ").strip().lower()
-        except (EOFError, KeyboardInterrupt):
-            print()
-            return
-        if again not in ("y", "yes"):
-            return
+    # OPEN THE CLAW HERE, AT THE TOP. The jaws swing ~490 ticks and there is
+    # nothing near them at the hover; doing it at grasp height would sweep them
+    # open a few millimetres above the table, next to the brick they are meant
+    # to close on. A run that arrives at the bottom with the claw already shut
+    # has also spent the whole descent unable to do the one thing it came for.
+    if not getattr(ctx.args, "no_grasp", False):
+        print("\n  Opening the claw (there is room for it here, and none at the "
+              "bottom).")
+        opened = gripper.open_fully(bus, lambda line: print(f"    {line}"))
+        print(f"    J6 at {opened.ticks} ({gripper.describe(opened.ticks)})")
 
 
 def offer_grasp(ctx):
-    """Offer to close the claw, now that the descent has put it in place.
+    """Close the claw automatically, now that the descent has put it in place.
 
-    THE ONE THING THE RUN EXISTED TO DO, and until now it stopped one step
-    short: a descent that ends with the claw at grasp height and nothing in the
-    jaws has done all the work and none of the point. The operator then had to
-    start a second script, by which time the brick has usually been nudged.
+    THE ONE THING THE RUN EXISTED TO DO. A descent that ends with the claw at
+    grasp height and nothing in the jaws has done all the work and none of the
+    point, and starting a second script to finish it means the brick has usually
+    been nudged by the time it runs.
 
-    Still an explicit, separate act, and asked rather than assumed. The claw is
-    at grasp height because FK says so, and FK's ABSOLUTE height on this arm is
-    the number least worth trusting -- the operator can see whether the jaws are
-    actually around the brick, and this function's whole job is to ask them.
-
-    Every jog inside is approved separately too (robot_interface.gripper). That
-    is not belt-and-braces: the gripper is the only joint whose job is to STALL,
-    and where it stalls depends on where the brick really is, which is precisely
-    what the vision chain is still bad at.
+    NO LONGER ASKS. It did while nobody had ever driven J6 on hardware; now that
+    the positions are measured, the operator's eye is replaced by a better
+    sensor for this one question -- the servo's own position read-back. A closing
+    step that does not deliver its travel has met something. See
+    gripper.auto_close for the two phases and where the search floor comes from.
 
     Returns the GripResult, or None if nothing was attempted.
     """
     if getattr(ctx.args, "no_grasp", False):
-        print("\n  --grasp is off; the claw was not touched.")
+        print("\n  --no-grasp: the claw was not touched.")
         return None
 
     try:
@@ -784,46 +765,21 @@ def offer_grasp(ctx):
         print("  Close it by hand, or with: python scripts/close_claw.py")
         return None
 
-    target = config.SERVO_GRIPPER_GRIP_TICKS
-    print(f"\n--- CLOSE THE CLAW? ---")
-    print(f"  J6 is at {current} ({gripper.describe(current)}); the grip position "
-          f"is {target}.")
-    if current <= target + gripper.STALL_TICKS:
+    print(f"\n--- CLOSING THE CLAW ---")
+    print(f"  J6 is at {current} ({gripper.describe(current)}).")
+    if current <= config.SERVO_GRIPPER_GRIP_TICKS + gripper.STALL_TICKS:
         print("  It is already at or past the grip position, so there is nothing")
-        print("  to close. Open it first: python scripts/close_claw.py --open")
-        return None
-    print(f"  {config.SERVO_GRIPPER_JOG_TICKS} ticks per jog, each one approved "
-          f"separately. It stops by itself")
-    print(f"  when the jaws meet the brick -- that is the wanted outcome, not a "
-          f"fault.")
-    print(f"  Saying no here leaves the arm exactly where it is; you can still run")
-    print(f"  scripts/close_claw.py afterwards.")
-
-    try:
-        if input("\n  Close the claw now? [y/N] ").strip().lower() not in ("y", "yes"):
-            print("  Not closing. The arm is holding at grasp height.")
-            return None
-    except (EOFError, KeyboardInterrupt):
-        print("\n  Not closing. The arm is holding at grasp height.")
+        print("  to close on. The hover should have opened it -- either --no-grasp")
+        print("  was set on the way in, or the open was refused. Open it with:")
+        print("      python scripts/close_claw.py --open")
         return None
 
-    def approve(prompt):
-        try:
-            return input(prompt).strip().lower() in ("", "y", "yes")
-        except (EOFError, KeyboardInterrupt):
-            print()
-            return False
-
-    print()
-    result = gripper.close_in_jogs(ctx.bus, target,
-                                   config.SERVO_GRIPPER_JOG_TICKS, approve, print)
+    result = gripper.auto_close(ctx.bus, lambda line: print(line))
     print(f"\n  {result.message}")
     if result.holding:
         squeeze_and_lift(ctx, result)
     elif result.outcome == gripper.REACHED:
-        print("  It met nothing on the way, so the jaws shut on air. The claw is")
-        print("  not where the brick is -- and the last-seen pixel error above")
-        print("  says in which direction.")
+        print("  The last-seen pixel error above says in which direction.")
     return result
 
 
@@ -845,13 +801,14 @@ def squeeze_and_lift(ctx, grip):
     there cannot open the claw -- the grip survives the lift.
     """
     bus = ctx.bus
-    contact = grip.ticks
-    past = 0
+    contact = grip.contact_ticks if grip.contact_ticks > 0 else grip.ticks
+    past = grip.commanded_past
     step = config.SERVO_GRIPPER_SQUEEZE_TICKS
 
-    print(f"\n  --- GRIP: squeeze or lift? ---")
-    print(f"    The claw stopped at {contact} because it MET the brick. That is")
-    print(f"    where the jaws touch, which is not necessarily where they hold.")
+    print(f"\n  --- GRIP: squeeze more, or lift? ---")
+    print(f"    Met the brick at {contact} and loaded onto it for {past} ticks.")
+    print(f"    That is a firm grip by the servo's own reading, but only the")
+    print(f"    operator can see whether it is firm enough for THIS brick.")
     print(f"    Enter   squeeze {step} ticks further (repeat as often as you like)")
     print(f"    k       accept this grip and drive to the hover pose")
     print(f"    n       leave it exactly here and stop")
@@ -1183,19 +1140,24 @@ def centre(ctx, estimates, label="CENTRING"):
 
 
 def confirm_descend(ctx):
-    """Hold after centring until the operator says to go down.
+    """Report that centring is done and go straight into the descent.
 
-    Deliberately a hard stop rather than a timeout or a flag. Centring is
-    reversible and happens well clear of the table; descending is the part that
-    can put the claw through the brick or into the tabletop, and it depends on
-    the joint calibration in a way centring does not — J5's dir_sign is still an
-    unconfirmed hypothesis. The operator has the arm in front of them and can
-    see whether the claw is genuinely over the brick, which is a judgement no
-    pixel count substitutes for.
+    THIS USED TO ASK, and stopping to ask was right when J5's dir_sign was an
+    unconfirmed hypothesis and no descent had ever reached a brick. Both have
+    since been settled -- all five dir_sign values are confirmed by physical jog,
+    and the run now validates its aim box before every descent step rather than
+    once, up front, on the operator's eye.
+
+    What is left is the announcement, which still earns its place: it names the
+    moment the run stops being reversible. Centring happens well clear of the
+    table and can be undone; the descent puts the claw next to it. Ctrl-C
+    freezes at any point.
+
+    Kept as a function returning True rather than deleted, so the one caller
+    keeps its shape and re-introducing a gate here means editing one place.
     """
     print("\n" + "-" * 68)
-    print("  CENTRED. Look at the arm: is the claw over the brick?")
-    print("  Nothing will descend until you say so.")
+    print("  CENTRED — descending. Ctrl-C freezes the arm without dropping it.")
     print("-" * 68)
     if ctx.view:
         try:
@@ -1207,14 +1169,7 @@ def confirm_descend(ctx):
                  dets[0].centroid_px if dets else None, ctx, ctx.detectors)
         except ViewAborted:
             return False
-    try:
-        answer = input("  Descend onto the brick? [y/N] ").strip().lower()
-    except EOFError:
-        return False
-    if answer in ("y", "yes"):
-        return True
-    print("  Not descending. The arm is holding where it is.")
-    return False
+    return True
 
 
 # --- phase 3: descend --------------------------------------------------------
@@ -1734,21 +1689,22 @@ def descend(ctx, estimates):
             print(f"    brick moved {ey2 - ey:+.0f} px vertically -> "
                   f"{model.describe()}")
 
-        # The ruler check, after the first step only. This is the J5 question,
-        # asked while the claw is still high enough for the answer to be safe.
-        if step_n == 1 and not ctx.args.no_confirm:
-            print("\n    *** MEASURE THE GAP UNDER THE CLAW NOW. ***")
-            print(f"    It should have shrunk by about {abs(dz_mm):.0f} mm.")
-            print("    If it barely changed, or moved the wrong way, the joint")
-            print("    calibration is not describing reality — most likely J5,")
-            print("    whose dir_sign is still an unconfirmed hypothesis. Say no.")
-            if input("    Did the gap shrink as expected? [y/N] ").strip().lower() \
-                    not in ("y", "yes"):
-                print("\n    STOPPING. The arm is holding where it is.")
-                print("    Revert J5 to +1 in data/servo_calibration.json (the old")
-                print("    value is in servo_calibration.json.bak-20260804-preJ5flip)")
-                print("    and re-run, or settle it with scripts/jog_joint.py --joint 5.")
-                return False
+        # The first step's ruler check USED TO STOP AND ASK. It was the J5
+        # question, put while the claw was still high enough for a wrong answer
+        # to be safe -- and J5's dir_sign has since been confirmed by physical
+        # jog, along with the other four. The check itself is still worth
+        # printing: FK's own report of what it did is the cheapest cross-check
+        # there is, and it costs nothing to read.
+        #
+        # THE MEASUREMENT THAT REPLACED IT IS BETTER. The line below reports
+        # FK's commanded-versus-actual for every step, and the descent model is
+        # refitted from the brick's pixel response after each one -- so a
+        # calibration that does not describe reality shows up as a model that
+        # will not fit, on every step, rather than as one operator judgement
+        # about one 8 mm move.
+        if step_n == 1:
+            print(f"\n    (the gap under the claw should have shrunk by about "
+                  f"{abs(dz_mm):.0f} mm)")
 
         # SIDEWAYS. J1 is base yaw: it cannot change the tip's height, so it
         # cannot undo a descent step and has no business in the combined solve.

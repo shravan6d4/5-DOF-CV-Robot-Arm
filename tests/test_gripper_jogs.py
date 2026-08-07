@@ -295,3 +295,93 @@ def test_a_squeeze_that_still_finds_travel_reports_it_differently():
     assert not r.refused
     assert r.moved == -12
     assert "still finding the brick" in r.message
+
+
+# --- auto_close: the servo as its own contact sensor -------------------------
+#
+# The claw is at grasp height with the brick between the jaws, so asking per jog
+# is friction. What replaces the operator's eye is the position read-back: a
+# closing step that does not deliver its travel has met something.
+
+def _auto(bus):
+    return gripper.auto_close(bus, lambda _l: None, settle=lambda b: b.ticks)
+
+
+def test_auto_close_detects_contact_from_a_step_that_did_not_deliver():
+    bus = FakeGripperBus(stops_at=GRIP + 90)
+    r = _auto(bus)
+
+    assert r.outcome == gripper.GRIPPED
+    assert r.holding
+    assert r.contact_ticks == GRIP + 90
+
+
+def test_auto_close_loads_onto_the_brick_after_finding_it():
+    """Contact is where the jaws TOUCH. Smooth plastic falls out of that, so it
+    keeps commanding past contact -- which is what the servo turns into force."""
+    bus = FakeGripperBus(stops_at=GRIP + 90)
+    r = _auto(bus)
+
+    assert r.commanded_past > 0
+    assert r.commanded_past == (config.SERVO_GRIPPER_FIRM_STEPS
+                                * config.SERVO_GRIPPER_SQUEEZE_TICKS)
+
+
+def test_auto_close_stops_at_the_grip_position_when_the_jaws_meet_nothing():
+    """The miss case, and it must NOT continue to the full-close stop: closing
+    on nothing is what the operator said must never happen."""
+    bus = FakeGripperBus()
+    r = _auto(bus)
+
+    assert r.outcome == gripper.REACHED
+    assert not r.holding
+    assert bus.ticks == GRIP
+    assert min(bus.commanded) >= GRIP, "it drove past the search floor"
+    assert "shutting on AIR" in r.message
+
+
+def test_auto_close_asks_nothing():
+    """No approve callback in the signature at all -- the absence is the point,
+    not a default that could be overridden back."""
+    import inspect
+    assert "approve" not in inspect.signature(gripper.auto_close).parameters
+
+
+def test_the_last_clamped_search_step_is_not_read_as_contact():
+    """The step into the floor is short by construction. Comparing against
+    min(step, asked) is what stops that registering as a brick."""
+    start = GRIP + config.SERVO_GRIPPER_AUTO_CLOSE_TICKS + 2
+    bus = FakeGripperBus(start=start)
+    r = _auto(bus)
+
+    assert r.outcome == gripper.REACHED, (
+        "a 2-tick final step delivered 2 ticks and met nothing")
+
+
+def test_auto_close_sets_j6s_speed_profile():
+    bus = FakeGripperBus(stops_at=GRIP + 90)
+    _auto(bus)
+    assert bus.profiles and bus.profiles[0][0] == (gripper.GRIPPER_JOINT,)
+
+
+def test_auto_close_keeps_squeezing_while_the_brick_is_still_settling():
+    """The first squeezes often move a little as the jaws seat. Firmness is
+    SERVO_GRIPPER_FIRM_STEPS consecutive near-zero moves, not the first one."""
+    class Settling(FakeGripperBus):
+        def move_and_verify(self, servo_id, target):
+            self.commanded.append(target)
+            was = self.ticks
+            # Meets the brick, then yields 5 ticks on each of two squeezes.
+            if self.ticks > GRIP + 90:
+                self.ticks = max(target, GRIP + 90)
+            elif len([c for c in self.commanded if c < GRIP + 90]) <= 2:
+                self.ticks = self.ticks - 5
+            self.moves.append(self.ticks - was)
+            return self.ticks
+
+    bus = Settling(stops_at=None)
+    r = _auto(bus)
+    assert r.outcome == gripper.GRIPPED
+    assert r.commanded_past > (config.SERVO_GRIPPER_FIRM_STEPS
+                               * config.SERVO_GRIPPER_SQUEEZE_TICKS), (
+        "it stopped at the first quiet squeeze instead of requiring a run")

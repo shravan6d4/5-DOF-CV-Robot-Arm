@@ -1745,13 +1745,14 @@ def test_the_grasp_is_offered_only_when_the_descent_SUCCEEDED():
     assert guard < offer
 
 
-def test_the_offer_is_asked_for_never_assumed():
-    """The claw is at grasp height because FK says so, and FK's ABSOLUTE height
-    on this arm is the number least worth trusting. The operator can see whether
-    the jaws are around the brick; this function's job is to ask them."""
+def test_the_close_is_automatic_and_asks_nothing():
+    """It DID ask, and that was right while nobody had ever driven J6. Now that
+    the positions are measured, the operator's eye is replaced by a better
+    sensor for this one question: the servo's own position read-back."""
     src = _source_of(vs.offer_grasp)
-    assert "input(" in src
-    assert "no_grasp" in src, "there must be a way to suppress the question"
+    assert "input(" not in src
+    assert "gripper.auto_close" in src
+    assert "no_grasp" in src, "there must still be a way to skip it entirely"
 
 
 def test_the_offer_targets_the_measured_grip_position_not_the_full_close():
@@ -1762,32 +1763,49 @@ def test_the_offer_targets_the_measured_grip_position_not_the_full_close():
         "servo against it")
 
 
-def test_the_offer_and_close_claw_share_one_implementation():
+def test_the_descent_and_close_claw_share_one_gripper_implementation():
     """Two copies of a loop that decides when to stop pushing on a servo is one
-    copy too many."""
+    copy too many. They use different entry points -- close_claw is interactive
+    and per-jog, the descent is automatic -- but one module."""
     import close_claw
     assert "gripper.close_in_jogs" in _source_of(close_claw.main)
-    assert "gripper.close_in_jogs" in _source_of(vs.offer_grasp)
+    assert "gripper.auto_close" in _source_of(vs.offer_grasp)
+    assert "gripper.open_fully" in _source_of(vs.go_to_hover)
 
 
-# --- the hover is offered again after the automatic move ---------------------
+# --- the hover: automatic, and it opens the claw ------------------------------
 #
 # poses.goto walks every joint in sub-cap hops and re-checks the travel limits
 # per hop, so a joint that is out of range is refused part-way while the others
 # arrive. The run then continues from a pose that LOOKS like the hover in the
-# log -- the move was commanded -- and is not one.
+# log -- the move was commanded -- and is not one. It cannot ask about that any
+# more, so it must SAY it.
 
 class HoverBus(FakeBus):
-    """Reports hover ticks, except for joints listed in `stuck`."""
+    """Reports hover ticks, except for joints listed in `stuck`. Has a J6."""
 
-    def __init__(self, stuck=None):
+    def __init__(self, stuck=None, j6=3003):
         super().__init__(start=dict(config.SERVO_HOVER_TICKS))
         self.stuck = dict(stuck or {})
         self.ticks.update(self.stuck)
+        self.ticks[6] = j6
         self.gotos = 0
+        self.j6_commands = []
 
     def read_position_retrying(self, servo_id):
         return self.ticks[servo_id]
+
+    def read_position(self, servo_id):
+        return self.ticks[servo_id]
+
+    def set_motion_profile(self, ids, speed, accel):
+        pass
+
+    def move_and_verify(self, servo_id, target):
+        assert servo_id == 6, "only the gripper may be commanded here"
+        self.j6_commands.append(target)
+        self.ticks[6] = int(target)
+        return self.ticks[6]
 
     def travel_limits(self, servo_id):
         return (500, 3900)
@@ -1802,36 +1820,63 @@ class HoverBus(FakeBus):
                 self.ticks[j] = int(t)
 
 
-def _hover_ctx(bus, answers, no_wait=False):
+def _hover_ctx(bus, no_grasp=False):
     args = Namespace(settle=0.0, deadband=12.0, view=False, max_iterations=10,
-                     no_wait=no_wait)
+                     no_wait=False, no_grasp=no_grasp)
     ctx = vs.Context(bus, None, None, args, None, ik=None)
     ctx.bus = bus
     return ctx
 
 
-def test_the_operator_is_asked_to_hover_again_after_the_automatic_move(monkeypatch):
+def _no_input():
+    def explode(_p=""):
+        raise AssertionError("the hover must not prompt")
+    import builtins
+    return builtins, explode
+
+
+def test_the_hover_asks_nothing():
+    """Only two questions survive in this script: the go-ahead and the
+    further-close prompt at the grip."""
     bus = HoverBus(stuck={2: 3000})
-    replies = iter(["y", "n"])
-    monkeypatch.setattr("builtins.input", lambda _p="": next(replies))
-    vs.go_to_hover(_hover_ctx(bus, replies))
-
-    assert bus.gotos == 2, "answering yes must re-command the move"
-
-
-def test_declining_the_second_hover_returns_immediately(monkeypatch):
-    bus = HoverBus(stuck={2: 3000})
-    monkeypatch.setattr("builtins.input", lambda _p="": "n")
-    vs.go_to_hover(_hover_ctx(bus, None))
+    builtins, explode = _no_input()
+    real, builtins.input = builtins.input, explode
+    try:
+        vs.go_to_hover(_hover_ctx(bus))
+    finally:
+        builtins.input = real
     assert bus.gotos == 1
 
 
-def test_a_joint_that_did_not_arrive_is_named(monkeypatch, capsys):
-    """The failure this prompt exists for, and it is silent otherwise: the move
-    was commanded, so the log says 'to hover' either way."""
+def test_the_hover_opens_the_claw_fully():
+    """At the TOP, where the jaws have room. A run that arrives at grasp height
+    with the claw already shut cannot do the one thing it came for."""
+    bus = HoverBus(j6=config.SERVO_GRIPPER_GRIP_TICKS)
+    vs.go_to_hover(_hover_ctx(bus))
+    assert bus.ticks[6] == config.SERVO_GRIPPER_OPEN_TICKS
+    assert bus.j6_commands, "the claw was never commanded"
+
+
+def test_the_hover_opens_the_claw_before_the_descent_can_close_it():
+    """Ordering, not just presence: opening at grasp height would sweep the jaws
+    open a few millimetres from the table, beside the brick."""
+    src = _source_of(vs.main)
+    hover = src.index("go_to_hover(ctx)")
+    grasp = src.index("offer_grasp(ctx)")
+    assert hover < grasp
+
+
+def test_no_grasp_leaves_the_claw_alone_at_the_hover():
+    bus = HoverBus(j6=config.SERVO_GRIPPER_GRIP_TICKS)
+    vs.go_to_hover(_hover_ctx(bus, no_grasp=True))
+    assert bus.j6_commands == []
+
+
+def test_a_joint_that_did_not_arrive_is_named(capsys):
+    """Silent otherwise: the move was commanded, so the log says 'to hover'
+    either way. It cannot ask about it any more, so it must say it."""
     bus = HoverBus(stuck={2: 3000})
-    monkeypatch.setattr("builtins.input", lambda _p="": "n")
-    vs.go_to_hover(_hover_ctx(bus, None))
+    vs.go_to_hover(_hover_ctx(bus))
 
     out = capsys.readouterr().out
     assert "did not arrive" in out
@@ -1839,28 +1884,10 @@ def test_a_joint_that_did_not_arrive_is_named(monkeypatch, capsys):
     assert str(config.SERVO_HOVER_TICKS[2]) in out
 
 
-def test_a_clean_hover_says_nothing_about_joints_not_arriving(monkeypatch, capsys):
+def test_a_clean_hover_says_nothing_about_joints_not_arriving(capsys):
     bus = HoverBus()
-    monkeypatch.setattr("builtins.input", lambda _p="": "n")
-    vs.go_to_hover(_hover_ctx(bus, None))
+    vs.go_to_hover(_hover_ctx(bus))
     assert "did not arrive" not in capsys.readouterr().out
-
-
-def test_no_wait_asks_nothing_at_all():
-    """--no-wait means 'ask me nothing' -- the same flag that skips the
-    go-ahead. An unattended run must not block on a prompt."""
-    bus = HoverBus(stuck={2: 3000})
-
-    def explode(_p=""):
-        raise AssertionError("--no-wait must not prompt")
-
-    import builtins
-    real, builtins.input = builtins.input, explode
-    try:
-        vs.go_to_hover(_hover_ctx(bus, None, no_wait=True))
-    finally:
-        builtins.input = real
-    assert bus.gotos == 1
 
 
 def test_the_hover_tolerance_is_tighter_than_at_poses_skip_test():
@@ -1869,26 +1896,20 @@ def test_the_hover_tolerance_is_tighter_than_at_poses_skip_test():
     assert config.SERVO_VISUAL_HOVER_TOLERANCE_TICKS < 40
 
 
-# --- at the grip: squeeze more, or accept and lift ---------------------------
+
+# --- at the grip: the one prompt that survives -------------------------------
 #
-# close_in_jogs stops the instant the claw stops moving, which is where the jaws
-# TOUCH the brick and not where they hold it. A Lego brick is smooth plastic and
-# first contact will drop it. Closing further is how a Feetech servo is asked to
-# grip harder -- it turns goal-position error into torque.
+# auto_close leaves a grip that is firm by the servo's own reading. Whether it
+# is firm enough for THIS brick is a judgement no sensor here makes, so this is
+# the one place the run still stops -- and it is the "further close prompt" the
+# operator asked to keep.
 
 class GripBus(HoverBus):
-    """HoverBus plus a J6 that meets a brick and then refuses to move."""
+    """HoverBus whose J6 has met a brick and will not move further."""
 
     def __init__(self, j6=3093, **kw):
-        super().__init__(**kw)
-        self.ticks[6] = j6
-        self.j6_commands = []
-
-    def read_position(self, servo_id):
-        return self.ticks[servo_id]
-
-    def set_motion_profile(self, ids, speed, accel):
-        pass
+        super().__init__(j6=j6, **kw)
+        self.j6_stuck_at = j6
 
     def move_and_verify(self, servo_id, target):
         assert servo_id == 6, "only the gripper may be commanded here"
@@ -1899,16 +1920,13 @@ class GripBus(HoverBus):
 def _grip_ctx(bus, replies, monkeypatch):
     it = iter(replies)
     monkeypatch.setattr("builtins.input", lambda _p="": next(it))
-    args = Namespace(settle=0.0, deadband=12.0, view=False, max_iterations=10,
-                     no_wait=False)
-    ctx = vs.Context(bus, None, None, args, None, ik=None)
-    ctx.bus = bus
-    return ctx
+    return _hover_ctx(bus)
 
 
-def _gripped(ticks):
+def _gripped(ticks, past=40):
     from vision_pipeline.robot_interface import gripper as g
-    return g.GripResult(g.GRIPPED, ticks, "gripped")
+    return g.GripResult(g.GRIPPED, ticks, "gripped", contact_ticks=ticks,
+                        commanded_past=past)
 
 
 def test_enter_squeezes_again_and_again(monkeypatch):
@@ -1976,3 +1994,11 @@ def test_squeezing_stops_at_the_full_close_stop_and_keeps_offering(monkeypatch):
 
     assert bus.j6_commands == [], "nothing may be commanded past the floor"
     assert bus.gotos == 1, "k must still lift"
+
+
+def test_the_squeeze_prompt_continues_from_what_auto_close_already_spent():
+    """auto_close loads onto the brick before handing over, so the running total
+    must carry across or the advisory ceiling counts from zero twice."""
+    src = _source_of(vs.squeeze_and_lift)
+    assert "grip.commanded_past" in src
+    assert "grip.contact_ticks" in src
