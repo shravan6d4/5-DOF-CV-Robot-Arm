@@ -784,32 +784,50 @@ SERVO_VISUAL_AIM_OFFSET_Y_PX = 0
 SERVO_VISUAL_TOLERANCE_X_PX = 45
 SERVO_VISUAL_TOLERANCE_Y_PX = 55
 
+# THE BOX IS VALIDATED BEFORE EVERY DESCENT STEP, and this bounds how long the
+# loop may keep trying to satisfy it. A step that starts outside the box descends
+# by ZERO and spends itself entirely on aim; height bought on a bad aim has to be
+# given back, and it is bought at the point in the run where the claw is nearest
+# the table and the brick nearest to leaving frame.
+#
+# This is NOT the two-loop arrangement that failed on 2026-08-05. That one
+# re-aimed with a JOINT JOG, which raised the tip further than the step had
+# lowered it -- four steps netted 4 mm. A re-aim here is one IK solve at CONSTANT
+# height, so it cannot undo a descent.
+#
+# When the budget runs out the brick is visible but not reachable into the box,
+# so more attempts only burn travel. That is "the aiming loop can no longer run",
+# and it takes the same exit as losing sight of the brick: a blind descent, with
+# the last-seen error reported so a miss is diagnosable. Six is enough for the
+# error to halve several times over at the loop's gains without letting a stalled
+# correction grind indefinitely.
+SERVO_VISUAL_MAX_REAIM_STEPS = 6
+
 # Sideways companion to AIM_OFFSET_Y, and the same kind of quantity: the claw
 # does not sit under the pixel the camera calls centre, so the aim point is the
 # frame centre pushed by the camera-to-claw offset. Y covers the "camera is
 # above and behind" part; this covers the sideways part.
 #
-# Set 2026-08-07 at the operator's request, from watching runs: THREE box
-# lengths LEFT of the detection, walked out one at a time (-90, -180, -270).
+# Set 2026-08-07 at the operator's request, from watching runs: walked out to
+# three box lengths LEFT (-90, -180, -270), then back one to -180 after the first
+# descent that actually reached the brick.
 # TOLERANCE_X is a HALF-width, so the box is 90 px across and one box length is
 # 90 px, negative being left in image coordinates. Written as a plain pixel
 # count rather than derived from TOLERANCE_X, so that widening the acceptance
 # box later does not silently move the aim point with it -- those are two
 # separate decisions and coupling them would hide one inside the other.
 #
-# THIS IS THE LAST FULL BOX LENGTH AVAILABLE. The box now spans x 5-95 of 640,
-# five pixels off the left edge; -275 clips it and report_aim_reachability will
-# say so. A fourth step is not available at this tolerance, and shrinking
-# TOLERANCE_X to buy room would be the wrong trade -- it tightens the acceptance
-# test below what the joints can resolve (~30 px, see SERVO_VISUAL_MIN_STEP_TICKS).
+# The box spans x 95-185 of 640, comfortably on screen. -275 would clip it and
+# report_aim_reachability says so; -270 was the last full box length that fits,
+# and the descent that worked ran there before this was moved back.
 #
-# And note what 270 px means: 42% of the frame width, for what is nominally the
-# sideways camera-to-claw offset. That is large for a lens sitting next to the
-# claw. If a further step is ever wanted, suspect the cause rather than the
-# number -- a rotated camera mount, or the sideways axis carrying a scale error
-# -- because at some point this stops being an offset and starts being a lever
-# arm that no fixed pixel count can describe.
-SERVO_VISUAL_AIM_OFFSET_X_PX = -270
+# Worth keeping in view: even 180 px is 28% of the frame width for what is
+# nominally the sideways camera-to-claw offset, which is a lot for a lens sitting
+# beside the claw. If this needs to keep growing, suspect the cause rather than
+# the number -- a rotated camera mount, or a scale error on the sideways axis --
+# because past some point it stops being an offset and becomes a lever arm no
+# fixed pixel count can describe.
+SERVO_VISUAL_AIM_OFFSET_X_PX = -180
 
 # --- Hand-eye: the acceptance test, and why capture geometry decides it ------
 #

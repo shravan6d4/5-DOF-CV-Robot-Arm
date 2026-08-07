@@ -1029,6 +1029,47 @@ def test_a_joint_with_no_limits_by_design_is_not_reported_as_a_gap(capsys):
         "say what guards it instead, or the note reads as an unprotected joint"
 
 
+def test_a_step_that_starts_outside_the_box_does_not_descend():
+    """VALIDATE THE BOX BEFORE EVERY DESCENT. Height bought on a bad aim has to
+    be given back later, and it is bought at the point in the run where the claw
+    is nearest the table and the brick nearest to leaving frame.
+
+    This is not the two-loop arrangement that failed on 2026-08-05: that one
+    re-aimed with a JOINT JOG, which raised the tip by more than the step had
+    lowered it. A re-aim here is one IK solve at CONSTANT height, so it cannot
+    undo a descent."""
+    ctx, bus, world = descent_ctx()
+    # DescentWorld starts 140 px above the aim point, well outside a 55 px box.
+    heights = []
+    real_move = bus.move_joints_stepped
+
+    def record(targets, **kw):
+        real_move(targets, **kw)
+        heights.append(bus.ticks[2])          # ticks[2] IS z in mm here
+
+    bus.move_joints_stepped = record
+    vs.descend(ctx, descent_estimates(ctx))
+
+    assert heights, "the descent must have commanded something"
+    assert heights[0] == pytest.approx(world.z0, abs=0.01), \
+        "the first step began outside the box, so it must not have lost height"
+
+
+def test_re_aiming_that_stops_working_falls_through_to_a_blind_descent(capsys):
+    """The brick is visible but cannot be brought into the box, so more attempts
+    only burn travel. That is the other face of "the aiming loop can no longer
+    run", and it takes the same exit as losing sight of the brick rather than
+    abandoning the run a few millimetres short."""
+    ctx, _bus, world = descent_ctx()
+    world.error0 = -400.0                    # never reachable into the box
+    ctx.args.max_iterations = 60
+
+    vs.descend(ctx, descent_estimates(ctx))
+    out = capsys.readouterr().out
+    assert "BLIND FINISH" in out
+    assert "re-aim" in out
+
+
 def test_losing_the_brick_late_finishes_the_descent_blind():
     """LOSING SIGHT NEAR THE END IS NORMAL. The camera sits above and behind the
     claw, so the brick slides out of the bottom of the frame exactly when the
@@ -1051,15 +1092,23 @@ def test_a_blind_finish_holds_x_and_y_and_drops_the_reach_correction():
     steady a view nobody is watching."""
     ctx, _bus, _world = descent_ctx()
     estimates = descent_estimates(ctx)
-    _angles, tip0 = vs.tip_position(ctx)
     ctx.detector.blind_after = ctx.detector.calls + 1   # one fix, then dark
 
     assert vs.descend(ctx, estimates) is True
+
+    # Compared against EACH OTHER, not against the pose the descent started
+    # from: a step that begins outside the box now legitimately spends itself on
+    # reach before the lights go out, so the blind phase may well start
+    # somewhere else. What must hold is that once blind, x and y never move
+    # again -- only z.
     asked = ctx.ik.solves[-6:]
-    assert asked, "the blind finish must have issued solves of its own"
-    for x, y, _z in asked:
-        assert x == pytest.approx(tip0[0], abs=1e-9)
-        assert y == pytest.approx(tip0[1], abs=1e-9)
+    assert len(asked) >= 2, "the blind finish must have issued solves of its own"
+    xs = {round(x, 9) for x, _y, _z in asked}
+    ys = {round(y, 9) for _x, y, _z in asked}
+    zs = {round(z, 9) for _x, _y, z in asked}
+    assert len(xs) == 1, f"blind descent moved x across {sorted(xs)}"
+    assert len(ys) == 1, f"blind descent moved y across {sorted(ys)}"
+    assert len(zs) == len(asked), "and z must change every step, or it is not descending"
 
 
 def test_a_blind_finish_needs_a_fix_to_hold(capsys):

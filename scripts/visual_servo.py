@@ -1251,6 +1251,7 @@ def descend(ctx, estimates):
     step_n = 0
     probe_mm = ctx.args.descend_probe_mm
     last_seen = None                      # (ex, ey, tip_z) at the last detection
+    reaims = 0                            # consecutive steps spent on aim, not height
 
     while True:
         angles, tip = tip_position(ctx)
@@ -1271,6 +1272,37 @@ def descend(ctx, estimates):
         wanted_z = max(tip[2] - ctx.args.descend_step / 1000.0, target_z, floor_z)
         dz_mm = (wanted_z - tip[2]) * 1000.0
 
+        # VALIDATE THE BOX BEFORE EVERY DESCENT. Height bought on a bad aim has
+        # to be given back later, and it is bought at the one point in the run
+        # where the claw is closest to the table and the brick closest to leaving
+        # frame. So a step that starts outside the acceptance box descends by
+        # ZERO and spends itself entirely on aim.
+        #
+        # This is NOT the two-loop version that failed on 2026-08-05. That one
+        # re-aimed with a JOINT JOG, which raised the tip by more than the step
+        # had gained -- four steps netted 4 mm. A re-aim here is still one IK
+        # solve at CONSTANT HEIGHT, so it cannot undo a descent; DescentModel
+        # already treats dz = 0 as a legitimate plan for exactly this reason.
+        # The difference is only that the box now DECIDES, rather than the model
+        # choosing to descend while the aim is still out.
+        tol_x, tol_y = ctx.tolerance
+        in_box = abs(ex) <= tol_x and abs(ey) <= tol_y
+        if in_box:
+            reaims = 0
+        else:
+            reaims += 1
+            dz_mm = 0.0
+            if reaims > config.SERVO_VISUAL_MAX_REAIM_STEPS:
+                # Re-aiming has stopped working: the loop can still see the brick
+                # but cannot get it into the box, so more attempts only burn
+                # travel. That is "hover can no longer run", and the fallback is
+                # the same as losing sight -- go down straight, having said
+                # loudly how far off the aim was.
+                print(f"\n  {reaims - 1} re-aim steps and the brick is still "
+                      f"{describe(ex, ey)} of the aim point.")
+                return descend_blind(ctx, target_z, floor_z, (ex, ey, tip[2]),
+                                     "re-aiming stopped closing the error")
+
         # How far to descend, and how far to reach out, in one decision.
         #   step 1  straight down, so the descent's own image response can be
         #           seen in isolation;
@@ -1284,6 +1316,15 @@ def descend(ctx, estimates):
                                            ctx.args.descend_max_reach_mm)
             note = ("re-aiming at constant height" if abs(dz_mm) < 0.05
                     else "model")
+        elif not in_box:
+            # Out of box before the model is fitted. Reach-only, so the step
+            # still corrects AND still banks a sample -- and a pure-reach sample
+            # next to a pure-descent one is the most independent pair the fit can
+            # get, which is what the rank check wants anyway.
+            dr_mm = probe_mm if ey < 0 else -probe_mm
+            dr_mm = float(np.clip(dr_mm, -ctx.args.descend_max_reach_mm,
+                                  ctx.args.descend_max_reach_mm))
+            note = "reach only, holding height until the brick is back in the box"
         elif step_n == 1:
             dr_mm, note = 0.0, "straight down, learning the descent's own swing"
         else:
@@ -1294,11 +1335,14 @@ def descend(ctx, estimates):
 
         next_z = tip[2] + dz_mm / 1000.0
         if abs(dz_mm) < 0.05 and abs(dr_mm) < config.SERVO_VISUAL_MIN_STEP_MM:
-            print(f"\n  STOPPED at step {step_n}: neither descending nor reaching "
-                  f"would help.")
+            # Nothing left to try WHILE WATCHING: no descent worth making and no
+            # reach that would improve the aim. That is the other face of "hover
+            # can no longer run", so it takes the same exit as running out of
+            # re-aims rather than abandoning the run a few millimetres up.
+            print(f"\n  Step {step_n}: neither descending nor reaching would help.")
             print(f"    {model.describe()}")
-            print(f"    brick {describe(ex, ey)} of the aim point. The arm is holding.")
-            return False
+            return descend_blind(ctx, target_z, floor_z, (ex, ey, tip[2]),
+                                 "the aiming loop ran out of useful moves")
 
         # The reach offset must go along the direction the arm can ACTUALLY
         # reach in, which is the pitch chain's own plane -- not the direction
