@@ -108,13 +108,23 @@ rangeDeg = [ -90  90;    % J1 base yaw
 % Written by scripts/find_joint_limits.py, which measures each end by small
 % operator-confirmed steps. The file is per-arm and gitignored, so a missing
 % file simply leaves the defaults in place. Radians, model convention.
+% A MISSING ENTRY IS NOT A NEUTRAL DEFAULT -- IT IS A WIDE ONE, AND THE SOLVER
+% PREFERS IT. The placeholder is +-90 deg, about +-1024 ticks, while a measured
+% joint might get a third of that. Faced with a redundant arm the solver spends
+% whichever joints look free, so the joints with real limits are spared and the
+% unmeasured ones absorb the motion -- the exact opposite of what the missing
+% measurement implies. On 2026-08-07 a descent walked J4 into its hard stop over
+% four steps while J2 and J3, both properly limited, sat with hundreds of ticks
+% of headroom. So say plainly which joints are running on fiction.
 limitsFile = fullfile('..','data','joint_limits_rad.json');
+measured = false(1,6);
 if isfile(limitsFile)
     lim = jsondecode(fileread(limitsFile));
     for k = 1:6
         f = sprintf('x%d', k);          % jsondecode prefixes numeric keys
         if isfield(lim, f)
             rangeDeg(k,:) = rad2deg([lim.(f).min_rad, lim.(f).max_rad]);
+            measured(k) = true;
             fprintf('init_arm: J%d limits from file: [%.1f %.1f] deg\n', ...
                     k, rangeDeg(k,1), rangeDeg(k,2));
         end
@@ -122,6 +132,15 @@ if isfile(limitsFile)
 else
     fprintf(['init_arm: no %s — using placeholder +-90 deg limits. ' ...
              'Measure with scripts/find_joint_limits.py.\n'], limitsFile);
+end
+if any(~measured)
+    missing = sprintf(' J%d', find(~measured));
+    fprintf(['init_arm: *** NO MEASURED LIMITS for%s -- these carry the wide ' ...
+             '+-90 deg placeholder,\n' ...
+             'init_arm:     so IK will preferentially spend them over joints ' ...
+             'that ARE limited.\n' ...
+             'init_arm:     Measure with: python scripts/find_joint_limits.py ' ...
+             '--joint N\n'], missing);
 end
 for i = 1:robot.NumBodies
     jnt = robot.Bodies{i}.Joint;

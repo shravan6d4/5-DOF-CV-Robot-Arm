@@ -1086,16 +1086,35 @@ def descend(ctx, estimates):
     sideways_monitor = ProgressMonitor()
     sideways_used = 0.0
 
+    # EVERY joint the descent can move, not only the sideways one. The descent
+    # solves IK, and IK spends whatever joints it pleases, so an unmeasured
+    # joint has no backstop no matter where the demand came from. This warned
+    # about the sideways actuator alone until 2026-08-07, when J4 walked into
+    # its hard stop over four steps (+2, -52, +72, +150) with nothing able to
+    # refuse it: data/joint_limits_rad.json carried J1-J3 only, so MATLAB's IK
+    # had no PositionLimits for J4 either and kept proposing it freely. Both
+    # backstops were blind to the same missing measurement -- and a joint
+    # stalled against a stop draws heavy current, which is where the checksum
+    # errors on the bus came from.
+    unmeasured = [j for j in IK_JOINTS if ctx.bus.travel_limits(j) is None]
+    if unmeasured:
+        names = ", ".join(f"J{j}" for j in unmeasured)
+        print(f"\n  NOTE: {names} {'has' if len(unmeasured) == 1 else 'have'} no "
+              f"measured travel limits. The descent solves IK, which is free to "
+              f"spend them, and neither the servo bus nor the solver can refuse a "
+              f"move on a joint whose range it does not know.")
+        print(f"    Measure them and BOTH gain a backstop -- init_arm.m reads the "
+              f"same file the bus does:")
+        for j in unmeasured:
+            print(f"      python scripts/find_joint_limits.py --joint {j}")
+
     if (x_actuator is not None and not ctx.args.no_sideways
             and x_actuator.kind == "joint"
             and ctx.bus.travel_limits(x_actuator.joint) is None):
-        print(f"\n  NOTE: {x_actuator.label()} has no measured travel limits, so "
-              f"the servo bus cannot refuse a bad sideways move.")
-        print(f"    The only bounds are this script's: a "
+        print(f"\n  {x_actuator.label()} carries the sideways correction, so until "
+              f"it is measured the only bounds on it are this script's: a "
               f"{ctx.args.sideways_budget:.0f}-tick budget for the whole descent, "
               f"and a stop the first time a correction makes the error worse.")
-        print(f"    Measure them and the bus can help: "
-              f"python scripts/find_joint_limits.py --joint {x_actuator.joint}")
     step_n = 0
     probe_mm = ctx.args.descend_probe_mm
 
@@ -1680,6 +1699,27 @@ def main() -> None:
             except ServoSafetyError as e:
                 bus.freeze(IK_JOINTS)
                 print(f"\n  REFUSED by the servo bus: {e}")
+            except RuntimeError as e:
+                # A LOST BUS READ MUST NOT CRASH OUT MID-DESCENT. ServoBus raises
+                # bare RuntimeError when a servo stops answering, and on
+                # 2026-08-07 that propagated straight out of main() -- no freeze
+                # attempted, no state reported, just a traceback over an arm that
+                # had a joint stalled against a hard stop. The freeze may well
+                # fail too if the bus is genuinely down; attempting it and SAYING
+                # SO is still strictly better than not trying, because the
+                # operator's next decision depends on knowing which it was.
+                print(f"\n  BUS FAILURE: {e}")
+                try:
+                    held = bus.freeze(IK_JOINTS)
+                    print(f"  Froze at {held}. Torque is on and the arm is holding.")
+                except Exception:                                 # noqa: BLE001
+                    print("  COULD NOT FREEZE -- the bus is not answering at all.")
+                    print("  The servos still hold their last goal, so the arm is")
+                    print("  not falling, but nothing can command it either.")
+                    print("  Power-cycle the bus, then: python scripts/check_servo_health.py")
+                print("  Line noise under motor current is the usual cause, and a")
+                print("  joint stalled against a hard stop is what produces it.")
+                print("  Check for a joint at the end of its travel before re-running.")
 
         if ik is not None:
             ik.close()
