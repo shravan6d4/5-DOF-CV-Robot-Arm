@@ -390,27 +390,24 @@ HAND_EYE_PATH = "data/hand_eye.json"
 # ticks_to_rad, i.e. on dir_sign being right; J2's confirm jog should happen
 # first (see SERVO_CALIBRATION_FALLBACK notes).
 #
-# -0.0677 SINCE 2026-08-07, AND IT IS THE MEASUREMENT THE PARAGRAPH ABOVE ASKS
-# FOR. The operator states that the tabletop is where the claw sits at HOME —
-# home being a pose the arm can be driven to exactly and repeatedly, so it is a
-# touch reading with no ruler and no eyeballed gap in it. request_fk_tip at all
-# five joints zero returns tip (+70.0, -0.1, -67.7) mm, so the table is at
-# -67.7 mm.
+# -0.0732 SINCE 2026-08-07, from SEVEN touches of the tabletop across three
+# distinct postures (scripts/measure_table_plane.py). It briefly sat at -0.0677
+# — the claw's height at home, on the reading that home rests ON the table — and
+# that was wrong by the arm's own 6 mm gap. It cost a descent: the run drove past
+# the surface until J2 stalled 34 ticks from its limit.
 #
-# It disagrees with the -74.0 above by 6.3 mm, and that gap is real, not a
-# rounding: the older figure came from reading a ruler into the gap under the
-# claw at two poses, and CLAUDE.md's own account of home describes the tip as
-# sitting "~10 mm above the table" — the same 6.3 mm seen from the other side.
-# One of the two is wrong and the touch reading is the better instrument: it
-# needs no gap estimate, and home is reproducible in a way "the pose the arm
-# happened to be in" is not.
+# WHAT MAKES THIS ONE DIFFERENT is that it does not depend on the dir_sign
+# question the touches opened up (see CLAUDE.md). Both hypotheses land here:
+#     J2/J3/J4 flipped   -> the seven touches average -73.2 mm directly
+#     signs as stored    -> home's tip is -67.7 mm and sits ~6 mm proud -> -73.7
+# and the 2026-07-22 ruler pair, taken 40 mm apart vertically, said -74.0 and
+# -75.7. Four routes inside 2.5 mm, so this number is safe to use while the sign
+# question is still open.
 #
-# The change is also in the SAFE direction. A higher table means every descent
-# and the floor guard stop 6.3 mm sooner, so being wrong here leaves the claw
-# short of the brick — visible, harmless, and correctable — rather than driving
-# it into the surface. Should the claw now stop consistently high by about this
-# much, that is this line, and the -74.0 reading deserves another look.
-TABLE_Z_IN_BASE = -0.0677
+# Under the flipped hypothesis the seven touches spread only 7.6 mm about this
+# value; under the stored signs they spread 73.1 mm, which is why the sign
+# question matters for everything ELSE the arm computes — but not for this line.
+TABLE_Z_IN_BASE = -0.0732
 
 # Where the gripper should end up to grasp, relative to the table surface.
 # Slightly above the table so the fingers close around the brick body rather

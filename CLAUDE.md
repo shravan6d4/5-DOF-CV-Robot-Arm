@@ -117,6 +117,48 @@ That is a centring loop commanding 9 mm, moving 0.1 mm, seeing no pixel response
 
 A solution is now taken or refused **whole**, with `SERVO_VISUAL_MAX_ROLL_DEG` joining the pan guard and shrinking the request until a solve fits. Deletion is pinned shut by `test_an_ik_solution_is_commanded_whole_never_censored`.
 
+## The touch plane says J2, J3 and J4 are sign-flipped — UNCONFIRMED (2026-08-07)
+
+Seven touches of the tabletop across three distinct postures
+([`scripts/measure_table_plane.py`](scripts/measure_table_plane.py)) are all one
+flat plane, so FK must return one z for all of them. Under the stored signs it
+spreads **73.1 mm**. Re-solved under all 32 `dir_sign` combinations:
+
+```
+  spread   dir_sign              implied table
+     7.6   (1, +1, +1, +1, -1)      -73.2 mm     <-- 10x better
+    73.1   (1, -1, -1, -1, -1)                   <-- stored, 21st of 32
+```
+
+**Four things agree, and only one of them is the fit.**
+
+1. spread collapses 73.1 -> **7.6 mm**;
+2. the implied table lands at **−73.2 mm** against the 2026-07-22 ruler pair's **−74.0 / −75.7 mm** — a measurement the fit never saw;
+3. reach becomes physically sensible. Base −y is the arm's forward (the frame is rotated −89.4°, see above): flipped puts the touches **83–167 mm** in front of the base, stored puts them **8–27 mm**, i.e. inside the base column;
+4. home's claw then sits **5.5 mm above** that table, matching the long-standing "~6 mm above the table".
+
+It also corroborates the hand-eye `--search`, which ranked J3/J4-flipped best (board spread 10.0 vs 15.0 mm, TSAI-vs-PARK 1.2 mm/0.2° vs 2.5 mm/5.8°) and was recorded as a hypothesis. J1 is indifferent here — it cannot change tip height — and J5 is unresolved either way (7.6 vs 7.7 mm).
+
+**DO NOT FLIP ON THIS EVIDENCE.** The rule stands: only a physical jog or a ruler
+settles a `dir_sign`, and `dir_sign_basis` records all three of these as
+CONFIRMED BY PHYSICAL JOG on 2026-08-06. That is a direct conflict with a direct
+observation, and a sign flip inverts every motion the arm makes.
+
+**The jog that settles it**, from ticks `J1 1794 J2 3293 J3 2911 J4 1462 J5 2744`,
+all well inside travel:
+
+| jog | stored predicts | flipped predicts |
+|---|---|---|
+| **J3 +150** | **18.2 mm DOWN** | **33.0 mm UP** |
+| J2 +150 | 2.2 mm up | 33.2 mm up |
+| J4 +150 | 10.0 mm up | 5.1 mm up |
+
+J3 is the discriminator — opposite directions, both large. `python scripts/jog_joint.py --joint 3 --ticks 150`, watch the claw, and one of the two columns is wrong.
+
+**Whichever way it goes, `TABLE_Z_IN_BASE = -0.0732` stands**: the flipped fit
+gives −73.2 directly, the stored signs give −73.7 via home's 6 mm gap, and the
+ruler gave −74.0. Four routes inside 2.5 mm.
+
 ## FK's ABSOLUTE height is not trustworthy; its DIFFERENTIAL height is (2026-08-07)
 
 The operator touched the tabletop from several postures and read the ticks. Every
