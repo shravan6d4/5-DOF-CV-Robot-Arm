@@ -1260,10 +1260,13 @@ def test_a_caller_predating_the_flag_still_gets_the_locking():
     assert set(vs.CartesianActuator("tangential").locked_joints(ctx)) == {5}
 
 
-def test_a_lock_that_did_not_hold_is_reported_not_swallowed(caplog):
-    """A silently failing lock is worse than no lock: the caller believes a
-    disturbance is suppressed and tunes its gains against that belief. This is
-    the 2026-08-06 case -- J5 locked, 94 ticks of drift, nothing said."""
+def test_lock_drift_is_recorded_but_does_not_cry_wolf(caplog):
+    """The drift must be RECORDED -- it is exactly how much motion the caller's
+    own enforcement has to drop, and if it ever reaches zero the server-side pin
+    started working. But not at warning level: the pin never holds, so a warning
+    fires on every nudge of every descent, dozens of identical lines about a
+    condition CartesianActuator handles two statements later. A log that cries
+    wolf on a known-permanent condition is where a real fault goes to hide."""
     import logging
     from vision_pipeline.robot_interface.matlab_client import MatlabIKClient
 
@@ -1275,9 +1278,10 @@ def test_a_lock_that_did_not_hold_is_reported_not_swallowed(caplog):
             return {"ok": True, "angles_rad": [0.0] * 5, "err_mm": 0.0,
                     "lock_drift_rad": self.drift}
 
-    with caplog.at_level(logging.WARNING):
+    with caplog.at_level(logging.DEBUG):
         Wire(np.deg2rad(8.0)).request_ik(0.1, 0.0, 0.1, seed_rad=[0.0] * 5, lock=[5])
-    assert "not holding" in caplog.text
+    assert "8.0 deg" in caplog.text and "held joint(s) [5]" in caplog.text
+    assert [r for r in caplog.records if r.levelno >= logging.WARNING] == []
 
 
 def test_a_lock_that_held_says_nothing(caplog):

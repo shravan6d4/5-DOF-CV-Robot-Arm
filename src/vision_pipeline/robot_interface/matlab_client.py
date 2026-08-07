@@ -136,6 +136,15 @@ class MatlabIKClient:
                 image. Locking J1 for a pure descent asks for the answer in the
                 plane the arm is already in. Requires seed_rad.
 
+                ADVISORY ONLY — THE CALLER MUST ENFORCE IT. The server pins the
+                joint's PositionLimits and the solver ignores it: lock=[5],
+                lock=[1] and lock=[1,5] all return a byte-identical solution
+                (measured 2026-08-06, reproduce with scripts/check_ik_lock.py).
+                Three fixes inside rigidBodyJoint failed. Anything that depends
+                on a joint staying put must drop it from what it commands, the
+                way visual_servo.CartesianActuator does. Sending the returned
+                angles verbatim and trusting this field will move the joint.
+
         Returns:
             (angles_rad, err_mm): J1..J5 angles in radians, and IK error in mm.
             Angles are frame-independent scalars; err_mm is a norm, unchanged
@@ -159,20 +168,21 @@ class MatlabIKClient:
         angles_rad = resp["angles_rad"]  # list of 5 floats
         err_mm = resp["err_mm"]  # float
 
-        # A LOCK THAT SILENTLY FAILS IS WORSE THAN NO LOCK: the caller believes
-        # a disturbance is suppressed and tunes its gains against that belief.
-        # Observed 2026-08-06 -- a run locking J5 came back moving it 94 ticks,
-        # because the server pinned it with a degenerate [v, v] interval the
-        # solver did not honour, and nothing in the protocol could report it.
-        # Older servers omit the field entirely, so absence is not a failure.
+        # DEBUG, NOT WARNING, AND DELIBERATELY. The lock never holds (see the
+        # `lock` arg above), so at warning level this fires on every nudge of
+        # every descent -- dozens of identical lines describing a condition the
+        # caller is already handling two statements later. A log that cries wolf
+        # on a known-permanent condition is where a real fault goes to hide.
+        # The number is still worth recording: it is exactly how much motion the
+        # caller's own enforcement has to drop, so if drift ever falls to zero
+        # the server-side pin started working and this can go back to being a
+        # real check. Older servers omit the field, so absence is not a failure.
         drift = resp.get("lock_drift_rad")
         if lock and drift is not None and drift > self.LOCK_DRIFT_WARN_RAD:
-            logger.warning(
-                "IK was asked to hold joint(s) %s but moved one by %.1f deg "
-                "(%.0f ticks). The lock is not holding — treat any gain measured "
-                "through this solve as unreliable, and check that MATLAB was "
-                "restarted after the last change to matlab/.",
-                list(lock), np.degrees(drift), drift * 651.89)
+            logger.debug(
+                "IK spent %.1f deg (%.0f ticks) on held joint(s) %s; the server "
+                "pin does not hold, so the caller must drop it.",
+                np.degrees(drift), drift * 651.89, list(lock))
         return angles_rad, err_mm
 
     def request_fk(self, angles_rad: list[float]) -> np.ndarray:
