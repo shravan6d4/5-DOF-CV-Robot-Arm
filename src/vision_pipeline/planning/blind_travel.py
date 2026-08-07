@@ -284,17 +284,54 @@ class HeightModel:
     the camera and the brick rather than of one run. Refitted every run from the
     whole log, the same way DescentModel refits every step.
 
-    Not trusted blindly: `ready` requires a minimum number of pairs spanning a
-    real range of apparent size, because a fit over sightings that all look the
-    same size is a fit to noise with a confident-looking slope.
+    WHAT THE FIRST TEN RUNS TAUGHT (2026-08-07, and every gate below comes from
+    them). The SHAPE is right -- within one descent the fit is excellent:
+
+        run 4 alone    c=4989   rms 2.5 mm over an 84 mm range   (0.03)
+        run 5 alone    c=6102   rms 2.3 mm                       (0.03)
+        run 10 alone   c=5013   rms 5.2 mm                       (0.07)
+        FLAT pooled    c=5069   rms 8.5 mm                       (0.10)
+        ALL pooled     c=4002   rms 27.0 mm                      (0.22)  <-- shipped
+
+    What breaks it is POOLING, because `c` is not a universal constant. It is
+    roughly f x W, where W is the width of the face the brick is PRESENTING --
+    so it changes when the brick is rotated or stood on a different side, which
+    is exactly what raising one usually means. Three flat runs of the same brick
+    spread c by 22%; mixing flat and raised runs took the rms from 8.5 mm to
+    27 mm, on a quantity whose whole range is 60.
+
+    So flat and raised are fitted SEPARATELY and the caller says which it wants.
+    That also happens to be what the operator asked for -- the model is only
+    consulted on the raised path -- but it would be right regardless.
+
+    THE GATES, in the order they bite:
+
+      MIN_RUNS x MIN_SIGHTINGS_PER_RUN -- pairs must come from at least two
+        DESCENTS that each saw the brick at least three times. Ten single-point
+        journeys are ten measurements of ten different situations, not a curve;
+        that is what the shipped fit was made of.
+      MIN_SPREAD -- the pairs must span a real range of apparent size, or the
+        slope is unconstrained and lstsq returns one anyway.
+      MAX_RMS_MM / MAX_RMS_RATIO -- a fit whose residual is comparable to the
+        range it predicts is not a fit. Single runs land at 0.03-0.07, flat-only
+        at 0.10; 0.12 admits the good ones and refuses the pooled one.
+
+    A model that fails any of them reports `ready == False` and says which, and
+    the raised descent falls back to the loss-of-sight drop.
     """
 
     MIN_PAIRS = 8
     MIN_SPREAD = 0.25       # fractional range of 1/sqrt(area) the pairs must span
+    MIN_RUNS = 2            # distinct descents contributing
+    MIN_SIGHTINGS_PER_RUN = 3
+    MAX_RMS_MM = 12.0
+    MAX_RMS_RATIO = 0.12    # rms as a fraction of the range being predicted
 
     def __init__(self, c: float = None, d: float = None, n: int = 0,
-                 rms_mm: float = float("nan")):
+                 rms_mm: float = float("nan"), runs: int = 0, reason: str = ""):
         self.c, self.d, self.n, self.rms_mm = c, d, n, rms_mm
+        self.runs = runs
+        self.reason = reason
 
     @property
     def ready(self) -> bool:
@@ -308,57 +345,93 @@ class HeightModel:
 
     def describe(self) -> str:
         if not self.ready:
-            return "height model: not fitted"
+            return (f"height model: NOT USABLE -- {self.reason or 'no data'} "
+                    f"({self.n} pairs from {self.runs} run"
+                    f"{'s' if self.runs != 1 else ''})")
         return (f"height model: remaining = {self.c:.0f}/sqrt(area) - {self.d:.1f} "
-                f"mm  ({self.n} pairs, rms {self.rms_mm:.1f} mm)")
+                f"mm  ({self.n} pairs from {self.runs} runs, rms "
+                f"{self.rms_mm:.1f} mm)")
 
 
-def training_pairs(journeys, flat_on_board=None):
-    """(1/sqrt(area), remaining_mm) from every sighting of every gripped run."""
-    pairs = []
+def usable_runs(journeys, flat_on_board=None):
+    """Descents that can contribute training pairs, with their pairs.
+
+    A run qualifies only if it GRIPPED (there is a ground truth), matches the
+    flat/raised question being asked, and saw the brick at least
+    MIN_SIGHTINGS_PER_RUN times. That last condition is the one the first ten
+    runs made necessary: eight of them contributed a single sighting each, so
+    the "fit" was really ten measurements of ten different situations rather
+    than a curve through any of them.
+    """
+    out = []
     for j in journeys:
         if j.outcome != GRIPPED or j.grip_tip is None:
             continue
         if flat_on_board is not None and j.flat_on_board != flat_on_board:
             continue
-        for s in j.sightings:
-            if s.area <= 0:
-                continue
-            pairs.append((1.0 / (s.area ** 0.5),
-                          (s.tip[2] - j.grip_tip[2]) * 1000.0))
-    return pairs
+        pairs = [(1.0 / (s.area ** 0.5), (s.tip[2] - j.grip_tip[2]) * 1000.0)
+                 for s in j.sightings if s.area > 0]
+        if len(pairs) >= HeightModel.MIN_SIGHTINGS_PER_RUN:
+            out.append(pairs)
+    return out
+
+
+def training_pairs(journeys, flat_on_board=None):
+    """(1/sqrt(area), remaining_mm) from every qualifying run, flattened."""
+    return [p for run in usable_runs(journeys, flat_on_board) for p in run]
 
 
 def fit_height_model(journeys, flat_on_board=None) -> HeightModel:
     """Least-squares fit of remaining_mm = c*(1/sqrt(area)) - d.
 
-    Returns an unfitted model rather than raising when there is not enough to go
-    on -- the caller then falls back to the loss-of-sight drop, which is what it
-    did before this existed.
+    Returns an UNFITTED model with a reason rather than raising when the data
+    does not support one -- the caller then falls back to the loss-of-sight
+    drop, which is what it did before any of this existed. Every gate here was
+    put in by the first ten runs; see HeightModel's docstring for their numbers.
     """
-    pairs = training_pairs(journeys, flat_on_board)
-    if len(pairs) < HeightModel.MIN_PAIRS:
-        return HeightModel(n=len(pairs))
+    runs = usable_runs(journeys, flat_on_board)
+    pairs = [p for run in runs for p in run]
+    n, r = len(pairs), len(runs)
+
+    if r < HeightModel.MIN_RUNS:
+        return HeightModel(n=n, runs=r, reason=(
+            f"needs {HeightModel.MIN_RUNS} descents that each saw the brick "
+            f"{HeightModel.MIN_SIGHTINGS_PER_RUN}+ times"))
+    if n < HeightModel.MIN_PAIRS:
+        return HeightModel(n=n, runs=r,
+                           reason=f"needs {HeightModel.MIN_PAIRS} pairs")
 
     xs = [p[0] for p in pairs]
     lo, hi = min(xs), max(xs)
     if hi <= 0 or (hi - lo) / hi < HeightModel.MIN_SPREAD:
         # Every sighting looked the same size, so the slope is unconstrained.
         # A fit here would be noise wearing a confident face.
-        return HeightModel(n=len(pairs))
+        return HeightModel(n=n, runs=r, reason="apparent size barely varied")
 
-    n = len(pairs)
     sx = sum(xs)
     sy = sum(p[1] for p in pairs)
     sxx = sum(x * x for x in xs)
     sxy = sum(x * y for x, y in pairs)
     denom = n * sxx - sx * sx
     if abs(denom) < 1e-18:
-        return HeightModel(n=n)
+        return HeightModel(n=n, runs=r, reason="degenerate")
     c = (n * sxy - sx * sy) / denom
     intercept = (sy - c * sx) / n
     rms = (sum((c * x + intercept - y) ** 2 for x, y in pairs) / n) ** 0.5
-    return HeightModel(c=c, d=-intercept, n=n, rms_mm=rms)
+
+    ys = [p[1] for p in pairs]
+    span = max(ys) - min(ys)
+    ratio = rms / span if span > 0 else float("inf")
+    if rms > HeightModel.MAX_RMS_MM or ratio > HeightModel.MAX_RMS_RATIO:
+        # A fit whose residual is comparable to the range it predicts is not a
+        # fit. This is the gate the shipped model failed: rms 27 mm on a 122 mm
+        # range, because it pooled flat and raised runs whose `c` differ.
+        return HeightModel(n=n, runs=r, rms_mm=rms, reason=(
+            f"rms {rms:.1f} mm is {ratio:.0%} of the {span:.0f} mm range it "
+            f"predicts (limits {HeightModel.MAX_RMS_MM:.0f} mm / "
+            f"{HeightModel.MAX_RMS_RATIO:.0%})"))
+
+    return HeightModel(c=c, d=-intercept, n=n, rms_mm=rms, runs=r)
 
 
 # --- the cross-check ---------------------------------------------------------
@@ -478,6 +551,9 @@ def summarise(journeys) -> list:
         if drop is not None:
             lines.append(f"  {label}: {drop:.1f} mm below loss of sight "
                          f"(median of {n})")
-    lines.append("  " + fit_height_model(journeys).describe())
+    # Reported per answer, never pooled -- `c` is not shared between them.
+    for flat, label in ((True, "flat"), (False, "raised")):
+        lines.append(f"  {label}: "
+                     + fit_height_model(journeys, flat_on_board=flat).describe())
     lines.extend("  " + l for l in triangulation_verdict(journeys))
     return lines

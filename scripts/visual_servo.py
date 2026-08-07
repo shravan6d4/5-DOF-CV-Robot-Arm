@@ -758,10 +758,6 @@ def ask_flat_on_board(ctx):
     path (blind_finish).
     """
     ctx.blind_history = blind_travel.load(config.BLIND_TRAVEL_PATH)
-    # Fitted from EVERY journey, flat and raised alike. The relationship between
-    # how big the brick looks and how far there is left to go is a property of
-    # the camera and the brick, not of which answer was given to this question.
-    ctx.height_model = blind_travel.fit_height_model(ctx.blind_history)
 
     if getattr(ctx.args, "raised", False):
         ctx.flat_on_board = False
@@ -781,13 +777,31 @@ def ask_flat_on_board(ctx):
             answer = "y"
         ctx.flat_on_board = answer not in ("n", "no")
 
+    # THE MODEL IS FITTED ONLY ON THE RAISED ANSWER, and this is the only place
+    # it is ever built. Operator's requirement 2026-08-07: answer Y and it must
+    # never be consulted -- so on Y it is never even CONSTRUCTED, and
+    # ctx.height_model stays the unfitted default that record_sighting refuses
+    # to read. That is stronger than a branch guard, because there is nothing
+    # there to read by accident.
+    #
+    # It is also the right fit either way. `c` is roughly f x W, where W is the
+    # width of the face the brick presents, so it changes when the brick is
+    # rotated or stood on a different side -- which is what raising one usually
+    # means. Pooling flat and raised runs took the rms from 8.5 mm to 27 mm on
+    # the first ten runs.
+    if not ctx.flat_on_board:
+        ctx.height_model = blind_travel.fit_height_model(ctx.blind_history,
+                                                         flat_on_board=False)
+
     for line in blind_travel.summarise(ctx.blind_history):
         print(f"  {line}")
     if ctx.flat_on_board:
         print("  -> flat: descending to the table plane, exactly as before.")
+        print("     The height model is not fitted and will not be consulted.")
     else:
         print("  -> RAISED: the descent will finish a measured distance below")
         print("     where sight of the brick is lost, not at the table plane.")
+        print(f"     {ctx.height_model.describe()}")
     return ctx.flat_on_board
 
 

@@ -201,9 +201,19 @@ def synthetic(n=12, c=900.0, d=5.0, grip_z=0.0):
     return out
 
 
+def two_good_runs(c=900.0, d=5.0, n=12):
+    """The minimum the gates accept: two descents, each with plenty of
+    sightings. Ten single-sighting journeys are ten measurements of ten
+    different situations, not a curve -- which is what the first shipped fit
+    was made of."""
+    # Same grip_z in the journey and in synthetic(), or `remaining` is computed
+    # against a different zero than the areas were generated for.
+    return [training_journey(grip_z=0.0, sightings=synthetic(n=n, c=c, d=d)),
+            training_journey(grip_z=0.0, sightings=synthetic(n=n, c=c, d=d))]
+
+
 def test_the_model_recovers_the_relationship_it_was_trained_on():
-    j = training_journey(sightings=synthetic())
-    m = bt.fit_height_model([j])
+    m = bt.fit_height_model(two_good_runs())
 
     assert m.ready
     assert m.c == pytest.approx(900.0, rel=1e-3)
@@ -212,7 +222,7 @@ def test_the_model_recovers_the_relationship_it_was_trained_on():
 
 
 def test_the_model_predicts_the_drop_still_to_come():
-    m = bt.fit_height_model([training_journey(sightings=synthetic())])
+    m = bt.fit_height_model(two_good_runs())
     area_at_20mm = (900.0 / 25.0) ** 2
     assert m.remaining_mm(area_at_20mm) == pytest.approx(20.0, abs=0.5)
 
@@ -221,7 +231,7 @@ def test_an_unfitted_model_says_nothing_rather_than_guessing():
     m = bt.HeightModel()
     assert not m.ready
     assert m.remaining_mm(1000.0) is None
-    assert "not fitted" in m.describe()
+    assert "NOT USABLE" in m.describe()
 
 
 def test_too_few_pairs_leaves_the_model_unfitted():
@@ -233,27 +243,42 @@ def test_sightings_that_all_look_the_SAME_SIZE_do_not_fit():
     """The slope is unconstrained there, and lstsq would return one anyway. A
     fit over a flat spread is noise wearing a confident face -- the same failure
     as the hand-eye capture whose rotations were all too small."""
-    j = training_journey(sightings=[(0.05, 4000.0)] * 20)
-    m = bt.fit_height_model([j])
+    js = [training_journey(sightings=[(0.05, 4000.0)] * 20),
+          training_journey(sightings=[(0.05, 4000.0)] * 20)]
+    m = bt.fit_height_model(js)
     assert not m.ready
-    assert m.n == 20, "the pairs are still counted, just not fitted"
+    assert m.n == 40, "the pairs are still counted, just not fitted"
+    assert "barely varied" in m.reason
 
 
 def test_only_journeys_that_gripped_train_the_model():
     """A run that shut on air has no ground truth for where the brick was."""
-    j = training_journey(sightings=synthetic(), outcome=bt.AIR)
-    assert not bt.fit_height_model([j]).ready
-    assert bt.training_pairs([j]) == []
+    js = [training_journey(sightings=synthetic(), outcome=bt.AIR)] * 2
+    assert not bt.fit_height_model(js).ready
+    assert bt.training_pairs(js) == []
 
 
-def test_flat_and_raised_runs_BOTH_train_the_model():
-    """Unlike the drop suggestion. How big the brick looks versus how far there
-    is to go is a property of the camera and the brick, not of which answer the
-    operator gave -- and the flat runs are the ones that work, so excluding them
-    would starve the model that the raised path depends on."""
-    flat = training_journey(sightings=synthetic(n=6), flat=True)
-    raised = training_journey(sightings=synthetic(n=6), flat=False)
-    assert bt.fit_height_model([flat, raised]).ready
+def test_flat_and_raised_runs_are_fitted_SEPARATELY():
+    """REVERSED 2026-08-07 by the first ten runs. They used to share a model on
+    the theory that apparent size versus distance is a property of the camera
+    and the brick. It is not shared: c is roughly f x W, where W is the width of
+    the face the brick PRESENTS, and raising a brick usually means standing it
+    on a different side. Pooling took the rms from 8.5 mm to 27 mm."""
+    flat = two_good_runs(c=900.0)
+    for j in flat:
+        j.flat_on_board = True
+    raised = two_good_runs(c=2500.0)          # a different presented face
+    for j in raised:
+        j.flat_on_board = False
+
+    both = flat + raised
+    assert bt.fit_height_model(both, flat_on_board=True).ready
+    assert bt.fit_height_model(both, flat_on_board=False).ready
+    assert not bt.fit_height_model(both).ready, (
+        "pooled, the two cs fight and the residual explodes")
+
+    only_flat = bt.fit_height_model(both, flat_on_board=True)
+    assert only_flat.c == pytest.approx(900.0, rel=1e-2)
 
 
 def test_a_sighting_survives_the_round_trip(tmp_path):
@@ -378,3 +403,56 @@ def test_both_triangulation_paths_end_at_the_same_call():
     assert "triangulate_pixels" in inspect.getsource(
         pipeline.PickPipeline.locate_brick_two_view)
     assert "triangulate_pixels" in inspect.getsource(bt.triangulate_sightings)
+
+
+# --- the gates the first ten runs made necessary ------------------------------
+
+def test_single_sighting_journeys_cannot_constitute_a_fit():
+    """THE SHIPPED BUG. Eight of the first ten journeys had one sighting each,
+    so the 'fit' was ten measurements of ten different situations."""
+    ones = [training_journey(sightings=[(0.05, 1000.0 * (i + 1))])
+            for i in range(20)]
+    m = bt.fit_height_model(ones)
+    assert not m.ready
+    assert m.n == 0, "a one-sighting run contributes NO pairs, not one"
+    assert str(bt.HeightModel.MIN_SIGHTINGS_PER_RUN) in m.reason
+
+
+def test_one_good_run_is_not_enough():
+    """Two, so that a per-run quirk -- a rotated brick, a glare-inflated
+    contour -- cannot masquerade as the relationship."""
+    m = bt.fit_height_model([training_journey(sightings=synthetic(n=20))])
+    assert not m.ready
+    assert m.runs == 1
+    assert "descents" in m.reason
+
+
+def test_a_fit_whose_rms_rivals_its_range_is_refused():
+    """The gate the shipped model failed: rms 27 mm on a 122 mm range."""
+    import random
+    random.seed(7)
+    noisy = []
+    for _ in range(2):
+        pts = [(z, area) for z, area in synthetic(n=12)]
+        j = bt.BlindJourney(lost_tip=(0.15, 0.02, 0.100), lost_sight=True)
+        for i, (z, area) in enumerate(pts):
+            seen(j, i + 1, z + random.uniform(-0.030, 0.030), area)
+        j.finish(bt.GRIPPED, (0.15, 0.02, 0.0))
+        noisy.append(j)
+
+    m = bt.fit_height_model(noisy)
+    assert not m.ready
+    assert "rms" in m.reason
+    assert m.rms_mm > bt.HeightModel.MAX_RMS_MM or "%" in m.reason
+
+
+def test_the_rms_gate_is_a_ratio_as_well_as_an_absolute():
+    """8 mm of residual is fine over an 80 mm range and useless over 20."""
+    assert bt.HeightModel.MAX_RMS_RATIO < 0.2
+    assert bt.HeightModel.MAX_RMS_MM > 0
+
+
+def test_a_refused_model_says_WHY():
+    """A silent 'not ready' sends the operator looking in the wrong place."""
+    for js in ([], [training_journey(sightings=synthetic(n=20))]):
+        assert bt.fit_height_model(js).reason, "no reason given"
