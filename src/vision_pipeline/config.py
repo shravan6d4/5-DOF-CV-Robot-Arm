@@ -389,7 +389,28 @@ HAND_EYE_PATH = "data/hand_eye.json"
 # request_fk_tip — the tip's z at that instant IS this value. Depends on
 # ticks_to_rad, i.e. on dir_sign being right; J2's confirm jog should happen
 # first (see SERVO_CALIBRATION_FALLBACK notes).
-TABLE_Z_IN_BASE = -0.074
+#
+# -0.0677 SINCE 2026-08-07, AND IT IS THE MEASUREMENT THE PARAGRAPH ABOVE ASKS
+# FOR. The operator states that the tabletop is where the claw sits at HOME —
+# home being a pose the arm can be driven to exactly and repeatedly, so it is a
+# touch reading with no ruler and no eyeballed gap in it. request_fk_tip at all
+# five joints zero returns tip (+70.0, -0.1, -67.7) mm, so the table is at
+# -67.7 mm.
+#
+# It disagrees with the -74.0 above by 6.3 mm, and that gap is real, not a
+# rounding: the older figure came from reading a ruler into the gap under the
+# claw at two poses, and CLAUDE.md's own account of home describes the tip as
+# sitting "~10 mm above the table" — the same 6.3 mm seen from the other side.
+# One of the two is wrong and the touch reading is the better instrument: it
+# needs no gap estimate, and home is reproducible in a way "the pose the arm
+# happened to be in" is not.
+#
+# The change is also in the SAFE direction. A higher table means every descent
+# and the floor guard stop 6.3 mm sooner, so being wrong here leaves the claw
+# short of the brick — visible, harmless, and correctable — rather than driving
+# it into the surface. Should the claw now stop consistently high by about this
+# much, that is this line, and the -74.0 reading deserves another look.
+TABLE_Z_IN_BASE = -0.0677
 
 # Where the gripper should end up to grasp, relative to the table surface.
 # Slightly above the table so the fingers close around the brick body rather
@@ -765,6 +786,19 @@ SERVO_VISUAL_AIM_OFFSET_Y_PX = 0
 # target only produces corrections the arm ignores.
 SERVO_VISUAL_TOLERANCE_X_PX = 45
 SERVO_VISUAL_TOLERANCE_Y_PX = 55
+
+# Sideways companion to AIM_OFFSET_Y, and the same kind of quantity: the claw
+# does not sit under the pixel the camera calls centre, so the aim point is the
+# frame centre pushed by the camera-to-claw offset. Y covers the "camera is
+# above and behind" part; this covers the sideways part.
+#
+# Set 2026-08-07 at the operator's request, from watching a run: one box length
+# LEFT of the detection. TOLERANCE_X is a HALF-width, so the box is 90 px across
+# and one box length is 90 px, negative being left in image coordinates. Written
+# as a plain pixel count rather than derived from TOLERANCE_X, so that widening
+# the acceptance box later does not silently move the aim point with it -- those
+# are two separate decisions and coupling them would hide one inside the other.
+SERVO_VISUAL_AIM_OFFSET_X_PX = -90
 
 # --- Hand-eye: the acceptance test, and why capture geometry decides it ------
 #

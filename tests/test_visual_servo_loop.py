@@ -143,7 +143,7 @@ def make_ctx(px_per_tick=None, miss_frames=0, detector=None, offset=None,
         # frame centre and make the box match the old scalar deadband so their
         # assertions still mean what they say. The offset and the box get their
         # own tests below.
-        aim_offset_y=0.0, tolerance_x=12.0, tolerance_y=12.0,
+        aim_offset_x=0.0, aim_offset_y=0.0, tolerance_x=12.0, tolerance_y=12.0,
     )
     for k, v in overrides.items():
         setattr(args, k, v)
@@ -612,8 +612,34 @@ def test_the_aim_point_sits_below_the_frame_centre():
 
 
 def test_zero_offset_aims_at_the_frame_centre():
-    ctx, _bus, _w = make_ctx(aim_offset_y=0.0)
+    ctx, _bus, _w = make_ctx(aim_offset_x=0.0, aim_offset_y=0.0)
     assert ctx.aim((480, 640)) == (320.0, 240.0)
+
+
+def test_the_aim_point_shifts_sideways_too():
+    """The claw does not sit under the pixel the camera calls centre in EITHER
+    axis. --aim-offset-y covers "the camera is above and behind"; this covers
+    the sideways part. Negative is left, matching image coordinates."""
+    ctx, _bus, _w = make_ctx(aim_offset_x=-90.0, aim_offset_y=0.0)
+    ax, ay = ctx.aim((480, 640, 3))
+    assert (ax, ay) == (230.0, 240.0)
+
+    # And the error is measured from there, so a brick sitting ON the shifted
+    # aim point is done -- not one sitting at the frame centre.
+    assert vs.pixel_error((230.0, 240.0), (480, 640), ctx.aim((480, 640))) == (0.0, 0.0)
+    assert vs.pixel_error((320.0, 240.0), (480, 640), ctx.aim((480, 640))) == (90.0, 0.0)
+
+
+def test_an_aim_point_pushed_off_the_side_is_reported(capsys):
+    """The same silent failure the y check exists for, on the other axis: a box
+    the camera cannot see is a loop that cannot converge, while the detector,
+    the arm and the gains all look healthy."""
+    args = Namespace(aim_offset_x=-400.0, aim_offset_y=0.0,
+                     tolerance_x=45.0, tolerance_y=55.0)
+    vs.report_aim_reachability(args)
+    out = capsys.readouterr().out
+    assert "OFF THE FRAME in x" in out
+    assert "--aim-offset-x" in out
 
 
 def test_error_is_measured_from_the_aim_point_not_the_centre():
@@ -631,7 +657,7 @@ def test_a_brick_already_inside_the_box_needs_no_correction():
     world.offset = (30.0, 25.0)          # inside a 45 x 55 box
     args = Namespace(probe_ticks=40, settle=0.0, deadband=12.0, max_iterations=10,
                      view=False, no_wait=True, recentre="joint", joint_x=1,
-                     joint_y=2, aim_offset_y=0.0, tolerance_x=45.0,
+                     joint_y=2, aim_offset_x=0.0, aim_offset_y=0.0, tolerance_x=45.0,
                      tolerance_y=55.0)
     ctx = vs.Context(bus, FakeCamera(world), FakeDetector(world), args, None)
 
@@ -655,7 +681,7 @@ def test_the_worst_axis_is_chosen_relative_to_its_own_tolerance():
     world.offset = (40.0, 50.0)
     args = Namespace(probe_ticks=40, settle=0.0, deadband=12.0, max_iterations=1,
                      view=False, no_wait=True, recentre="joint", joint_x=1,
-                     joint_y=2, aim_offset_y=0.0, tolerance_x=45.0,
+                     joint_y=2, aim_offset_x=0.0, aim_offset_y=0.0, tolerance_x=45.0,
                      tolerance_y=100.0)
     ctx = vs.Context(bus, FakeCamera(world), FakeDetector(world), args, None)
 
@@ -699,7 +725,7 @@ def test_a_high_gain_run_never_pushes_the_brick_out_of_frame(monkeypatch):
     args = Namespace(probe_ticks=4, settle=0.0, deadband=12.0, max_iterations=80,
                      view=False, no_wait=True, recentre="joint",
                      joint_x=1, joint_y=2,
-                     aim_offset_y=0.0, tolerance_x=12.0, tolerance_y=12.0)
+                     aim_offset_x=0.0, aim_offset_y=0.0, tolerance_x=12.0, tolerance_y=12.0)
     ctx = vs.Context(bus, FakeCamera(world), detector, args, None)
 
     ax, ay = joint_actuators(probe_ticks=args.probe_ticks)
@@ -775,9 +801,13 @@ def test_an_axis_that_costs_more_than_it_gains_is_called_out():
     bus = FakeBus()
     world = CoupledWorld(bus)
     world.offset = (10.0, -120.0)          # mostly a vertical error to fix
+    # Aim pinned to the frame centre: this test is about the COUPLING guard, and
+    # letting the aim offsets fall back to config would make its geometry move
+    # whenever the camera-to-claw offset is re-measured.
     args = Namespace(probe_ticks=20, settle=0.0, deadband=12.0,
                      max_iterations=40, view=False, no_wait=True,
-                     recentre="joint", joint_x=1, joint_y=2)
+                     recentre="joint", joint_x=1, joint_y=2,
+                     aim_offset_x=0.0, aim_offset_y=0.0)
     ctx = vs.Context(bus, FakeCamera(world), FakeDetector(world), args, None)
 
     ax, ay = joint_actuators(probe_ticks=args.probe_ticks)
@@ -942,12 +972,19 @@ def descent_ctx(**overrides):
     world.bus = bus
     args = Namespace(
         probe_ticks=40, settle=0.0, max_iterations=40, view=False, no_wait=True,
-        descend=True, descend_step=20.0, target_z=-64.0, no_confirm=True,
+        # DERIVED, NOT HARDCODED. This was -64.0, which was a legal grasp height
+        # only while TABLE_Z_IN_BASE was -74 mm. When the table was re-measured
+        # to -67.7 mm on 2026-08-07 the floor guard rose to -62.7 and every
+        # descent test began refusing its own target -- a test constant that
+        # silently depended on a measured one. Ask config the same question the
+        # script asks.
+        descend=True, descend_step=20.0, no_confirm=True,
+        target_z=(vs.config.TABLE_Z_IN_BASE + vs.config.PICK_Z_OFFSET) * 1000.0,
         recentre="joint", joint_x=1, joint_y=3,
         descend_probe_mm=8.0, descend_max_reach_mm=25.0,
         no_sideways=False, lock_base=True,
         sideways_budget=vs.config.SERVO_VISUAL_SIDEWAYS_BUDGET_TICKS,
-        aim_offset_y=0.0, tolerance_x=45.0, tolerance_y=55.0,
+        aim_offset_x=0.0, aim_offset_y=0.0, tolerance_x=45.0, tolerance_y=55.0,
     )
     for k, v in overrides.items():
         setattr(args, k, v)
@@ -1009,7 +1046,10 @@ def test_the_descent_actually_descends():
 
     assert heights == sorted(heights, reverse=True), \
         f"height must never increase, got {heights}"
-    assert bus.ticks[2] <= -64 + 1
+    # ticks[2] IS z in mm in this fake world. Derived from the context's own
+    # target for the same reason the target is derived from config: a literal
+    # here silently encodes whatever TABLE_Z_IN_BASE happened to be that week.
+    assert bus.ticks[2] <= ctx.args.target_z + 1
 
 
 def test_each_descent_step_is_a_single_ik_solve():

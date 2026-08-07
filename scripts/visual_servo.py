@@ -268,6 +268,8 @@ class Context:
         # offset. Kept here so every phase and the overlay agree on one answer.
         self.aim_offset_y = getattr(args, "aim_offset_y",
                                     config.SERVO_VISUAL_AIM_OFFSET_Y_PX)
+        self.aim_offset_x = getattr(args, "aim_offset_x",
+                                    config.SERVO_VISUAL_AIM_OFFSET_X_PX)
         self.tolerance = (getattr(args, "tolerance_x",
                                   config.SERVO_VISUAL_TOLERANCE_X_PX),
                           getattr(args, "tolerance_y",
@@ -276,7 +278,7 @@ class Context:
     def aim(self, frame_shape):
         """The pixel the brick is being driven to, for this frame size."""
         h, w = frame_shape[0], frame_shape[1]
-        return (w / 2.0, h / 2.0 + self.aim_offset_y)
+        return (w / 2.0 + self.aim_offset_x, h / 2.0 + self.aim_offset_y)
 
 
 def report_aim_reachability(args) -> None:
@@ -289,28 +291,38 @@ def report_aim_reachability(args) -> None:
     that does not exist. Worth one line at startup rather than fifteen wasted
     iterations and a guess about which subsystem is wrong.
     """
+    aim_x = config.FRAME_WIDTH / 2.0 + getattr(args, "aim_offset_x", 0.0)
     aim_y = config.FRAME_HEIGHT / 2.0 + args.aim_offset_y
-    top, bottom = aim_y - args.tolerance_y, aim_y + args.tolerance_y
-    visible = max(0.0, min(bottom, config.FRAME_HEIGHT) - max(top, 0.0))
-    fraction = visible / (2 * args.tolerance_y)
+    print(f"aim point    x = {aim_x:.0f} of {config.FRAME_WIDTH}, "
+          f"y = {aim_y:.0f} of {config.FRAME_HEIGHT} px")
 
-    print(f"aim point    y = {aim_y:.0f} of {config.FRAME_HEIGHT} px")
-    if fraction >= 0.999:
-        return
-    if visible <= 0:
-        print(f"  *** THE AIM POINT IS OFF THE BOTTOM OF THE FRAME. The brick")
-        print(f"      cannot reach it and this loop CANNOT converge. Reduce")
-        print(f"      --aim-offset-y below "
-              f"{config.FRAME_HEIGHT / 2.0 + args.tolerance_y:.0f}.")
-        return
-    print(f"  NOTE: only {fraction * 100:.0f}% of the target box is on screen "
-          f"(rows {max(top, 0):.0f}-{min(bottom, config.FRAME_HEIGHT):.0f}).")
-    print(f"      The brick must finish in the bottom {visible:.0f} rows, where it")
-    print(f"      may also be clipped by the frame edge — a clipped blob's")
-    print(f"      centroid is biased UPWARD, away from the aim point. If the")
-    print(f"      loop stalls just short, that is the reason. Largest offset")
-    print(f"      keeping the whole box visible: "
-          f"{config.FRAME_HEIGHT / 2.0 - args.tolerance_y:.0f}.")
+    # BOTH AXES. This checked only y until an x offset existed, and the failure
+    # is identical on either: a box the camera cannot see is a loop that cannot
+    # converge, while every other symptom looks healthy -- the detector works,
+    # the arm moves, the gains measure correctly, and it simply never finishes.
+    for axis, centre, half, extent, flag in (
+            ("x", aim_x, args.tolerance_x, config.FRAME_WIDTH, "--aim-offset-x"),
+            ("y", aim_y, args.tolerance_y, config.FRAME_HEIGHT, "--aim-offset-y")):
+        lo, hi = centre - half, centre + half
+        visible = max(0.0, min(hi, extent) - max(lo, 0.0))
+        fraction = visible / (2 * half)
+        if fraction >= 0.999:
+            continue
+        if visible <= 0:
+            print(f"  *** THE AIM POINT IS OFF THE FRAME in {axis}. The brick "
+                  f"cannot reach it")
+            print(f"      and this loop CANNOT converge. Bring {flag} back "
+                  f"inside +/-{extent / 2.0 - half:.0f}.")
+            continue
+        print(f"  NOTE: only {fraction * 100:.0f}% of the target box is on "
+              f"screen in {axis} ({max(lo, 0):.0f}-{min(hi, extent):.0f} "
+              f"of {extent:.0f}).")
+        print(f"      The brick must finish in {visible:.0f} px of {axis}, where it")
+        print(f"      may also be clipped by the frame edge -- a clipped blob's")
+        print(f"      centroid is biased AWAY from the edge, hence away from the")
+        print(f"      aim point. If the loop stalls just short, that is the")
+        print(f"      reason. Largest {flag} keeping the whole box visible: "
+              f"+/-{extent / 2.0 - half:.0f}.")
 
 
 # --- vision ------------------------------------------------------------------
@@ -1467,6 +1479,13 @@ def main() -> None:
                          "the frame centre by this much. Measure it once: put "
                          f"the claw over the brick by hand and read it off the "
                          f"live view (default {config.SERVO_VISUAL_AIM_OFFSET_Y_PX:.0f})")
+    ap.add_argument("--aim-offset-x", type=float,
+                    default=config.SERVO_VISUAL_AIM_OFFSET_X_PX,
+                    help="sideways companion to --aim-offset-y, in pixels, "
+                         "NEGATIVE being left. Same kind of quantity: the claw "
+                         "does not sit under the pixel the camera calls centre "
+                         f"(default {config.SERVO_VISUAL_AIM_OFFSET_X_PX:.0f}, "
+                         "one box length left)")
     ap.add_argument("--tolerance-x", type=float,
                     default=config.SERVO_VISUAL_TOLERANCE_X_PX,
                     help="half-width of the acceptance box, px "
@@ -1508,17 +1527,22 @@ def main() -> None:
     print("Ctrl-C freezes it in place; so does q in the --view window.")
     print("=" * 70)
     print(f"descend      {'yes, ' + str(args.descend_step) + ' mm per step, on your say-so' if args.descend else 'no'}")
+    # Name each axis by what it is doing, not by a formula. "0 px above the
+    # brick" would read as a grasp geometry rather than the deliberate
+    # abandonment of one, and "frame centre" is simply false once x is offset.
+    where = []
     if args.aim_offset_y:
-        print(f"aim          crosshair {args.aim_offset_y:.0f} px ABOVE the brick "
-              f"(camera sits above the claw)")
-    else:
-        # Saying "0 px above the brick" would read as a grasp geometry rather
-        # than the deliberate abandonment of one. The camera sits above and
-        # behind the claw, so a brick centred in the image is short of it.
-        print("aim          frame CENTRE — not the grasp point. The camera sits")
-        print("             above and behind the claw, so the claw will stop")
-        print("             BEHIND a centred brick. Keeps it in frame during the")
-        print("             descent; pass --aim-offset-y to aim to grasp.")
+        where.append(f"{abs(args.aim_offset_y):.0f} px "
+                     f"{'below' if args.aim_offset_y > 0 else 'above'} centre")
+    if args.aim_offset_x:
+        where.append(f"{abs(args.aim_offset_x):.0f} px "
+                     f"{'right' if args.aim_offset_x > 0 else 'left'} of centre")
+    print(f"aim          {' and '.join(where) if where else 'the frame centre'}")
+    if not args.aim_offset_y:
+        print("             VERTICALLY THIS IS NOT THE GRASP POINT. The camera")
+        print("             sits above and behind the claw, so the claw stops")
+        print("             BEHIND a vertically centred brick. Keeps it in frame")
+        print("             during the descent; --aim-offset-y to aim to grasp.")
     print(f"target box   {args.tolerance_x:.0f} x {args.tolerance_y:.0f} px "
           f"around the aim point")
     report_aim_reachability(args)
