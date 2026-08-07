@@ -117,6 +117,67 @@ That is a centring loop commanding 9 mm, moving 0.1 mm, seeing no pixel response
 
 A solution is now taken or refused **whole**, with `SERVO_VISUAL_MAX_ROLL_DEG` joining the pan guard and shrinking the request until a solve fits. Deletion is pinned shut by `test_an_ik_solution_is_commanded_whole_never_censored`.
 
+## FK's ABSOLUTE height is not trustworthy; its DIFFERENTIAL height is (2026-08-07)
+
+The operator touched the tabletop from several postures and read the ticks. Every
+touch is the same flat plane, so FK must return one z for all of them. It does
+not:
+
+| touch | J2 | J3 | FK tip z |
+|---|---|---|---|
+| home (all joints zero) | 0° | 0° | −67.7 mm |
+| C | −76.4° | +53.2° | **+4.6 mm** |
+| A (board base) | −90.8° | +75.4° | **+37.3 mm** |
+
+A and C are **37.7 mm apart horizontally** and **32.6 mm apart in FK z**. Including
+home the spread is 105 mm. The postures differ by 107° of total joint travel while
+the tip barely moves — the regime where kinematic error is most amplified.
+
+**The fault is not in `servo_calibration.json`.** Every hypothesis at that layer was
+scanned and refuted (scratch `fit_calibration.py`), each searched for a value that
+puts BOTH touches on the plane home defines:
+
+- `ticks_per_rad` scale on J2, J3, J4 individually, or all three together — best residual pair +63/+48, and the least-bad common scale (0.44) would mean 360° spans 1800 ticks on a 12-bit encoder;
+- `home_tick` offset on J2, J3, J4 over ±600 ticks — best +55/+18;
+- a free **two-parameter** J2×J3 scale grid — **zero** pairs fit both touches within 5 mm;
+- all **32 `dir_sign`** combinations — best spread 42 mm, stored ranks 8th at 60.9 mm.
+
+So the residual lives in the imported model's geometry or in an assumption about
+it, not in the tick↔radian layer. What is NOT contradicted: link lengths (ruler),
+`dir_sign` (physical jog), and **differential** height — Stage D's 45 mm commanded
+lift moved the FK tip 40.7 mm against a 39 mm ruler reading.
+
+**Consequence, and it caused the 2026-08-07 stall.** A descent commanded to an
+absolute `target_z` is aiming at a number FK cannot deliver: the run drove down
+past the surface until J2 reached 34 ticks of its limit and stalled, and the
+stalled joint's current is what produced the checksum storm and the bus failure.
+Prefer a descent expressed as "N mm from here" over one expressed as "to z = −57.7".
+
+**One plane can refute but cannot identify.** Zhuang, Motaghedi & Roth, *Robot
+Calibration with Planar Constraints* (ICRA 1999): a single-plane constraint leaves
+the identification matrix rank deficient; **three mutually non-parallel planes** are
+the minimum, and then only if the identification Jacobian is nonsingular and the
+points on each plane are not collinear. So the scans above are eliminations, not a
+fit. [`scripts/measure_table_plane.py`](scripts/measure_table_plane.py) collects the
+touches and reports the spread; closing it needs two more surfaces (a book on edge,
+a box side).
+
+**The camera route is shut, for now.** With a correct hand-eye a board flat on the
+table gives the plane for free — `solvePnP` for the board in camera coordinates,
+FK @ hand-eye for the camera in base coordinates — and robot-world hand-eye
+(`AX = ZB`, Zhuang/Roth/Sudhakar 1994; `cv2.calibrateRobotWorldHandEye`) solves
+`Z` = base→world directly, whose translation IS the table height when the board
+lies flat. Both depend on `data/hand_eye.json`, which is known wrong; `AX=ZB` on
+the current samples returns 257 mm against a 24 mm ruler measurement.
+
+### Sources
+
+- H. Zhuang, S. Motaghedi & Z. Roth, [*Robot Calibration with Planar Constraints*](https://ieeexplore.ieee.org/document/770073/), ICRA 1999 — one plane is insufficient; three mutually non-parallel planes, non-collinear points, nonsingular identification Jacobian.
+- H. Zhuang, Z. Roth & R. Sudhakar, [*Simultaneous Robot–World and Hand–Eye Calibration*](https://ieeexplore.ieee.org/document/704233/), IEEE T-RA 10(4), 1994 — the `AX = ZB` formulation whose `Z` is base→world.
+- A. Li et al., [*Solving the Robot-World Hand-Eye(s) Calibration Problem with Iterative Methods*](https://arxiv.org/abs/1907.12425), Machine Vision and Applications 2017 — iterative solvers for the same, more robust than the closed forms.
+- [*A novel robot calibration method with plane constraint*](https://arxiv.org/pdf/2208.02652), arXiv:2208.02652, and [SCALAR](https://arxiv.org/pdf/1803.00747), arXiv:1803.00747 — Levenberg–Marquardt identification under planar constraints, and how many planes each sensing modality needs.
+- [MathWorks, *Estimate Pose of Moving Camera Mounted on a Robot*](https://www.mathworks.com/help/vision/ug/estimate-pose-of-moving-camera-mounted-on-a-robot.html) — the practical eye-in-hand workflow for taking a board on a table into the base frame.
+
 ## home_tick was wrong by up to 268 ticks, and nothing could see it (2026-08-05)
 
 **`matlab/init_arm.m` defines home as all five joint angles ZERO** (`homeAngles = zeros(1,6)`, `HomePosition` reset to 0 per motor joint). FK there returns claw tip `(+70.0, −0.1, −67.7)` mm — 70 mm in front of the base, dead centre in y, hanging below the wrist. That is the arm's reference frame; `home_tick` in `data/servo_calibration.json` is the tick reading at that physical pose, and nothing else.
