@@ -117,6 +117,66 @@ That is a centring loop commanding 9 mm, moving 0.1 mm, seeing no pixel response
 
 A solution is now taken or refused **whole**, with `SERVO_VISUAL_MAX_ROLL_DEG` joining the pan guard and shrinking the request until a solve fits. Deletion is pinned shut by `test_an_ik_solution_is_commanded_whole_never_censored`.
 
+## RULER vs MODEL: the imported geometry is wrong by up to 68 mm (2026-08-07)
+
+Operator measurements at the home pose, heights above the tabletop, against what
+`importrobot` produces. **`scripts/audit_model_axes.py` section E prints the model
+column**; the ruler column is the arm.
+
+| | model | **ruler** | error |
+|---|---|---|---|
+| servo 2 shaft (shoulder) | 158.2 | **90** | **−68.2** |
+| servo 3 shaft (elbow) | 106.4 | **146** | **+39.6** |
+| servo 4 shaft (wrist pitch) | 108.0 | **152** | **+44.0** |
+| wrist (servo 5) | 71.3 | **71.3** | **0** |
+| claw tip | 5.5 | **0** | −5.5 |
+
+**The shoulder number is the one that admits no argument.** That shaft is bolted to
+the base column: no joint angle, no `dir_sign`, no `ticks_per_rad` and no backlash
+can move it, and it is pose-independent (verified at home, hover and an arbitrary
+pose — always 158.2 in the model). The model is simply wrong about where the
+shoulder is.
+
+**The model has the arm the wrong shape.** It puts the elbow 51.8 mm BELOW the
+shoulder; the arm has it 56 mm ABOVE. The upper arm points ~30° down in the model
+and ~33° up in reality. That is what produces the moment-arm inversion above, and
+hence the x2.17 jog discrepancy.
+
+**Also note the claw tip at 0 mm: at home the claw is ON the table**, not ~6 mm
+proud as long assumed. `TABLE_Z_IN_BASE = -0.0732` is unaffected — that value came
+from the touch mean and the ruler pair, not from home's gap.
+
+### Why no fix has been applied yet
+
+**The fix belongs in MATLAB, not in a Python correction layer, and IK decides that.**
+A Python layer corrects FK trivially, but IK runs *inside* MATLAB against the wrong
+geometry: using it would mean inverting a pose-dependent correction around a remote
+solver on every call, and every consumer would have to know which side of the
+correction it is on. The whole motion path goes through IK.
+
+What is missing is data, not intent. Five VERTICAL numbers cannot determine a link
+transform's 3-D translation; pinning z while leaving x and y at whatever the CAD
+says — the same source that got z wrong by 68 mm — yields a model correct in one
+axis at one pose and unknown elsewhere.
+
+Reconstructing it in Python from the ruler alone was tried (scratch `ruler_fk.py`):
+the arm reduces to a three-term planar chain because J2/J3/J4 are parallel, and the
+claw tip at 0 mm pins it with no fitting. On the seven held-out touches it gives a
+**36.5 mm** spread against MATLAB's 73.1 — better, not right. A 3-D scan of the
+tick→angle scales on top of it bottoms out at 27.7 mm while running to the edge of
+its range, so no tick calibration rescues either geometry.
+
+**Suspect the touch data has a floor.** Those touches were taken by hand-pressing a
+limp arm onto the table, which loads every joint against its gear backlash — several
+degrees on these servos, and at a 150 mm moment arm 3° is 8 mm, so 20–40 mm across
+three joints is plausible. The ruler heights carry none of that, which is why they
+are the data to rebuild on.
+
+**To finish it, measure the same five points' FORWARD distance from the base
+column's centre at home.** Ten numbers total determine the planar chain, and then
+the corrected transforms can be written into `init_arm.m` with the touches as an
+independent check.
+
 ## THE MODEL'S J2 MOMENT ARM IS WRONG — confirmed by jog (2026-08-07)
 
 **The fault is in the imported model, not in any JSON.** `data/servo_calibration.json`
