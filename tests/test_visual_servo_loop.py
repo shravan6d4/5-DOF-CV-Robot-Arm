@@ -2080,3 +2080,126 @@ def test_the_slowdown_triggers_on_step_count_not_height():
     line = [l for l in src.splitlines()
             if "SERVO_VISUAL_SLOW_FROM_STEP" in l and "step_n" in l]
     assert line, "the trigger must compare the step counter"
+
+
+# --- picking at a height the table plane does not describe -------------------
+#
+# Answering YES to "flat on the board?" must leave the run exactly as it was.
+# That is the load-bearing property here: this feature is additive, and a
+# regression in the flat path would be a regression in the only path that works.
+
+def test_answering_flat_leaves_the_target_at_the_table_plane(monkeypatch):
+    ctx, _bus, _world = descent_ctx()
+    estimates = descent_estimates(ctx)
+    ctx.detector.blind_after = ctx.detector.calls + 3
+
+    ctx.flat_on_board = True
+    assert vs.descend(ctx, estimates) is True
+
+    _a, tip = vs.tip_position(ctx)
+    expected = config.TABLE_Z_IN_BASE + config.PICK_Z_OFFSET
+    assert tip[2] == pytest.approx(expected, abs=0.002), (
+        "the flat path must still descend to the table plane")
+
+
+def test_a_raised_brick_finishes_relative_to_where_sight_was_lost():
+    """The whole point. The table plane does not describe this brick, so an
+    absolute height derived from it is the wrong target."""
+    ctx, _bus, _world = descent_ctx()
+    estimates = descent_estimates(ctx)
+    ctx.detector.blind_after = ctx.detector.calls + 3
+    ctx.flat_on_board = False
+    ctx.blind_history = []
+
+    assert vs.descend(ctx, estimates) is True
+
+    j = ctx.journey
+    assert j is not None, "a raised descent must record its journey"
+    assert j.drop_mm == pytest.approx(config.SERVO_VISUAL_BLIND_DROP_MM, abs=2.0)
+
+
+def test_a_raised_descent_uses_the_learned_drop_when_there_is_one():
+    from vision_pipeline.planning import blind_travel as bt
+    ctx, _bus, _world = descent_ctx()
+    estimates = descent_estimates(ctx)
+    ctx.detector.blind_after = ctx.detector.calls + 3
+    ctx.flat_on_board = False
+
+    past = bt.BlindJourney(lost_tip=(0.15, 0.0, 0.100), flat_on_board=False)
+    past.step((0.15, 0.0, 0.060))          # 40 mm
+    past.finish(bt.GRIPPED)
+    ctx.blind_history = [past]
+
+    vs.descend(ctx, estimates)
+    assert ctx.journey.drop_mm == pytest.approx(40.0, abs=2.0), (
+        "the log's median must beat the config default once it exists")
+
+
+def test_the_learned_drop_is_capped():
+    from vision_pipeline.planning import blind_travel as bt
+    ctx, _bus, _world = descent_ctx()
+    estimates = descent_estimates(ctx)
+    ctx.detector.blind_after = ctx.detector.calls + 3
+    ctx.flat_on_board = False
+
+    freak = bt.BlindJourney(lost_tip=(0.15, 0.0, 0.300), flat_on_board=False)
+    freak.step((0.15, 0.0, 0.000))         # 300 mm
+    freak.finish(bt.GRIPPED)
+    ctx.blind_history = [freak]
+
+    vs.descend(ctx, estimates)
+    assert ctx.journey.drop_mm <= config.SERVO_VISUAL_BLIND_DROP_MAX_MM + 2.0
+
+
+def test_the_journey_records_every_blind_step_from_the_READ_BACK():
+    """Not from what was commanded. The servos settle short, and this is the
+    regime where FK's differentials are the only trustworthy thing left."""
+    ctx, _bus, _world = descent_ctx()
+    estimates = descent_estimates(ctx)
+    ctx.detector.blind_after = ctx.detector.calls + 3
+    ctx.flat_on_board = False
+    ctx.blind_history = []
+
+    vs.descend(ctx, estimates)
+    assert len(ctx.journey.steps) >= 1
+    for s in ctx.journey.steps:
+        assert len(s) == 3
+
+
+def test_a_flat_descent_still_records_its_journey():
+    """Both answers produce data. The flat runs are what a later raised run has
+    to compare against, and refusing to log them would make the feature depend
+    on the operator having already used it."""
+    ctx, _bus, _world = descent_ctx()
+    estimates = descent_estimates(ctx)
+    ctx.detector.blind_after = ctx.detector.calls + 3
+    ctx.flat_on_board = True
+
+    vs.descend(ctx, estimates)
+    assert ctx.journey is not None
+    assert ctx.journey.flat_on_board is True
+
+
+def test_the_question_is_asked_after_the_go_ahead():
+    """Same reason the go-ahead comes after the hover: by then the operator is
+    looking at the arm and brick in the positions the run will actually use."""
+    src = _source_of(vs.main)
+    go = src.rindex("wait_for_go(ctx)")
+    ask = src.index("ask_flat_on_board(ctx)")
+    probe = src.index("probe_axis(ctx, a, act)")
+    assert go < ask < probe
+
+
+def test_the_question_is_skipped_when_there_is_no_descent():
+    """Nothing about it applies to a centring-only run, and a prompt that
+    changes nothing is a prompt that teaches the operator to hit enter."""
+    src = _source_of(vs.main)
+    ask = src.index("ask_flat_on_board(ctx)")
+    guard = src.rindex("if args.descend:", 0, ask)
+    assert guard < ask
+
+
+def test_the_default_is_flat_so_nothing_changes_by_accident():
+    ctx, _bus, _world = descent_ctx()
+    assert ctx.flat_on_board is True
+    assert ctx.journey is None

@@ -953,6 +953,40 @@ SERVO_VISUAL_SLOW_FROM_STEP = 7
 SERVO_VISUAL_SLOW_STEP_TICKS = 60
 SERVO_VISUAL_SLOW_PAUSE_S = 0.25
 
+# --- picking at heights the table plane does not describe --------------------
+#
+# The single-view pick assumes the brick lies flat on the table at
+# TABLE_Z_IN_BASE and descends to an ABSOLUTE height derived from it. A brick on
+# a book, on another brick, or standing on end breaks that, and one camera
+# cannot detect the breakage without a hand-eye transform this project does not
+# yet have that it can trust.
+#
+# WHAT IS AVAILABLE INSTEAD IS THE MOMENT SIGHT IS LOST. The camera sits above
+# and behind the claw, so the brick leaves the bottom of the frame at a height
+# that depends on where its top surface actually is -- a brick 20 mm higher
+# disappears roughly 20 mm earlier. That moment is a measurement, and it needs
+# no calibration beyond FK's DIFFERENTIAL accuracy, which is the part of FK this
+# arm is good at. Nothing in this path uses FK's absolute z.
+#
+# planning/blind_travel.py logs, per descent: where the tip was when sight was
+# lost, every blind step after it, and whether the claw then found anything.
+# The next run asks that log how far past loss-of-sight the runs that GRIPPED
+# had to travel.
+BLIND_TRAVEL_PATH = "data/blind_travel.json"
+#
+# What to drop below loss-of-sight when the log has nothing to say. Used ONLY
+# for the raised-brick path and ONLY on the first few runs; once journeys that
+# gripped exist, their median replaces it. A guess, and labelled as one wherever
+# it is used: roughly the camera-to-claw vertical offset, i.e. about how far the
+# claw still has to go when the brick leaves the frame.
+SERVO_VISUAL_BLIND_DROP_MM = 25.0
+#
+# Hard ceiling on a relative blind drop, whatever the log or the default says.
+# The floor guard still applies underneath this and is the real protection; this
+# bounds the case where a single freak journey drags the median, since a blind
+# descent is by definition running with nothing reading the image.
+SERVO_VISUAL_BLIND_DROP_MAX_MM = 60.0
+
 # Sideways companion to AIM_OFFSET_Y, and the same kind of quantity: the claw
 # does not sit under the pixel the camera calls centre, so the aim point is the
 # frame centre pushed by the camera-to-claw offset. Y covers the "camera is

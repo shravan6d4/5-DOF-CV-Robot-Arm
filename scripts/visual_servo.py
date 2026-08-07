@@ -118,6 +118,7 @@ from vision_pipeline import config
 from vision_pipeline.capture.camera import Camera
 from vision_pipeline.detection.lego_detector import LegoBrickDetector
 from vision_pipeline.overlay import draw_aim, draw_boards, draw_hud
+from vision_pipeline.planning import blind_travel
 from vision_pipeline.planning.visual_servo import (
     DescentModel,
     ProgressMonitor,
@@ -289,6 +290,14 @@ class Context:
         # the sideways nudges inside a step go through CartesianActuator, which
         # has no idea which descent step it is serving and should not need one.
         self.pace = (config.PICK_STEP_TICKS, config.PICK_STEP_PAUSE_S)
+        # THE RAISED-BRICK PATH, and both default to the old behaviour so that
+        # every existing caller and test gets exactly what it got before.
+        # flat_on_board True means "the table plane describes this brick", which
+        # is what the whole single-view pick has always assumed; ask_flat_on_board
+        # is the only thing that sets it False.
+        self.flat_on_board = True
+        self.journey = None              # set when sight is lost
+        self.blind_history = []          # past journeys, loaded once per run
 
     def slow_down(self, why):
         """Switch to the near-the-table pace. Idempotent; announces once."""
@@ -696,6 +705,87 @@ class CartesianActuator:
         return f"tip ({tip[0] * 1000:+.0f},{tip[1] * 1000:+.0f},{tip[2] * 1000:+.0f})"
 
 
+def ask_flat_on_board(ctx):
+    """Is the brick lying flat on the board? Sets ctx.flat_on_board.
+
+    THE ONE THING THE CAMERA CANNOT TELL US. Every depth this pipeline recovers
+    from a single view comes from intersecting the brick's pixel ray with the
+    plane z = TABLE_Z_IN_BASE, so "how high is the brick" is not measured, it is
+    ASSUMED -- and the assumption is invisible when it is wrong. A brick on a
+    book gives a perfectly well-formed PickTarget that the claw drives straight
+    past the top of.
+
+    Two-view triangulation (PickPipeline.locate_brick_two_view) removes the
+    assumption properly and is the real answer; it needs a hand-eye transform
+    this project does not yet have that it can trust. Until then, the operator
+    can see the answer in a second and the machine cannot see it at all, which
+    makes asking the correct thing to do rather than a shortcut.
+
+    Answering YES leaves the run byte-for-byte as it was. Only NO takes the new
+    path (blind_finish).
+    """
+    ctx.blind_history = blind_travel.load(config.BLIND_TRAVEL_PATH)
+
+    if getattr(ctx.args, "raised", False):
+        ctx.flat_on_board = False
+        print("\n  --raised: treating the brick as NOT flat on the board.")
+    elif getattr(ctx.args, "flat", False) or getattr(ctx.args, "no_wait", False):
+        ctx.flat_on_board = True
+    else:
+        print("\n--- IS THE BRICK FLAT ON THE BOARD? ---")
+        print("  The single-view pick assumes it is: depth comes from")
+        print(f"  intersecting the brick's pixel with the table plane at "
+              f"{config.TABLE_Z_IN_BASE * 1000:+.0f} mm,")
+        print("  so a brick on a book or standing on end is descended straight")
+        print("  past. The camera cannot tell; you can.")
+        try:
+            answer = input("\n  Flat on the board? [Y/n] ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            answer = "y"
+        ctx.flat_on_board = answer not in ("n", "no")
+
+    for line in blind_travel.summarise(ctx.blind_history):
+        print(f"  {line}")
+    if ctx.flat_on_board:
+        print("  -> flat: descending to the table plane, exactly as before.")
+    else:
+        print("  -> RAISED: the descent will finish a measured distance below")
+        print("     where sight of the brick is lost, not at the table plane.")
+    return ctx.flat_on_board
+
+
+def record_journey(ctx, result):
+    """Close out the journey with what the claw found, and save it.
+
+    Never raises: this is a log, and losing a record is a worse outcome than
+    nothing only in the sense that it is mildly annoying. Failing a run that has
+    a brick in its jaws because a JSON write went wrong would be much worse.
+    """
+    if ctx.journey is None:
+        return
+    try:
+        _a, tip = tip_position(ctx)
+    except Exception:                                             # noqa: BLE001
+        tip = None
+
+    if result is None:
+        outcome, contact, past = blind_travel.UNKNOWN, -1, 0
+    elif result.holding:
+        outcome, contact, past = (blind_travel.GRIPPED, result.contact_ticks,
+                                  result.commanded_past)
+    else:
+        outcome, contact, past = blind_travel.AIR, -1, 0
+
+    ctx.journey.finish(outcome, tip, contact, past,
+                       note=result.message if result is not None else "")
+    print(f"\n  blind travel: {ctx.journey.describe()}")
+    try:
+        blind_travel.append(config.BLIND_TRAVEL_PATH, ctx.journey)
+        print(f"  recorded in {config.BLIND_TRAVEL_PATH}")
+    except Exception as e:                                        # noqa: BLE001
+        print(f"  (could not write {config.BLIND_TRAVEL_PATH}: {e})")
+
+
 def hover_residual(bus):
     """Per-joint (landed, target, delta) for the hover pose. Reads only."""
     return [(j, bus.read_position_retrying(j), int(t),
@@ -801,6 +891,9 @@ def offer_grasp(ctx):
 
     result = gripper.auto_close(ctx.bus, lambda line: print(line))
     print(f"\n  {result.message}")
+    # RECORD BEFORE LIFTING. squeeze_and_lift may drive to the hover pose, and
+    # the journey wants the tip where the claw CLOSED, not where it ended up.
+    record_journey(ctx, result)
     if result.holding:
         squeeze_and_lift(ctx, result)
     elif result.outcome == gripper.REACHED:
@@ -1312,6 +1405,69 @@ def tip_position(ctx):
     return angles, T_tip[:3, 3]
 
 
+def blind_finish(ctx, target_z, floor_z, last_seen, why):
+    """Start recording, choose where the bottom is, then hand to descend_blind.
+
+    ADDED 2026-08-07 AND DELIBERATELY A WRAPPER. `descend_blind` below is
+    unchanged and still does exactly what it did: drive straight down to the
+    `target_z` it is given. What is new is who decides that number, and the
+    answer now depends on the one question the operator is asked before a
+    descent -- is the brick flat on the board?
+
+        YES  -> nothing changes. target_z is the table plane plus the pick
+                offset, computed in descend() exactly as before.
+
+        NO   -> the table plane does not describe this brick, so an absolute
+                height derived from it is the wrong target. Descend a MEASURED
+                DISTANCE below where sight was lost instead.
+
+    WHY LOSS OF SIGHT IS THE RIGHT ANCHOR. The camera sits above and behind the
+    claw, so the brick leaves the bottom of the frame at a height that depends
+    on where its top surface actually is -- a brick 20 mm higher disappears
+    roughly 20 mm earlier. So the moment of loss is itself a measurement of the
+    brick's height, taken by the camera, needing no calibration beyond FK's
+    DIFFERENTIAL accuracy. That is the half of FK this arm is good at; its
+    absolute z is the half not to trust, and nothing on this path uses it.
+
+    The distance comes from planning/blind_travel.py: how far past loss of sight
+    the runs that actually GRIPPED had to travel. With no history it falls back
+    to a config default and says so, because a guess announced is a guess the
+    operator can overrule and a guess presented as a measurement is not.
+
+    The floor guard is unchanged and still underneath all of this.
+    """
+    _angles, tip = tip_position(ctx)
+    ctx.journey = blind_travel.BlindJourney(
+        lost_tip=tuple(tip), lost_error_px=last_seen[:2] if last_seen else None,
+        flat_on_board=ctx.flat_on_board)
+
+    if not ctx.flat_on_board:
+        learned = blind_travel.suggest_drop_mm(ctx.blind_history,
+                                               flat_on_board=False)
+        drop_mm = min(learned if learned is not None
+                      else config.SERVO_VISUAL_BLIND_DROP_MM,
+                      config.SERVO_VISUAL_BLIND_DROP_MAX_MM)
+        relative_z = max(tip[2] - drop_mm / 1000.0, floor_z)
+        print(f"\n  RAISED BRICK: descending {drop_mm:.1f} mm below where sight "
+              f"was lost,")
+        if learned is None:
+            print(f"    which is config.SERVO_VISUAL_BLIND_DROP_MM -- A GUESS. "
+                  f"No run has")
+            print(f"    gripped a raised brick yet, so there is nothing to learn "
+                  f"from. This")
+            print(f"    run's outcome becomes the first data point either way.")
+        else:
+            n = len([j for j in ctx.blind_history
+                     if j.outcome == blind_travel.GRIPPED and not j.flat_on_board])
+            print(f"    which is the median of {n} past run"
+                  f"{'s' if n != 1 else ''} that gripped.")
+        print(f"    z {tip[2] * 1000:+.1f} -> {relative_z * 1000:+.1f} mm "
+              f"(table-plane target would have been {target_z * 1000:+.1f})")
+        target_z = relative_z
+
+    return descend_blind(ctx, target_z, floor_z, last_seen, why)
+
+
 def descend_blind(ctx, target_z, floor_z, last_seen, why):
     """Finish the descent straight down, without looking. MOVES THE ARM.
 
@@ -1414,6 +1570,15 @@ def descend_blind(ctx, target_z, floor_z, last_seen, why):
             or (lambda k, n: print(f"      hop {k}/{n}", flush=True)),
         )
         wait_watching(ctx.args.settle, ctx, ["blind descent step done"])
+
+        # RECORD WHERE THAT ACTUALLY PUT THE TIP, not where it was asked to go.
+        # The two differ -- the servos settle short, and this is exactly the
+        # regime where FK's differentials are the only trustworthy thing left --
+        # so the log has to hold the read-back. No behaviour depends on this
+        # line; ctx.journey is None on any path that never lost sight.
+        if ctx.journey is not None:
+            _a, landed = tip_position(ctx)
+            ctx.journey.step(landed)
 
 
 def descend(ctx, estimates):
@@ -1546,7 +1711,7 @@ def descend(ctx, estimates):
 
         centroid, frame = detect_centroid(ctx)
         if centroid is None:
-            return descend_blind(ctx, target_z, floor_z, last_seen,
+            return blind_finish(ctx, target_z, floor_z, last_seen,
                                  "lost sight of the brick between steps")
         ex, ey = pixel_error(centroid, frame.shape, ctx.aim(frame.shape))
         last_seen = (ex, ey, tip[2])
@@ -1593,7 +1758,7 @@ def descend(ctx, estimates):
                 # loudly how far off the aim was.
                 print(f"\n  {reaims - 1} re-aim steps and the brick is still "
                       f"{describe(ex, ey)} of the aim point.")
-                return descend_blind(ctx, target_z, floor_z, (ex, ey, tip[2]),
+                return blind_finish(ctx, target_z, floor_z, (ex, ey, tip[2]),
                                      "re-aiming stopped closing the error")
 
         # How far to descend, and how far to reach out, in one decision.
@@ -1634,7 +1799,7 @@ def descend(ctx, estimates):
             # re-aims rather than abandoning the run a few millimetres up.
             print(f"\n  Step {step_n}: neither descending nor reaching would help.")
             print(f"    {model.describe()}")
-            return descend_blind(ctx, target_z, floor_z, (ex, ey, tip[2]),
+            return blind_finish(ctx, target_z, floor_z, (ex, ey, tip[2]),
                                  "the aiming loop ran out of useful moves")
 
         # The reach offset must go along the direction the arm can ACTUALLY
@@ -1800,7 +1965,7 @@ def descend(ctx, estimates):
         # Did it help? This is the check whose absence caused the runaway.
         confirm, confirm_frame = detect_centroid(ctx)
         if confirm is None:
-            return descend_blind(ctx, target_z, floor_z, last_seen,
+            return blind_finish(ctx, target_z, floor_z, last_seen,
                                  "lost sight of the brick after a sideways move")
         ex3, _ = pixel_error(confirm, confirm_frame.shape,
                              ctx.aim(confirm_frame.shape))
@@ -1878,6 +2043,16 @@ def main() -> None:
                          "starts from wherever the arm happens to be, which is "
                          "not reproducible and makes probe gains from different "
                          "runs incomparable.")
+    ap.add_argument("--flat", action="store_true",
+                    help="the brick IS flat on the board; do not ask. The "
+                         "descent then targets the table plane, which is what "
+                         "it has always done.")
+    ap.add_argument("--raised", action="store_true",
+                    help="the brick is NOT flat on the board (on a book, on "
+                         "another brick, on end); do not ask. The descent then "
+                         "finishes a measured distance below where sight of it "
+                         "is lost, rather than at the table plane. Either way "
+                         "the run is logged to data/blind_travel.json.")
     ap.add_argument("--no-grasp", action="store_true",
                     help="do not offer to close the claw when the descent "
                          "reaches grasp height. The offer is already opt-in "
@@ -2161,6 +2336,13 @@ def main() -> None:
                     print("  detector with: python scripts/run_live_view.py")
                     return
                 report_starting_error(ctx, centroid, frame)
+
+                # ASKED AFTER THE GO-AHEAD, for the same reason the go-ahead
+                # comes after the hover: by now the operator is looking at the
+                # arm and the brick in the positions the run will actually use.
+                # Answering yes leaves the run exactly as it was.
+                if args.descend:
+                    ask_flat_on_board(ctx)
 
                 estimates = [((a, act), probe_axis(ctx, a, act)) for a, act in axes]
                 centre(ctx, estimates)

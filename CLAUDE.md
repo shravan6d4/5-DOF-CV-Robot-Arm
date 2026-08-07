@@ -790,6 +790,24 @@ Two consequences worth keeping straight:
 
 **Any change to `matlab/` requires restarting the server (`>> ik_fk_server`) to take effect.**
 
+#### Picking at a height the table plane does not describe (2026-08-07)
+
+**Every depth this pipeline recovers from one view comes from intersecting the brick's pixel ray with the plane `z = TABLE_Z_IN_BASE`.** So "how high is the brick" is not measured, it is *assumed* — and the assumption is invisible when it is wrong: a brick on a book yields a perfectly well-formed `PickTarget` the claw drives straight past the top of. Two-view triangulation removes the assumption properly and needs a hand-eye transform this project cannot yet trust.
+
+**So the run asks, once, after the go-ahead: "Flat on the board? [Y/n]".** Answering **yes leaves the run byte-for-byte as it was**, which is the load-bearing property — this is additive, and a regression in the flat path would be a regression in the only path that works. `--flat` / `--raised` skip the question.
+
+**What "no" uses instead is the moment sight is lost.** The camera sits above and behind the claw, so the brick leaves the bottom of the frame at a height that depends on where its top surface actually is — a brick 20 mm higher disappears roughly 20 mm earlier. That moment is a **measurement**, and it needs nothing from FK but *differences*, which is the half of FK this arm is good at. Nothing on this path touches FK's absolute z, the half that is wrong by tens of millimetres.
+
+[`planning/blind_travel.py`](src/vision_pipeline/planning/blind_travel.py) logs per descent: the FK tip when sight was lost, every blind step after it (from the **read-back**, not the command — the servos settle short), and whether the claw then found anything. `suggest_drop_mm` answers the next run's question: how far past loss of sight did the runs that actually **GRIPPED** have to travel?
+
+- **Only `GRIPPED` journeys count.** One that shut on air measured where the brick *isn't* — useful to a human reading the log, actively misleading as an input.
+- **Median, not mean.** A run refused early by the floor guard contributes a short drop and one where the brick was knocked over a long one; both are real records and neither should drag the estimate.
+- **No history returns `None`, not a default.** A caller that must handle `None` says out loud that it is guessing; one handed a number does not. `blind_finish` prints "A GUESS" on the first raised run and the sample count thereafter.
+- Flat and raised journeys are kept apart — they are answers to different questions.
+- Capped by `SERVO_VISUAL_BLIND_DROP_MAX_MM`, with the floor guard unchanged underneath.
+
+`blind_finish` is a **wrapper**: `descend_blind` still does exactly what it did, drive straight down to the `target_z` it is given. All that changed is who computes that number — which is what `descend_blind`'s own "TWO-VIEW GOES HERE" note anticipated.
+
 #### Descending and re-aiming are ONE degree of freedom (2026-08-05)
 
 Lowering the claw and correcting the brick's **vertical** position in the image are not independent. Both ride the shoulder/elbow chain, and the camera is on the wrist, so descending swings the view — **~7 px per mm**, measured. A 20 mm step throws the brick ~140 px up the frame, against a 55 px acceptance box.
