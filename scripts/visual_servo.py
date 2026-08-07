@@ -274,6 +274,32 @@ class Context:
                                   config.SERVO_VISUAL_TOLERANCE_X_PX),
                           getattr(args, "tolerance_y",
                                   config.SERVO_VISUAL_TOLERANCE_Y_PX))
+        # HOW FAST THE ARM IS PACED RIGHT NOW, and it changes mid-run.
+        #
+        # The default pace is the whole-repo one (PICK_STEP_TICKS /
+        # PICK_STEP_PAUSE_S), which was made brisker on 2026-08-07. That is fine
+        # while the claw is high: a wrong move up there has room and time. It is
+        # not fine near the table, where the same move ends against the tabletop
+        # -- and the descent's late steps are exactly where the claw is closest
+        # to it and where the run is least reversible.
+        #
+        # So the descent drops back to the older, slower pace from
+        # SERVO_VISUAL_SLOW_FROM_STEP onward, and the blind finish uses it
+        # unconditionally. Kept on the Context rather than passed down because
+        # the sideways nudges inside a step go through CartesianActuator, which
+        # has no idea which descent step it is serving and should not need one.
+        self.pace = (config.PICK_STEP_TICKS, config.PICK_STEP_PAUSE_S)
+
+    def slow_down(self, why):
+        """Switch to the near-the-table pace. Idempotent; announces once."""
+        slow = (config.SERVO_VISUAL_SLOW_STEP_TICKS,
+                config.SERVO_VISUAL_SLOW_PAUSE_S)
+        if self.pace == slow:
+            return False
+        self.pace = slow
+        print(f"    pace: {slow[0]} ticks/hop, {slow[1]:.2f} s between hops "
+              f"({why})")
+        return True
 
     def aim(self, frame_shape):
         """The pixel the brick is being driven to, for this frame size."""
@@ -653,8 +679,7 @@ class CartesianActuator:
         amount_mm = attempt_mm
 
         ctx.bus.move_joints_stepped(
-            targets, step_ticks=config.PICK_STEP_TICKS,
-            pause_s=config.PICK_STEP_PAUSE_S,
+            targets, step_ticks=ctx.pace[0], pause_s=ctx.pace[1],
             progress=live_progress(ctx, f"{self.direction} {amount_mm:+.1f} mm"),
         )
         return amount_mm
@@ -1315,6 +1340,11 @@ def descend_blind(ctx, target_z, floor_z, last_seen, why):
     Returns True if it reached target_z, False if something refused first.
     """
     print(f"\n  --- BLIND FINISH: {why} ---")
+    # UNCONDITIONALLY THE SLOW PACE, whatever step this is. A blind descent is
+    # the lowest the claw gets and the only part of the run with nothing reading
+    # the image, so the operator's eye is the only thing left watching -- give it
+    # the longer pauses even if the loop got here on step 2.
+    ctx.slow_down("blind: nothing is reading the image now")
     if last_seen is None:
         # Never had a fix, so "straight down from here" is down from nowhere in
         # particular. Refusing is the honest answer; a blind descent that was
@@ -1379,8 +1409,7 @@ def descend_blind(ctx, target_z, floor_z, last_seen, why):
         print(f"    IK residual {err_mm:.1f} mm; joints {busy or 'none moved'}")
 
         ctx.bus.move_joints_stepped(
-            targets, step_ticks=config.PICK_STEP_TICKS,
-            pause_s=config.PICK_STEP_PAUSE_S,
+            targets, step_ticks=ctx.pace[0], pause_s=ctx.pace[1],
             progress=live_progress(ctx, "blind descent")
             or (lambda k, n: print(f"      hop {k}/{n}", flush=True)),
         )
@@ -1523,6 +1552,16 @@ def descend(ctx, estimates):
         last_seen = (ex, ey, tip[2])
 
         step_n += 1
+        # SLOW DOWN FOR THE LAST OF IT. The brisk pace is fine while the claw
+        # is high, where a wrong move has room and time; by the late steps the
+        # claw is a few millimetres off the table and the same move ends against
+        # it. Step count rather than height because it is the number that does
+        # not depend on FK's ABSOLUTE z, which is the quantity on this arm least
+        # worth trusting -- a height-triggered slowdown would fire at the wrong
+        # moment exactly when FK is wrong, which is the case it exists for.
+        if step_n >= config.SERVO_VISUAL_SLOW_FROM_STEP:
+            ctx.slow_down(f"step {step_n}: near the table now")
+
         wanted_z = max(tip[2] - ctx.args.descend_step / 1000.0, target_z, floor_z)
         dz_mm = (wanted_z - tip[2]) * 1000.0
 
@@ -1662,7 +1701,7 @@ def descend(ctx, estimates):
              centroid, ctx, ctx.detectors)
 
         ctx.bus.move_joints_stepped(
-            targets, step_ticks=config.PICK_STEP_TICKS, pause_s=config.PICK_STEP_PAUSE_S,
+            targets, step_ticks=ctx.pace[0], pause_s=ctx.pace[1],
             progress=live_progress(ctx, f"descent step {step_n}")
             or (lambda k, n: print(f"      hop {k}/{n}", flush=True)),
         )

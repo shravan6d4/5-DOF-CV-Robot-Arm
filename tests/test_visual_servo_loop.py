@@ -2002,3 +2002,81 @@ def test_the_squeeze_prompt_continues_from_what_auto_close_already_spent():
     src = _source_of(vs.squeeze_and_lift)
     assert "grip.commanded_past" in src
     assert "grip.contact_ticks" in src
+
+
+# --- the descent slows down for its last steps -------------------------------
+#
+# The brisk whole-repo pace is fine while the claw is high; by the late steps it
+# is a few millimetres off the table and the same move ends against it.
+
+def _paced_ctx(**overrides):
+    bus = CartesianBus()
+    world = FakeWorld(bus)
+    args = Namespace(settle=0.0, deadband=12.0, view=False, max_iterations=10,
+                     **overrides)
+    return vs.Context(bus, FakeCamera(world), FakeDetector(world), args, None,
+                      ik=FakeIK(bus))
+
+
+def test_a_run_starts_at_the_repo_wide_pace():
+    ctx = _paced_ctx()
+    assert ctx.pace == (config.PICK_STEP_TICKS, config.PICK_STEP_PAUSE_S)
+
+
+def test_slowing_down_switches_to_the_previous_pace():
+    """The pace the descents that worked were taken at."""
+    ctx = _paced_ctx()
+    assert ctx.slow_down("because")
+    assert ctx.pace == (config.SERVO_VISUAL_SLOW_STEP_TICKS,
+                        config.SERVO_VISUAL_SLOW_PAUSE_S)
+    assert config.SERVO_VISUAL_SLOW_STEP_TICKS < config.PICK_STEP_TICKS
+    assert config.SERVO_VISUAL_SLOW_PAUSE_S > config.PICK_STEP_PAUSE_S
+
+
+def test_slowing_down_announces_once_not_every_step(capsys):
+    """It is called on every step past the threshold; a line per step would
+    bury the descent's own numbers."""
+    ctx = _paced_ctx()
+    assert ctx.slow_down("first")
+    assert not ctx.slow_down("second")
+    out = capsys.readouterr().out
+    assert out.count("pace:") == 1
+
+
+def test_the_descent_slows_from_the_configured_step():
+    src = _source_of(vs.descend)
+    assert "SERVO_VISUAL_SLOW_FROM_STEP" in src
+    trigger = src.index("SERVO_VISUAL_SLOW_FROM_STEP")
+    move = src.index("move_joints_stepped")
+    assert trigger < move, "the pace must change before the step it governs"
+
+
+def test_the_blind_finish_slows_down_whatever_step_it_starts_on():
+    """The lowest the claw gets, and the only part with nothing reading the
+    image -- the operator's eye is all that is left watching."""
+    src = _source_of(vs.descend_blind)
+    assert "slow_down" in src
+    assert "SLOW_FROM_STEP" not in src, "the blind finish must not be conditional"
+
+
+def test_every_paced_move_in_the_loop_reads_the_current_pace():
+    """Including the sideways nudges, which go through CartesianActuator and
+    have no idea which descent step they are serving."""
+    import inspect
+    src = inspect.getsource(vs)
+    assert "step_ticks=config." not in src, (
+        "a move site still passes a config constant directly, so it will keep "
+        "the fast pace after the descent has slowed down")
+    assert src.count("step_ticks=ctx.pace[0]") == 3, (
+        "expected the nudge, the descent and the blind finish to be the three "
+        "paced move sites")
+
+
+def test_the_slowdown_triggers_on_step_count_not_height():
+    """Height is the natural trigger and depends on FK's ABSOLUTE z, the
+    quantity on this arm least worth trusting -- so it would fire at the wrong
+    moment exactly when FK is wrong, which is the case it exists for."""
+    src = _source_of(vs.descend)
+    line = [l for l in src.splitlines()
+            if "SERVO_VISUAL_SLOW_FROM_STEP" in l and "step_n" in l]
+    assert line, "the trigger must compare the step counter"

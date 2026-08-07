@@ -830,6 +830,11 @@ Sideways error still goes through a J1 jog on purpose: J1 is base yaw, it cannot
 
 **`SERVO_MOVE_SPEED_TICKS_S` deliberately stayed at 160 through both changes.** It is the one number bounding how fast the arm is actually MOVING rather than how often it stops, and raising it is the change that would make a wrong move genuinely hard to react to. Take further speed from the pause before the speed.
 
+
+**The descent takes the OLD pace back for its last steps.** From `SERVO_VISUAL_SLOW_FROM_STEP` (7) onward it reverts to 60 ticks / 0.25 s — the pace the descents that worked were taken at — and the blind finish uses it unconditionally, whatever step it starts on, since nothing is reading the image there and the operator's eye is all that is still watching. The brisk pace is fine while the claw is high, where a wrong move has room and time; by the late steps the claw is a few millimetres off the table and the same move ends against it.
+
+**Step count, not height, and deliberately.** Height is the more natural trigger and it depends on FK's ABSOLUTE z, the quantity on this arm least worth trusting — so a height-triggered slowdown would fire at the wrong moment precisely when FK is wrong, which is the case it exists to protect against. The current pace lives on `Context.pace` rather than being passed down, because the sideways nudges go through `CartesianActuator`, which has no idea which descent step it is serving and should not need one.
+
 ## Tuning is centralized in config.py
 
 All thresholds live in [`config.py`](src/vision_pipeline/config.py) — detection tunables (HSV bounds, `MIN_CONTOUR_AREA`, `MORPH_KERNEL_SIZE`, Hough parameters, `STUD_ROI_REFERENCE_PX`/`STUD_ROI_MAX_UPSCALE`/`STUD_HOUGH_PARAM2_UPSCALED`, `STUD_REGION_CLOSE_*`, `SPECULAR_*`, `SHAPE_*`, `STUD_WEIGHT`/`SHAPE_WEIGHT`/`DETECTION_CONFIDENCE_THRESHOLD`) **and** the geometry/calibration tunables (`CAMERA_*` intrinsics, `HAND_EYE_PATH`, `TABLE_Z_IN_BASE`, `PICK_Z_OFFSET`, `APPROACH_HEIGHT`, `PICK_ROLL_DEG`/`PICK_PITCH_DEG`). Detection and calibration classes read these as **constructor defaults**, so tests/callers override per-instance without touching config. When behaviour is wrong, retune here rather than editing logic. Key relationships baked into current values:

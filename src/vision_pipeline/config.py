@@ -930,6 +930,29 @@ SERVO_VISUAL_MAX_REAIM_STEPS = 6
 # move?") and should stay loose.
 SERVO_VISUAL_HOVER_TOLERANCE_TICKS = 15
 
+# --- the descent slows down for its last steps -------------------------------
+#
+# PICK_STEP_TICKS / PICK_STEP_PAUSE_S were made brisker on 2026-08-07 (60/0.25
+# -> 90/0.15). That is fine while the claw is high: a wrong move up there has
+# room and time. It is not fine a few millimetres above the table, where the
+# same move ends against the tabletop -- and the descent's late steps are both
+# where the claw is closest to it and where the run is least reversible.
+#
+# So from this step onward the descent reverts to the PREVIOUS pace, which ran
+# for a day and is the one the descents that worked were taken at. The blind
+# finish uses it unconditionally, whatever step it starts on: nothing is reading
+# the image there, so the operator's eye is the only thing still watching.
+#
+# STEP COUNT, NOT HEIGHT, and deliberately. Height would be the more natural
+# trigger and it depends on FK's ABSOLUTE z, which is the quantity on this arm
+# least worth trusting (see CLAUDE.md) -- so a height-triggered slowdown would
+# fire at the wrong moment precisely when FK is wrong, which is the case it
+# exists to protect against. At 8 mm per step, step 7 is ~50 mm into a descent
+# that starts ~100 mm up, i.e. about the halfway mark.
+SERVO_VISUAL_SLOW_FROM_STEP = 7
+SERVO_VISUAL_SLOW_STEP_TICKS = 60
+SERVO_VISUAL_SLOW_PAUSE_S = 0.25
+
 # Sideways companion to AIM_OFFSET_Y, and the same kind of quantity: the claw
 # does not sit under the pixel the camera calls centre, so the aim point is the
 # frame centre pushed by the camera-to-claw offset. Y covers the "camera is
