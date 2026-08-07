@@ -296,8 +296,12 @@ class Context:
         # is what the whole single-view pick has always assumed; ask_flat_on_board
         # is the only thing that sets it False.
         self.flat_on_board = True
-        self.journey = None              # set when sight is lost
+        self.journey = None              # set when a descent starts
         self.blind_history = []          # past journeys, loaded once per run
+        # Fitted from the whole log at the start of a run. Unfitted by default,
+        # and an unfitted model is never consulted, so a fresh checkout behaves
+        # exactly as it did before any of this existed.
+        self.height_model = blind_travel.HeightModel()
 
     def slow_down(self, why):
         """Switch to the near-the-table pace. Idempotent; announces once."""
@@ -377,14 +381,42 @@ def detect_centroid(ctx, attempts=DETECT_ATTEMPTS):
     is genuinely gone, not that one frame was unlucky. Only if every attempt
     fails is it treated as a real loss.
     """
+    detection, frame = detect_brick(ctx, attempts)
+    return (detection.centroid_px if detection is not None else None), frame
+
+
+def detect_brick(ctx, attempts=DETECT_ATTEMPTS):
+    """As detect_centroid, but hands back the whole Detection.
+
+    ADDED 2026-08-07 and detect_centroid became a wrapper over it, so no
+    existing caller changed. What the extra fields are for: `area` is the one
+    depth cue on this arm that survives the camera rotating, and the loop had
+    been computing it and dropping it on the floor every frame. See
+    planning.blind_travel.HeightModel.
+    """
     frame = None
     for attempt in range(max(1, attempts)):
         for _ in range(SETTLE_FRAMES if attempt == 0 else 1):
             frame = ctx.camera.read_frame()
         detections = ctx.detector.detect(frame)
         if detections:
-            return detections[0].centroid_px, frame
+            return detections[0], frame
     return None, frame
+
+
+def fk_frames(ctx):
+    """(angles, wrist 4x4, tip xyz). Both frames, one round trip.
+
+    The tip is what the height model and the floor guard speak; the WRIST is
+    what triangulation needs, because hand-eye was solved against request_fk
+    (Body08) and chaining it onto the tip would be wrong by the claw's own
+    70 mm. tip_position() is left alone -- it is called from a dozen places that
+    want only the tip.
+    """
+    angles = [ctx.bus.ticks_to_rad(j, ctx.bus.read_position_retrying(j))
+              for j in IK_JOINTS]
+    T_wrist, T_tip = ctx.ik.request_fk_tip(angles)
+    return angles, T_wrist, T_tip[:3, 3]
 
 
 def describe(err_x, err_y):
@@ -725,6 +757,10 @@ def ask_flat_on_board(ctx):
     path (blind_finish).
     """
     ctx.blind_history = blind_travel.load(config.BLIND_TRAVEL_PATH)
+    # Fitted from EVERY journey, flat and raised alike. The relationship between
+    # how big the brick looks and how far there is left to go is a property of
+    # the camera and the brick, not of which answer was given to this question.
+    ctx.height_model = blind_travel.fit_height_model(ctx.blind_history)
 
     if getattr(ctx.args, "raised", False):
         ctx.flat_on_board = False
@@ -754,6 +790,53 @@ def ask_flat_on_board(ctx):
     return ctx.flat_on_board
 
 
+def record_sighting(ctx, step_n, detection, tip, target_z, floor_z):
+    """Log this frame, and on the RAISED path let it move the target.
+
+    STAGE 1 (every path, flat included): store the brick's pixel and AREA with
+    both FK frames. Pure logging -- the flat descent's behaviour does not read
+    any of it back, and the flat runs are precisely where the training data has
+    to come from, since they are the ones that work.
+
+    STAGE 2 (raised only): apparent area is a depth cue that survives the camera
+    rotating, so once HeightModel has been fitted from past grips it can say how
+    much drop remains, from this frame, every step. That is the raised path's
+    answer to the thing the flat path has and it did not: a quantity re-measured
+    at every step and corrected toward, rather than one number committed to at
+    loss of sight.
+
+    Returns the (possibly updated) target_z, or None to mean "stop, you are
+    there". Never returns a target below the floor guard, and never raises the
+    target above where it already is -- a model that suddenly says "further than
+    you thought" mid-descent is a model disagreeing with itself, and the honest
+    response is to keep the deeper commitment and let the log show the argument.
+    """
+    if ctx.journey is not None:
+        try:
+            _a, wrist, tip_now = fk_frames(ctx)
+            ctx.journey.see(step_n, tip_now, wrist.tolist(),
+                            detection.centroid_px, float(detection.area))
+        except Exception as e:                                    # noqa: BLE001
+            print(f"    (could not record the sighting: {e})")
+
+    if ctx.flat_on_board or not ctx.height_model.ready:
+        return target_z
+
+    remaining = ctx.height_model.remaining_mm(float(detection.area))
+    if remaining is None:
+        return target_z
+    if remaining <= 0.0:
+        return None
+
+    wanted = max(tip[2] - remaining / 1000.0, floor_z)
+    if wanted < target_z:                     # only ever commit deeper
+        print(f"    height model: {remaining:.1f} mm still to go "
+              f"(area {detection.area:.0f} px^2) -> target "
+              f"{target_z * 1000:+.1f} to {wanted * 1000:+.1f} mm")
+        return wanted
+    return target_z
+
+
 def record_journey(ctx, result):
     """Close out the journey with what the claw found, and save it.
 
@@ -778,6 +861,33 @@ def record_journey(ctx, result):
 
     ctx.journey.finish(outcome, tip, contact, past,
                        note=result.message if result is not None else "")
+
+    # THE CROSS-CHECK, run once, after the arm has stopped, and never fed back
+    # into anything. Triangulation needs FK @ hand-eye and data/hand_eye.json is
+    # known wrong, so its answer is recorded BESIDE the grip height rather than
+    # used. That is deliberately the arrangement that caught the hand-eye
+    # failure: five solvers agreeing with each other meant nothing until a ruler
+    # disagreed with all of them. What is new is that this referee accumulates
+    # -- every grip is a ground-truth pixel-to-base-frame correspondence the
+    # hand-eye solve never had.
+    if ctx.journey.sightings:
+        try:
+            from vision_pipeline.calibration.pixel_to_world import PixelToWorldCalibrator
+            found = blind_travel.triangulate_sightings(
+                ctx.journey, PixelToWorldCalibrator())
+            ctx.journey.triangulated = found
+            good = [e for e in found if e.get("accepted")]
+            print(f"\n  triangulation: {len(good)} of {len(found)} pairs passed "
+                  f"the parallax/residual gates")
+            for e in good[:3]:
+                vs = (f", {e['vs_grip_mm']:+.1f} mm vs the grip"
+                      if "vs_grip_mm" in e else "")
+                print(f"    steps {e['steps'][0]}-{e['steps'][1]}: z "
+                      f"{e['z_mm']:+.1f} mm ({e['parallax_deg']:.1f} deg, "
+                      f"residual {e['residual_mm']:.1f} mm){vs}")
+        except Exception as e:                                    # noqa: BLE001
+            print(f"  (triangulation cross-check unavailable: {e})")
+
     print(f"\n  blind travel: {ctx.journey.describe()}")
     try:
         blind_travel.append(config.BLIND_TRAVEL_PATH, ctx.journey)
@@ -1437,9 +1547,15 @@ def blind_finish(ctx, target_z, floor_z, last_seen, why):
     The floor guard is unchanged and still underneath all of this.
     """
     _angles, tip = tip_position(ctx)
-    ctx.journey = blind_travel.BlindJourney(
-        lost_tip=tuple(tip), lost_error_px=last_seen[:2] if last_seen else None,
-        flat_on_board=ctx.flat_on_board)
+    if ctx.journey is None:                   # a caller that never descended
+        ctx.journey = blind_travel.BlindJourney(lost_tip=tuple(tip),
+                                                flat_on_board=ctx.flat_on_board)
+    # Re-anchor: the journey has been collecting sightings since the descent
+    # began, and THIS is the moment its lost_tip is about. Overwriting rather
+    # than replacing the object keeps those sightings.
+    ctx.journey.lost_tip = tuple(float(v) for v in tip)
+    ctx.journey.lost_error_px = tuple(last_seen[:2]) if last_seen else None
+    ctx.journey.lost_sight = True
 
     if not ctx.flat_on_board:
         learned = blind_travel.suggest_drop_mm(ctx.blind_history,
@@ -1617,6 +1733,15 @@ def descend(ctx, estimates):
         print("  Already at or below the target height. Nothing to descend.")
         return True
 
+    # THE JOURNEY NOW STARTS HERE, not at loss of sight. Every descent records
+    # what the brick looked like at every step, flat or raised, because the FLAT
+    # runs are the ones that work and are therefore where the height model's
+    # training data comes from. lost_tip holds the start pose until sight is
+    # actually lost, which is what `lost_sight` distinguishes -- drop_mm means
+    # two different things either side of that flag.
+    ctx.journey = blind_travel.BlindJourney(lost_tip=tuple(tip),
+                                            flat_on_board=ctx.flat_on_board)
+
     # ONE SOLVE PER STEP. Descending and correcting the brick's vertical
     # position in the image are not independent -- both ride on the shoulder /
     # elbow chain, and the camera is on the wrist, so descending swings the view
@@ -1709,7 +1834,8 @@ def descend(ctx, estimates):
             print("  act. The offer comes next.")
             return True
 
-        centroid, frame = detect_centroid(ctx)
+        detection, frame = detect_brick(ctx)
+        centroid = detection.centroid_px if detection is not None else None
         if centroid is None:
             return blind_finish(ctx, target_z, floor_z, last_seen,
                                  "lost sight of the brick between steps")
@@ -1717,6 +1843,18 @@ def descend(ctx, estimates):
         last_seen = (ex, ey, tip[2])
 
         step_n += 1
+
+        # RECORD THE SIGHTING, and on the RAISED path only, let it move the
+        # target. Logging happens on every path including flat -- the flat runs
+        # are the ones that work, so they are where the height model's training
+        # data comes from -- but nothing flat reads the result back.
+        target_z = record_sighting(ctx, step_n, detection, tip, target_z, floor_z)
+        if target_z is None:
+            print("\n  AT GRASP HEIGHT by the height model -- the brick looks as "
+                  "big as it")
+            print("  does at a grip. Nothing has been grasped yet; the offer "
+                  "comes next.")
+            return True
         # SLOW DOWN FOR THE LAST OF IT. The brisk pace is fine while the claw
         # is high, where a wrong move has room and time; by the late steps the
         # claw is a few millimetres off the table and the same move ends against

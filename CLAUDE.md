@@ -808,6 +808,30 @@ Two consequences worth keeping straight:
 
 `blind_finish` is a **wrapper**: `descend_blind` still does exactly what it did, drive straight down to the `target_z` it is given. All that changed is who computes that number — which is what `descend_blind`'s own "TWO-VIEW GOES HERE" note anticipated.
 
+
+##### The raised path's feedback loop: apparent SIZE, not the descent model
+
+The flat path self-corrects because it re-measures pixel error every step. The raised path needed the same shape for *height*, and the obvious candidate is `DescentModel`'s `a` (px per mm of descent) — closer brick, more pixels per mm. **It is not an inverse-depth signal, and the run data says so:** measured 2026-08-07, `a` **fell** 4.72 → 3.08 px/mm as the claw came down on the brick. Parallax would have made it grow. `a` is dominated by the camera *rotating* as the wrist swings, which is depth-independent, and separating the terms needs the camera's rotation rate — i.e. hand-eye, the thing being avoided.
+
+**Apparent AREA has none of that trouble.** It is invariant to camera rotation about any axis, needs no hand-eye and no intrinsics (focal length folds into the fitted constant), and for a target of fixed physical size `√area ~ 1/Z`, so `remaining_mm = c/√area − d`. `Detection.area` already existed and `detect_centroid` was discarding it every frame; `detect_brick` now hands back the whole `Detection` and `detect_centroid` is a wrapper, so no existing caller changed.
+
+**The ground truth is the grip.** Every journey that gripped knows where the claw finally closed, so each of its sightings yields a training pair: what the brick looked like then, and how much drop actually remained. `HeightModel` is fitted **across runs** from the whole log (it is a property of the camera and the brick, not of one run) and refitted at the start of every run — the same discipline `DescentModel` applies per step.
+
+- **Flat AND raised runs both train it.** Unlike `suggest_drop_mm`, which keeps them apart. The flat runs are the ones that work, so excluding them would starve the model the raised path depends on.
+- **`ready` needs `MIN_PAIRS` (8) spanning `MIN_SPREAD` (25%) of apparent size.** A fit over sightings that all looked the same size is a fit to noise with a confident slope — the same failure as a hand-eye capture whose rotations were all too small.
+- The model may commit the target **deeper, never shallower**. A model that mid-descent says "further than you thought" is disagreeing with itself; keep the deeper commitment and let the log show the argument.
+- Unfitted ⇒ never consulted, so the raised path falls back to `drop_mm` exactly as before.
+
+##### Triangulation is the referee, not the answer
+
+The descent is already a stereo rig: a frame per step with the arm's pose for each. Adjacent 8 mm steps give only 2.3° of parallax at 200 mm — under the 5° gate — but **three steps apart is 24 mm and 6.8°**, which passes, hence `min_step_gap` rather than consecutive pairs. `triangulate_sightings` runs once after the arm has stopped, wrapped, and **never feeds control**: it needs FK @ hand-eye and `data/hand_eye.json` is known wrong.
+
+It logs the triangulated z beside the grip height. That is deliberately the arrangement that caught the hand-eye failure — five solvers agreeing with each other meant nothing until a ruler disagreed with all of them — except **this referee accumulates**. Every successful grip is a ground-truth pixel-to-base-frame correspondence generated free by a run that was happening anyway, which is the held-out data the hand-eye solve has never had. `triangulation_verdict` reports the median against the grip and says plainly whether the transform can be promoted.
+
+Sightings store **both FK frames**: the tip for the height model and the floor guard, the **wrist** for triangulation, because hand-eye was solved against `request_fk` (Body08) and chaining it onto the tip would be wrong by the claw's own 70 mm.
+
+**None of this reaches the flat descent.** Logging happens on every path; reading it back is gated on `not ctx.flat_on_board`, and `test_the_flat_descent_never_consults_the_height_model` holds a fitted model on the context and asserts the flat run still lands on the table plane.
+
 #### Descending and re-aiming are ONE degree of freedom (2026-08-05)
 
 Lowering the claw and correcting the brick's **vertical** position in the image are not independent. Both ride the shoulder/elbow chain, and the camera is on the wrist, so descending swings the view — **~7 px per mm**, measured. A 20 mm step throws the brick ~140 px up the frame, against a 55 px acceptance box.

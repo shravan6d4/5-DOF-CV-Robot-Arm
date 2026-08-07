@@ -93,9 +93,12 @@ class FakeWorld:
 
 
 class FakeDetection:
-    def __init__(self, centroid):
+    def __init__(self, centroid, area=4000.0):
         self.centroid_px = centroid
         self.confidence = 0.9
+        # Real Detections carry this and the loop had been discarding it. The
+        # height model reads it, so the fake has to have one.
+        self.area = area
 
 
 class FakeCamera:
@@ -2125,7 +2128,8 @@ def test_a_raised_descent_uses_the_learned_drop_when_there_is_one():
     ctx.detector.blind_after = ctx.detector.calls + 3
     ctx.flat_on_board = False
 
-    past = bt.BlindJourney(lost_tip=(0.15, 0.0, 0.100), flat_on_board=False)
+    past = bt.BlindJourney(lost_tip=(0.15, 0.0, 0.100), flat_on_board=False,
+                           lost_sight=True)
     past.step((0.15, 0.0, 0.060))          # 40 mm
     past.finish(bt.GRIPPED)
     ctx.blind_history = [past]
@@ -2142,7 +2146,8 @@ def test_the_learned_drop_is_capped():
     ctx.detector.blind_after = ctx.detector.calls + 3
     ctx.flat_on_board = False
 
-    freak = bt.BlindJourney(lost_tip=(0.15, 0.0, 0.300), flat_on_board=False)
+    freak = bt.BlindJourney(lost_tip=(0.15, 0.0, 0.300), flat_on_board=False,
+                            lost_sight=True)
     freak.step((0.15, 0.0, 0.000))         # 300 mm
     freak.finish(bt.GRIPPED)
     ctx.blind_history = [freak]
@@ -2203,3 +2208,117 @@ def test_the_default_is_flat_so_nothing_changes_by_accident():
     ctx, _bus, _world = descent_ctx()
     assert ctx.flat_on_board is True
     assert ctx.journey is None
+
+
+# --- stage 2: the height model steers the RAISED descent only ----------------
+#
+# The flat path is the only one that works, so the guarantee that matters most
+# here is that none of this reaches it.
+
+def _fitted_model(c=900.0, d=5.0):
+    from vision_pipeline.planning import blind_travel as bt
+    return bt.HeightModel(c=c, d=d, n=50, rms_mm=0.4)
+
+
+def test_the_flat_descent_never_consults_the_height_model():
+    """THE GUARANTEE. Even with a model fitted and sitting on the context, a
+    flat run must reach exactly the target it always reached."""
+    ctx, _bus, _world = descent_ctx()
+    estimates = descent_estimates(ctx)
+    ctx.detector.blind_after = ctx.detector.calls + 3
+    ctx.flat_on_board = True
+    ctx.height_model = _fitted_model()
+
+    assert vs.descend(ctx, estimates) is True
+    _a, tip = vs.tip_position(ctx)
+    assert tip[2] == pytest.approx(config.TABLE_Z_IN_BASE + config.PICK_Z_OFFSET,
+                                   abs=0.002)
+
+
+def test_a_raised_descent_stops_where_the_height_model_says():
+    """The feedback loop. The area is re-read every step, so the target is a
+    re-measured quantity rather than one number committed to at loss of sight."""
+    ctx, _bus, _world = descent_ctx()
+    estimates = descent_estimates(ctx)
+    ctx.flat_on_board = False
+    ctx.height_model = _fitted_model()
+
+    assert vs.descend(ctx, estimates) is True
+    assert ctx.journey is not None and ctx.journey.sightings
+
+
+def test_the_model_may_commit_deeper_but_never_shallower():
+    """A model that suddenly says 'further than you thought' mid-descent is
+    disagreeing with itself; keeping the deeper commitment and letting the log
+    show the argument beats yo-yoing the target."""
+    ctx, _bus, _world = descent_ctx()
+    ctx.flat_on_board = False
+    ctx.height_model = _fitted_model()
+
+    # area 8100 -> 900/90 - 5 = 5 mm remaining, i.e. shallower than the target.
+    class Near:
+        centroid_px = (320.0, 240.0)
+        area = 8100.0
+    kept = vs.record_sighting(ctx, 1, Near(), (0.15, 0.0, 0.100), -0.050, -0.068)
+    assert kept == -0.050, "a shallower suggestion must not raise the target"
+
+    # area 200 -> 900/14.1 - 5 = 58.6 mm remaining, deeper than the target.
+    class Far:
+        centroid_px = (320.0, 240.0)
+        area = 200.0
+    deeper = vs.record_sighting(ctx, 2, Far(), (0.15, 0.0, 0.000), -0.050, -0.068)
+    assert deeper < -0.050, "a deeper suggestion must be taken"
+    assert deeper >= -0.068, "and never past the floor guard"
+
+
+def test_sightings_are_recorded_on_the_FLAT_path_too():
+    """The flat runs are the ones that work, so they are where the training
+    data has to come from. Excluding them would starve the model the raised
+    path depends on."""
+    ctx, _bus, _world = descent_ctx()
+    estimates = descent_estimates(ctx)
+    ctx.flat_on_board = True
+    ctx.detector.blind_after = ctx.detector.calls + 4
+
+    vs.descend(ctx, estimates)
+    assert ctx.journey.sightings, "a flat descent recorded nothing"
+    assert all(s.area > 0 for s in ctx.journey.sightings)
+
+
+def test_a_sighting_carries_both_fk_frames():
+    """The tip is what the height model and the floor guard speak; the WRIST is
+    what triangulation needs, because hand-eye was solved against request_fk and
+    chaining it onto the tip would be wrong by the claw's own 70 mm."""
+    ctx, _bus, _world = descent_ctx()
+    estimates = descent_estimates(ctx)
+    ctx.detector.blind_after = ctx.detector.calls + 4
+    vs.descend(ctx, estimates)
+
+    s = ctx.journey.sightings[0]
+    assert len(s.wrist) == 4 and len(s.wrist[0]) == 4
+    assert len(s.tip) == 3
+
+
+def test_detect_centroid_still_returns_what_it_always_did():
+    """It became a wrapper over detect_brick; a dozen callers depend on the
+    old two-tuple."""
+    ctx, _bus, _world = descent_ctx()
+    centroid, frame = vs.detect_centroid(ctx)
+    assert centroid is not None and len(centroid) == 2
+    assert frame is not None
+
+
+def test_an_unfitted_model_leaves_the_raised_path_as_it_was():
+    """Falls back to the loss-of-sight drop, which is what it did before any of
+    this existed."""
+    ctx, _bus, _world = descent_ctx()
+    estimates = descent_estimates(ctx)
+    ctx.detector.blind_after = ctx.detector.calls + 3
+    ctx.flat_on_board = False
+    ctx.blind_history = []
+    from vision_pipeline.planning import blind_travel as bt
+    ctx.height_model = bt.HeightModel()
+
+    vs.descend(ctx, estimates)
+    assert ctx.journey.drop_mm == pytest.approx(config.SERVO_VISUAL_BLIND_DROP_MM,
+                                                abs=2.0)

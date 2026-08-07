@@ -54,6 +54,34 @@ UNKNOWN = "unknown"       # the run ended before the claw was closed
 
 
 @dataclass
+class Sighting:
+    """One frame in which the brick was seen, and where the arm was for it.
+
+    Everything a depth estimate could want, recorded raw so the estimating can
+    be redone later against better calibration than exists today:
+
+        tip / wrist -- FK, both of them. The tip is what the height model uses;
+            the WRIST is what triangulation needs, because hand-eye was solved
+            against request_fk (Body08) and chaining it onto the tip would be
+            wrong by the claw's own 70 mm.
+        px, area -- the brick in the image. Area is the one depth cue on this
+            arm that survives the camera rotating (see HeightModel).
+    """
+
+    step: int
+    tip: tuple
+    wrist: list                  # 4x4, row-major, JSON-friendly
+    px: tuple
+    area: float
+
+    def __post_init__(self):
+        self.tip = tuple(float(v) for v in self.tip)
+        self.px = tuple(float(v) for v in self.px)
+        self.area = float(self.area)
+        self.wrist = [[float(v) for v in row] for row in self.wrist]
+
+
+@dataclass
 class BlindJourney:
     """One descent's worth of "what happened after the camera stopped helping".
 
@@ -65,8 +93,16 @@ class BlindJourney:
     lost_tip: tuple                      # FK claw tip when sight was lost
     lost_error_px: Optional[tuple] = None    # aim error at that moment
     flat_on_board: bool = True           # what the operator answered
+    # Was sight ACTUALLY lost, or did the descent finish with the brick still
+    # visible? Until it is, lost_tip holds the descent's starting pose, so
+    # drop_mm means "how far this descent went" rather than "how far past loss
+    # of sight" -- two different quantities, and only the second one may inform
+    # suggest_drop_mm.
+    lost_sight: bool = False
     when: str = ""
     steps: list = field(default_factory=list)   # tip after each blind step
+    sightings: list = field(default_factory=list)   # every frame the brick was seen in
+    triangulated: list = field(default_factory=list)  # cross-check, never control
     outcome: str = UNKNOWN
     grip_tip: Optional[tuple] = None     # FK tip when the claw closed
     contact_ticks: int = -1
@@ -77,8 +113,20 @@ class BlindJourney:
         if not self.when:
             self.when = datetime.now(timezone.utc).isoformat(timespec="seconds")
         self.lost_tip = tuple(float(v) for v in self.lost_tip)
+        self.sightings = [s if isinstance(s, Sighting) else Sighting(**s)
+                          for s in self.sightings]
 
     # --- recording ----------------------------------------------------------
+
+    def see(self, step: int, tip, wrist, px, area) -> None:
+        """Record one frame in which the brick was visible.
+
+        Called on EVERY descent step, flat or raised. A journey object exists
+        from the start of a descent now rather than only from loss of sight, so
+        that the flat runs -- which are the ones that work -- contribute their
+        data too. Nothing about a flat run's behaviour reads any of this.
+        """
+        self.sightings.append(Sighting(step, tip, wrist, px, area))
 
     def step(self, tip) -> None:
         """Note where the tip ended up after one blind step."""
@@ -193,7 +241,7 @@ def suggest_drop_mm(journeys, flat_on_board: Optional[bool] = None):
     a caller that has to handle None will say out loud that it is guessing,
     whereas one handed a number will not.
     """
-    usable = [j for j in journeys if j.outcome == GRIPPED]
+    usable = [j for j in journeys if j.outcome == GRIPPED and j.lost_sight]
     if flat_on_board is not None:
         usable = [j for j in usable if j.flat_on_board == flat_on_board]
     if not usable:
@@ -201,17 +249,214 @@ def suggest_drop_mm(journeys, flat_on_board: Optional[bool] = None):
     return statistics.median(j.drop_mm for j in usable)
 
 
+# --- how far is there left to go? -------------------------------------------
+
+class HeightModel:
+    """Remaining drop, estimated from how big the brick looks. No hand-eye.
+
+    WHY APPARENT SIZE AND NOT THE DESCENT MODEL. The obvious candidate is
+    planning.visual_servo.DescentModel's `a`, px of image motion per mm of
+    descent, which looks like an inverse-depth signal -- closer brick, more
+    pixels per mm. It is not. Measured on hardware 2026-08-07, `a` FELL from
+    4.72 to 3.08 px/mm as the claw came down on the brick; parallax would have
+    made it grow. It is dominated by the camera ROTATING as the wrist swings,
+    which is depth-independent, and separating the two terms needs the camera's
+    rotation rate -- which is hand-eye, which is the thing being avoided.
+
+    Apparent AREA has none of that trouble. It is invariant to camera rotation
+    about any axis, needs no hand-eye and no intrinsics (the focal length folds
+    into the fitted constant), and for a target of fixed physical size
+
+        sqrt(area)  ~  1 / Z          =>      Z  ~  c / sqrt(area)
+
+    so the drop still to come is affine in 1/sqrt(area):
+
+        remaining_mm  =  c / sqrt(area)  -  d
+
+    THE GROUND TRUTH IS THE GRIP. Each journey that gripped knows where the claw
+    finally closed, so every sighting in it yields a training pair: what the
+    brick looked like then, and how much drop actually remained. That pairing
+    costs nothing -- the run was happening anyway -- and it is the only
+    measurement in this project that has never been wrong about height.
+
+    FIT ACROSS RUNS, not within one. There is no useful fit from a single
+    descent's worth of sightings early on, and the relationship is a property of
+    the camera and the brick rather than of one run. Refitted every run from the
+    whole log, the same way DescentModel refits every step.
+
+    Not trusted blindly: `ready` requires a minimum number of pairs spanning a
+    real range of apparent size, because a fit over sightings that all look the
+    same size is a fit to noise with a confident-looking slope.
+    """
+
+    MIN_PAIRS = 8
+    MIN_SPREAD = 0.25       # fractional range of 1/sqrt(area) the pairs must span
+
+    def __init__(self, c: float = None, d: float = None, n: int = 0,
+                 rms_mm: float = float("nan")):
+        self.c, self.d, self.n, self.rms_mm = c, d, n, rms_mm
+
+    @property
+    def ready(self) -> bool:
+        return self.c is not None and self.d is not None
+
+    def remaining_mm(self, area: float):
+        """Drop still to come, or None if the model cannot say."""
+        if not self.ready or area <= 0:
+            return None
+        return self.c / (area ** 0.5) - self.d
+
+    def describe(self) -> str:
+        if not self.ready:
+            return "height model: not fitted"
+        return (f"height model: remaining = {self.c:.0f}/sqrt(area) - {self.d:.1f} "
+                f"mm  ({self.n} pairs, rms {self.rms_mm:.1f} mm)")
+
+
+def training_pairs(journeys, flat_on_board=None):
+    """(1/sqrt(area), remaining_mm) from every sighting of every gripped run."""
+    pairs = []
+    for j in journeys:
+        if j.outcome != GRIPPED or j.grip_tip is None:
+            continue
+        if flat_on_board is not None and j.flat_on_board != flat_on_board:
+            continue
+        for s in j.sightings:
+            if s.area <= 0:
+                continue
+            pairs.append((1.0 / (s.area ** 0.5),
+                          (s.tip[2] - j.grip_tip[2]) * 1000.0))
+    return pairs
+
+
+def fit_height_model(journeys, flat_on_board=None) -> HeightModel:
+    """Least-squares fit of remaining_mm = c*(1/sqrt(area)) - d.
+
+    Returns an unfitted model rather than raising when there is not enough to go
+    on -- the caller then falls back to the loss-of-sight drop, which is what it
+    did before this existed.
+    """
+    pairs = training_pairs(journeys, flat_on_board)
+    if len(pairs) < HeightModel.MIN_PAIRS:
+        return HeightModel(n=len(pairs))
+
+    xs = [p[0] for p in pairs]
+    lo, hi = min(xs), max(xs)
+    if hi <= 0 or (hi - lo) / hi < HeightModel.MIN_SPREAD:
+        # Every sighting looked the same size, so the slope is unconstrained.
+        # A fit here would be noise wearing a confident face.
+        return HeightModel(n=len(pairs))
+
+    n = len(pairs)
+    sx = sum(xs)
+    sy = sum(p[1] for p in pairs)
+    sxx = sum(x * x for x in xs)
+    sxy = sum(x * y for x, y in pairs)
+    denom = n * sxx - sx * sx
+    if abs(denom) < 1e-18:
+        return HeightModel(n=n)
+    c = (n * sxy - sx * sy) / denom
+    intercept = (sy - c * sx) / n
+    rms = (sum((c * x + intercept - y) ** 2 for x, y in pairs) / n) ** 0.5
+    return HeightModel(c=c, d=-intercept, n=n, rms_mm=rms)
+
+
+# --- the cross-check ---------------------------------------------------------
+
+def triangulate_sightings(journey, calibrator, min_step_gap: int = 3,
+                          min_parallax_deg: float = 5.0,
+                          max_residual_m: float = 0.010) -> list:
+    """Two-view depth from the descent's own frames. NEVER feeds control.
+
+    THE DESCENT IS ALREADY A STEREO RIG. It takes a frame at every step and
+    knows the arm's pose for each, so a baseline is free -- but only between
+    steps far enough apart. At ~200 mm from the brick, adjacent 8 mm steps give
+    2.3 deg of parallax, under the 5 deg gate; three steps apart is 24 mm and
+    6.8 deg, which passes. Hence min_step_gap rather than consecutive pairs.
+
+    WHY THIS IS A CROSS-CHECK AND NOT THE ANSWER. Triangulation needs the
+    camera's base-frame pose, which is FK @ hand-eye, and data/hand_eye.json is
+    known wrong -- 52 mm and 91 deg out. So its answer is recorded beside the
+    grip height and never acted on. That is deliberately the same arrangement
+    that caught the hand-eye failure in the first place: five solvers agreeing
+    with each other meant nothing until a ruler disagreed with all of them.
+
+    What makes this different from a ruler is that it accumulates. Every
+    successful grip is a ground-truth pixel-to-base-frame correspondence
+    generated free by a run that was happening anyway, so the residual below is
+    the held-out measurement hand-eye has never had.
+
+    Returns a list of dicts, JSON-safe, one per usable pair.
+    """
+    out = []
+    sightings = list(journey.sightings)
+    for i in range(len(sightings)):
+        for k in range(i + min_step_gap, len(sightings)):
+            a, b = sightings[i], sightings[k]
+            try:
+                import numpy as np
+                result = calibrator.triangulate_pixels([
+                    (a.px, np.array(a.wrist, dtype=float)),
+                    (b.px, np.array(b.wrist, dtype=float)),
+                ])
+            except Exception as e:                                # noqa: BLE001
+                logger.debug(f"triangulation failed for {i}/{k}: {e}")
+                continue
+            if result is None:
+                continue
+            entry = {
+                "steps": [a.step, b.step],
+                "z_mm": float(result.point_base[2]) * 1000.0,
+                "parallax_deg": float(result.parallax_deg),
+                "residual_mm": float(result.residual_m) * 1000.0,
+                "accepted": bool(result.parallax_deg >= min_parallax_deg
+                                 and result.residual_m <= max_residual_m),
+            }
+            if journey.grip_tip is not None:
+                entry["vs_grip_mm"] = entry["z_mm"] - journey.grip_tip[2] * 1000.0
+            out.append(entry)
+    return out
+
+
+def triangulation_verdict(journeys) -> list:
+    """Does triangulation agree with where the claw actually touched?
+
+    The whole point of logging it. Reports over every accepted pair in the log,
+    against the one number that cannot be argued with.
+    """
+    errs = [e["vs_grip_mm"] for j in journeys for e in j.triangulated
+            if e.get("accepted") and "vs_grip_mm" in e]
+    if not errs:
+        return ["triangulation: no accepted pairs with a grip to check against"]
+    med = statistics.median(errs)
+    spread = max(errs) - min(errs)
+    lines = [f"triangulation vs grip: median {med:+.1f} mm over {len(errs)} "
+             f"pair{'s' if len(errs) != 1 else ''}, spread {spread:.1f} mm"]
+    if abs(med) < 10.0 and spread < 30.0:
+        lines.append("  -> agrees with the grip. hand_eye.json may be usable for "
+                     "height after all; check with scripts/hand_eye_report.py "
+                     "before promoting it.")
+    else:
+        lines.append("  -> DISAGREES. Consistent with data/hand_eye.json being "
+                     "wrong (52 mm / 91 deg). This is the held-out measurement "
+                     "the hand-eye solve never had.")
+    return lines
+
+
 def summarise(journeys) -> list:
     """A few lines about the history, for printing at the start of a run."""
     if not journeys:
         return ["no blind-travel history yet"]
     gripped = [j for j in journeys if j.outcome == GRIPPED]
+    sightings = sum(len(j.sightings) for j in journeys)
     lines = [f"{len(journeys)} journey{'s' if len(journeys) != 1 else ''} "
-             f"recorded, {len(gripped)} of them gripped"]
+             f"recorded, {len(gripped)} of them gripped, {sightings} sightings"]
     for flat, label in ((True, "flat on the board"), (False, "raised")):
         drop = suggest_drop_mm(journeys, flat_on_board=flat)
-        n = len([j for j in gripped if j.flat_on_board == flat])
+        n = len([j for j in gripped if j.flat_on_board == flat and j.lost_sight])
         if drop is not None:
             lines.append(f"  {label}: {drop:.1f} mm below loss of sight "
                          f"(median of {n})")
+    lines.append("  " + fit_height_model(journeys).describe())
+    lines.extend("  " + l for l in triangulation_verdict(journeys))
     return lines
