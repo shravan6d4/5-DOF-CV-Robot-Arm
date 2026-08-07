@@ -1035,6 +1035,105 @@ def tip_position(ctx):
     return angles, T_tip[:3, 3]
 
 
+def descend_blind(ctx, target_z, floor_z, last_seen, why):
+    """Finish the descent straight down, without looking. MOVES THE ARM.
+
+    LOSING THE BRICK NEAR THE END IS NORMAL, NOT A FAULT. The camera sits above
+    and behind the claw, so as the tool comes down the brick slides out of the
+    bottom of the frame -- and it does so precisely when the loop has nearly
+    finished. Treating that as a failure stopped the run at the one moment it
+    had already done its job, and left the claw hovering above a brick it could
+    no longer see.
+
+    A blind finish is geometrically sound in a way a blind START would not be.
+    Every step here asks for the SAME x and y with a lower z, so the tool goes
+    straight down in the base frame and stays over whatever it was over. The
+    reach correction is dropped deliberately: its only purpose is to cancel the
+    image swing a descent causes, and nothing is reading the image now. What
+    the loop gives up is the ability to fix an aim error it cannot see, which is
+    why the last-seen error is reported below rather than quietly discarded --
+    if the claw lands off, that number says by how much and in which direction.
+
+    TWO-VIEW GOES HERE. `target_z` is the one input this function needs, and it
+    currently arrives as the table plane. Once triangulation is trusted
+    (PickPipeline.locate_brick_two_view), the brick's own measured height
+    replaces it and nothing else in this function changes -- the caller decides
+    what "the bottom" means, and this drives to it.
+
+    Returns True if it reached target_z, False if something refused first.
+    """
+    print(f"\n  --- BLIND FINISH: {why} ---")
+    if last_seen is None:
+        # Never had a fix, so "straight down from here" is down from nowhere in
+        # particular. Refusing is the honest answer; a blind descent that was
+        # never aimed is not a descent, it is a guess with a floor guard.
+        print("    But the brick was never detected during this descent, so there")
+        print("    is no aim to hold. The arm is holding where it stands.")
+        return False
+
+    ex, ey, seen_z = last_seen
+    tol_x, tol_y = ctx.tolerance
+    in_box = abs(ex) <= tol_x and abs(ey) <= tol_y
+    print(f"    Last seen {describe(ex, ey)} of the aim point, at z "
+          f"{seen_z * 1000:+.1f} mm.")
+    if in_box:
+        print(f"    That is inside the {tol_x:.0f} x {tol_y:.0f} px box, so the "
+              f"claw is over the brick and")
+        print("    descending straight down keeps it there.")
+    else:
+        print(f"    *** That is OUTSIDE the {tol_x:.0f} x {tol_y:.0f} px box. The "
+              f"claw was not over the")
+        print("    brick when sight was lost, and going straight down will not put")
+        print("    it there. Expect a miss in that direction, not a grasp.")
+
+    while True:
+        angles, tip = tip_position(ctx)
+        if tip[2] - target_z <= 0.001:
+            print(f"\n  AT TARGET HEIGHT — tip z {tip[2] * 1000:+.1f} mm, reached "
+                  f"blind.")
+            print("  Nothing has been grasped: closing the gripper is a separate act.")
+            return True
+
+        next_z = max(tip[2] - ctx.args.descend_step / 1000.0, target_z, floor_z)
+        if tip[2] - next_z <= 0.0005:
+            print(f"\n  STOPPED at z {tip[2] * 1000:+.1f} mm: the floor guard "
+                  f"({floor_z * 1000:+.1f} mm) is as low as this may go.")
+            return False
+
+        print(f"\n  blind step: z {tip[2] * 1000:+.1f} -> {next_z * 1000:+.1f} mm")
+        try:
+            targets_rad, err_mm = ctx.ik.request_ik(
+                tip[0], tip[1], next_z, seed_rad=angles,
+                lock=[1] if ctx.args.lock_base else None)
+        except IKUnreachableError as e:
+            print(f"    UNREACHABLE: {e}")
+            print("    Stopping here; the arm is holding.")
+            return False
+
+        targets = {j: ctx.bus.rad_to_ticks(j, a)
+                   for j, a in zip(IK_JOINTS, targets_rad)}
+        blocked = [j for j in IK_JOINTS
+                   if (lim := ctx.bus.travel_limits(j))
+                   and not (lim[0] <= targets[j] <= lim[1])]
+        if blocked:
+            print(f"    REFUSED: {', '.join(f'J{j}' for j in blocked)} would leave "
+                  f"measured travel. Stopping.")
+            return False
+
+        busy = ", ".join(f"J{j}{targets[j] - ctx.bus.rad_to_ticks(j, a):+d}"
+                         for j, a in zip(IK_JOINTS, angles)
+                         if abs(targets[j] - ctx.bus.rad_to_ticks(j, a)) >= 2)
+        print(f"    IK residual {err_mm:.1f} mm; joints {busy or 'none moved'}")
+
+        ctx.bus.move_joints_stepped(
+            targets, step_ticks=config.PICK_STEP_TICKS,
+            pause_s=config.PICK_STEP_PAUSE_S,
+            progress=live_progress(ctx, "blind descent")
+            or (lambda k, n: print(f"      hop {k}/{n}", flush=True)),
+        )
+        wait_watching(ctx.args.settle, ctx, ["blind descent step done"])
+
+
 def descend(ctx, estimates):
     """Lower the claw in small steps, re-centring between each.
 
@@ -1151,6 +1250,7 @@ def descend(ctx, estimates):
               f"and a stop the first time a correction makes the error worse.")
     step_n = 0
     probe_mm = ctx.args.descend_probe_mm
+    last_seen = None                      # (ex, ey, tip_z) at the last detection
 
     while True:
         angles, tip = tip_position(ctx)
@@ -1162,9 +1262,10 @@ def descend(ctx, estimates):
 
         centroid, frame = detect_centroid(ctx)
         if centroid is None:
-            print("\n  STOPPED: lost the brick between steps. The arm is holding.")
-            return False
+            return descend_blind(ctx, target_z, floor_z, last_seen,
+                                 "lost sight of the brick between steps")
         ex, ey = pixel_error(centroid, frame.shape, ctx.aim(frame.shape))
+        last_seen = (ex, ey, tip[2])
 
         step_n += 1
         wanted_z = max(tip[2] - ctx.args.descend_step / 1000.0, target_z, floor_z)
@@ -1361,8 +1462,8 @@ def descend(ctx, estimates):
         # Did it help? This is the check whose absence caused the runaway.
         confirm, confirm_frame = detect_centroid(ctx)
         if confirm is None:
-            print("    lost the brick after the sideways move; stopping.")
-            return False
+            return descend_blind(ctx, target_z, floor_z, last_seen,
+                                 "lost sight of the brick after a sideways move")
         ex3, _ = pixel_error(confirm, confirm_frame.shape,
                              ctx.aim(confirm_frame.shape))
         print(f"    sideways error {ex2:+.0f} -> {ex3:+.0f} px")

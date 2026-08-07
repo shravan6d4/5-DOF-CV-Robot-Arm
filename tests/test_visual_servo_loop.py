@@ -1029,6 +1029,66 @@ def test_a_joint_with_no_limits_by_design_is_not_reported_as_a_gap(capsys):
         "say what guards it instead, or the note reads as an unprotected joint"
 
 
+def test_losing_the_brick_late_finishes_the_descent_blind():
+    """LOSING SIGHT NEAR THE END IS NORMAL. The camera sits above and behind the
+    claw, so the brick slides out of the bottom of the frame exactly when the
+    descent has nearly finished. Stopping there abandoned the run at the one
+    moment it had already done its job, leaving the claw hovering over a brick
+    it could no longer see."""
+    ctx, bus, _world = descent_ctx()
+    estimates = descent_estimates(ctx)
+    ctx.detector.blind_after = ctx.detector.calls + 3    # a couple of steps, then dark
+
+    assert vs.descend(ctx, estimates) is True
+    assert bus.ticks[2] <= ctx.args.target_z + 1, \
+        "a blind finish must still reach the target height, not stall at it"
+
+
+def test_a_blind_finish_holds_x_and_y_and_drops_the_reach_correction():
+    """Straight down, so the tool stays over whatever it was over. The reach
+    term exists only to cancel the image swing a descent causes, and nothing is
+    reading the image now -- carrying it on would move the claw off the brick to
+    steady a view nobody is watching."""
+    ctx, _bus, _world = descent_ctx()
+    estimates = descent_estimates(ctx)
+    _angles, tip0 = vs.tip_position(ctx)
+    ctx.detector.blind_after = ctx.detector.calls + 1   # one fix, then dark
+
+    assert vs.descend(ctx, estimates) is True
+    asked = ctx.ik.solves[-6:]
+    assert asked, "the blind finish must have issued solves of its own"
+    for x, y, _z in asked:
+        assert x == pytest.approx(tip0[0], abs=1e-9)
+        assert y == pytest.approx(tip0[1], abs=1e-9)
+
+
+def test_a_blind_finish_needs_a_fix_to_hold(capsys):
+    """Blind at the END is sound; blind from the START is a guess with a floor
+    guard. Without a single detection there is no aim to hold, so refusing is
+    the honest answer."""
+    ctx, bus, _world = descent_ctx()
+    estimates = descent_estimates(ctx)
+    ctx.detector.blind_after = 0            # dark from the descent's first look
+    bus.stepped.clear()
+
+    assert vs.descend(ctx, estimates) is False
+    assert bus.stepped == [], "nothing may be commanded without a fix to hold"
+    assert "never detected" in capsys.readouterr().out
+
+
+def test_a_blind_finish_says_when_the_claw_was_not_over_the_brick(capsys):
+    """The loop gives up the ability to fix an aim error it cannot see, so the
+    last-seen error must be reported rather than quietly discarded. If the claw
+    lands off, that number says by how much and in which direction."""
+    ctx, _bus, _world = descent_ctx()          # starts 90 px right, outside a 45 px box
+    estimates = descent_estimates(ctx)
+    ctx.detector.blind_after = ctx.detector.calls + 1   # one fix, then dark
+
+    vs.descend(ctx, estimates)
+    out = capsys.readouterr().out
+    assert "OUTSIDE" in out and "Expect a miss" in out
+
+
 def test_the_descent_actually_descends():
     """The headline regression. The old two-loop version went
     144 -> 136 -> 147.5 -> 128 -> 154.7 ... : every re-centre gave back more
