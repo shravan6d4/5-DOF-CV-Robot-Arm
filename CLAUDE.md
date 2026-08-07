@@ -10,7 +10,7 @@ The full path is implemented end-to-end against a **simulated** robot: detect br
 
 See [README.md](README.md) for a quick project overview, setup, and the command list; this file goes deeper on architecture, the data flow, and the merge path onto real hardware. Session narratives live in `SESSION_LOG_2026-07-22.md` (bring-up) and `SESSION_LOG_2026-08-04.md` (hand-eye diagnosis, joint limits, the arm-drop incident).
 
-**Current state in one line:** the vision pipeline is merge-ready and fully tested; the arm's model geometry is now ruler-confirmed and **four of five `dir_sign` values are confirmed by physical jog — J2 has never been tested**; **`data/hand_eye.json` is still wrong and no saved capture can fix it** — every attempt so far rotated about too few axes to observe the camera's position (see "One diagnostic" below), so the open-loop pick path stays blocked. The CLOSED-LOOP path (`scripts/visual_servo.py`) needs no hand-eye and is the way forward; a pick is additionally limited by ground-derived joint limits capping forward reach at ~180 mm.
+**Current state in one line:** the vision pipeline is merge-ready and fully tested; **the arm is now built from a RULER SURVEY rather than the CAD import, which was the wrong shape by up to 68 mm** (see the section directly below), and all five `dir_sign` values are confirmed by physical jog; **`data/hand_eye.json` is still wrong and no saved capture can fix it** — every attempt so far rotated about too few axes to observe the camera's position (see "One diagnostic" below), so the open-loop pick path stays blocked. The CLOSED-LOOP path (`scripts/visual_servo.py`) needs no hand-eye and is the way forward; a pick is additionally limited by ground-derived joint limits capping forward reach at ~180 mm.
 
 ## COORDINATE FRAMES — the imported model is upside-down (read before touching kinematics)
 
@@ -116,6 +116,39 @@ The same run produced a worse mistake, now reverted. The `lock` field is ignored
 That is a centring loop commanding 9 mm, moving 0.1 mm, seeing no pixel response and asking again with the same numbers — which is exactly how the run stalled at 99 px with J3 requesting the same −18 ticks twelve times running. **The tell was the request not changing**: the loop re-reads the arm's angles every iteration, so an unchanging ask means an unmoving arm.
 
 A solution is now taken or refused **whole**, with `SERVO_VISUAL_MAX_ROLL_DEG` joining the pan guard and shrinking the request until a solve fits. Deletion is pinned shut by `test_an_ik_solution_is_commanded_whole_never_censored`.
+
+## THE ARM IS NOW BUILT FROM A RULER SURVEY, NOT FROM CAD (2026-08-07, LIVE)
+
+`matlab/init_arm.m` has `USE_SURVEY_GEOMETRY = true` and calls
+[`build_arm_from_survey.m`](matlab/build_arm_from_survey.m) instead of
+`importrobot`. Flip the flag to `false` for the old behaviour; the legacy import
+sits untouched below it. Python's twin is
+[`kinematics/arm_model.py`](src/vision_pipeline/kinematics/arm_model.py).
+
+**Why: the CAD was the wrong shape by up to 68 mm** — see the next section. **How
+much better: seven held-out tabletop touches spread 6.0 mm instead of 73.1**, and
+MATLAB reproduces Python to 0.01 mm on every one of them
+(`matlab/test_arm_from_survey.m`, four checks, offline).
+
+**Nothing in Python changed.** A base transform inside `init_arm.m` puts the tree
+in the frame the project already speaks, so all 26 files that call the server are
+untouched. Verified end to end, including `MatlabIKClient`'s flip:
+`audit_model_axes.py` section E now prints **90 / 146 / 152 / 71.3 / 0**, which is
+the ruler exactly.
+
+**Two things that DID change, both deliberate:**
+- **X and Y now mean the arm's forward and left**, not the CAD's axes, which sat ~89.4° off the arm's own forward — a known unfixed wart nothing correct depended on. `goto_point.py --x` therefore drives a different direction than before (a correct one). The visual servo is indifferent: it builds targets as `tip + delta` and measures its reach direction.
+- **Z is matched exactly** and is the axis that mattered, being the one `target_z` and the floor guard are expressed in.
+
+**J1's rotation sense is UNCHANGED** — operator-confirmed. That was the one thing
+the rebuild could have silently inverted, since J1's `dir_sign +1` was jogged
+against the old tree and a wrong sign on the sideways axis turns the servo loop
+into a runaway. It did not flip; no `dir_sign` needs revisiting.
+
+**The acceptance test, after any change to the geometry or the frame:** run
+`python scripts/audit_model_axes.py` and check section E against the ruler. It
+exercises MATLAB, the wire, the client's frame conversion and the audit's own
+arithmetic in one go. Section D's moment-arm warning should stay silent.
 
 ## RULER vs MODEL: the imported geometry is wrong by up to 68 mm (2026-08-07)
 

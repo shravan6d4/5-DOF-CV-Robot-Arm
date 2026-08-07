@@ -66,6 +66,15 @@ if USE_SURVEY_GEOMETRY
     % nothing correct depended on it. The descent is unaffected either way: it
     % builds targets as tip + delta, so the absolute frame cancels, and its reach
     % direction is measured (visual_servo.reach_axis_xy) rather than assumed.
+    % J1'S ROTATION SENSE IS UNCHANGED from the legacy tree -- confirmed by the
+    % operator on 2026-08-07, who knows this arm's base yaw by eye. It was the
+    % one thing this rebuild could have silently inverted: positive J1 swings the
+    % tip toward physical +y (LEFT, viewed from behind the arm along the claw;
+    % counterclockwise seen from above), and J1's dir_sign +1 was jogged against
+    % the OLD tree. Had the sense flipped, that sign would now be backwards, and
+    % a wrong sign on the SIDEWAYS axis is what turns the visual servo's
+    % correction loop from converging into a runaway -- which is how J1 was run
+    % away twice already. It did not flip; no dir_sign needs revisiting.
     TABLE_Z_M = -0.0732;                       % config.TABLE_Z_IN_BASE
     flipX = [1 0 0 0; 0 -1 0 0; 0 0 -1 0; 0 0 0 1];
     baseTf = flipX * trvec2tform([0 0 TABLE_Z_M]);
