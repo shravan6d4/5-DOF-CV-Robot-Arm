@@ -33,6 +33,19 @@ from vision_pipeline import config  # noqa: E402
 from vision_pipeline.planning.visual_servo import AxisEstimate  # noqa: E402
 
 
+@pytest.fixture(autouse=True)
+def _never_actually_wait(monkeypatch):
+    """No test in this file may sleep.
+
+    wait_watching sleeps and, with --view, draws; neither is under test here.
+    It matters more since the two-view settle became a 2 s FLOOR that
+    ctx.args.settle cannot lower -- four legs is 8 s of real time per survey
+    test, which turned this file from 22 s into 46. Tests that assert ON the
+    settle patch it themselves and still win, because they patch later.
+    """
+    monkeypatch.setattr(vs, "wait_watching", lambda s, c, lines=None: None)
+
+
 class FakeBus:
     """Just enough ServoBus to drive the loop, and it insists on integer IDs."""
 
@@ -2639,3 +2652,68 @@ def test_no_integer_format_code_survives_in_the_unit_agnostic_layer():
         if re.search(r"[+\- #0]*\d*d$", spec):
             bad.append((node.lineno, ast.unparse(node.value), spec))
     assert not bad, f"integer format codes in a unit-agnostic module: {bad}"
+
+
+# --- the survey must PROVE it struck both poses -------------------------------
+#
+# The operator reported it "didn't go left" and nothing in the output could
+# confirm or deny that. apply() returns the amount it settled on after the
+# pan-budget shrink loop, not the amount the joint moved, so the request is not
+# evidence.
+
+def test_every_survey_leg_is_verified_against_the_servo(capsys):
+    ctx, _bus = _survey_ctx()
+    vs.two_view_survey(ctx)
+    out = capsys.readouterr().out
+    assert out.count("VERIFIED:") == 4, "every leg must report a read-back"
+    assert "J1" in out and "ticks" in out
+    assert "asked" in out
+
+
+def test_a_leg_that_did_not_move_is_called_out(capsys, monkeypatch):
+    """A commanded solve the joints did not follow. Silent otherwise."""
+    ctx, _bus = _survey_ctx()
+    # monkeypatch, not a bare assignment: an unrestored patch on a CLASS leaks
+    # into every test that runs after this one.
+    monkeypatch.setattr(vs.CartesianActuator, "apply", lambda self, c, mm: mm)
+    monkeypatch.setattr(vs, "tip_position",
+                        lambda c: ([0.0] * 5, np.array([0.15, 0.0, 0.08])))
+    vs.two_view_survey(ctx)
+    assert "THE ARM DID NOT MOVE" in capsys.readouterr().out
+
+
+def test_two_poses_that_are_not_apart_are_refused(capsys, monkeypatch):
+    """Rays this close to parallel give a confident answer built from detection
+    noise. The parallax gate inside locate_brick_two_view cannot catch it alone:
+    it is computed from the same poses, so if the arm never moved, the gate and
+    the solve agree with each other about a baseline that was not there."""
+    ctx, _bus = _survey_ctx()
+    monkeypatch.setattr(vs.CartesianActuator, "apply", lambda self, c, mm: mm)
+    called = []
+    monkeypatch.setattr(vs, "tip_position",
+                        lambda c: ([0.0] * 5, np.array([0.15, 0.0, 0.08])))
+    monkeypatch.setattr(vs, "fk_frames",
+                        lambda c: ([0.0] * 5, np.eye(4),
+                                   np.array([0.15, 0.0, 0.08])))
+
+    from vision_pipeline import pipeline
+    monkeypatch.setattr(pipeline.PickPipeline, "locate_brick_two_view",
+                        lambda self, caps: called.append(caps))
+
+    assert vs.two_view_survey(ctx) is None
+    out = capsys.readouterr().out
+    assert "REFUSING TO TRIANGULATE" in out
+    assert not called, "it must not reach the solver at all"
+
+
+def test_the_separation_check_measures_fk_not_the_request():
+    src = _source_of(vs.two_view_survey)
+    assert "pose_tips[1] - pose_tips[0]" in src, (
+        "separation must come from where the arm actually was at each capture")
+    assert "SERVO_VISUAL_TWO_VIEW_MIN_SEPARATION_FRAC" in src
+
+
+def test_the_separation_threshold_leaves_room_for_honest_shrinkage():
+    """The pan budget can legitimately cut a leg, and the tangential direction
+    is re-measured at each pose so the legs are not exactly collinear."""
+    assert 0.4 < config.SERVO_VISUAL_TWO_VIEW_MIN_SEPARATION_FRAC < 1.0

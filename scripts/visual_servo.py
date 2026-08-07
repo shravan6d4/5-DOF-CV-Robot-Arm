@@ -877,22 +877,37 @@ def two_view_survey(ctx):
 
     actuator = CartesianActuator("tangential")
     captures = []
+    pose_tips = []                # FK tip AT each capture, for the separation check
     offset = 0.0                  # where the base is now, relative to centred
 
     def go(to_offset, label):
-        """Drive the base to a signed tangential offset from the centred pose.
+        """Drive the base to a signed tangential offset, and VERIFY IT ARRIVED.
 
         Tracked as an ABSOLUTE offset rather than a running total of deltas so
         that a move the pan budget shrinks does not silently leave the arm off
         centre: the next go() sees the real offset and closes whatever gap the
         shrink left.
+
+        EVERY LEG IS CHECKED AGAINST THE SERVO, not against the request. The
+        operator reported 2026-08-07 that the survey "didn't go left", and
+        nothing in the output could confirm or deny it: apply() returns the
+        amount it ASKED for, which is what the shrink loop settled on, not what
+        the joint did. A solve can also come back as a legal no-op -- IK finding
+        the target already satisfied, or the pan budget shrinking the request
+        below SERVO_VISUAL_MIN_STEP_MM, in which case apply returns 0.0 and the
+        arm correctly does nothing. Either way the terminal now says which.
         """
         nonlocal offset
         delta = to_offset - offset
         if abs(delta) < 0.1:
             return
-        print(f"    -> {label}")
-        offset += actuator.apply(ctx, delta)
+        print(f"    -> {label}: asking for {delta:+.1f} mm tangential")
+        j1_before = ctx.bus.read_position_retrying(1)
+        _a, tip_before = tip_position(ctx)
+
+        asked = actuator.apply(ctx, delta)
+        offset += asked
+
         # STAND STILL LONGER HERE THAN ANYWHERE ELSE IN THE RUN. A 7.5 deg base
         # swing at 205 mm of reach leaves the forearm ringing after the servo
         # reports it has arrived, and the camera is bolted to the wrist, so what
@@ -904,6 +919,19 @@ def two_view_survey(ctx):
         print(f"       settling {settle_s:.1f} s")
         wait_watching(settle_s, ctx, [f"two-view: {label}", "settling"])
 
+        j1_after = ctx.bus.read_position_retrying(1)
+        _a, tip_after = tip_position(ctx)
+        travelled = float(np.linalg.norm(tip_after - tip_before)) * 1000.0
+        print(f"       VERIFIED: J1 {j1_before} -> {j1_after} "
+              f"({j1_after - j1_before:+d} ticks), tip moved {travelled:.1f} mm "
+              f"(asked {abs(asked):.1f})")
+        if abs(asked) > config.SERVO_VISUAL_MIN_STEP_MM and travelled < 1.0:
+            print(f"       *** THE ARM DID NOT MOVE. The solve was commanded and "
+                  f"the joints did not")
+            print(f"           follow: check the bus, and whether a travel limit "
+                  f"refused it.")
+        return travelled
+
     def capture(label):
         detection, frame = detect_brick(ctx)
         if detection is None:
@@ -911,8 +939,10 @@ def two_view_survey(ctx):
             return False
         _a, wrist, tip = fk_frames(ctx)
         captures.append((frame, wrist))
+        pose_tips.append(np.asarray(tip, dtype=float))
         print(f"    {label}: brick at {detection.centroid_px[0]:.0f},"
-              f"{detection.centroid_px[1]:.0f} px, tip z {tip[2] * 1000:+.1f} mm")
+              f"{detection.centroid_px[1]:.0f} px, tip ({tip[0] * 1000:+.1f}, "
+              f"{tip[1] * 1000:+.1f}, {tip[2] * 1000:+.1f}) mm")
         return True
 
     ok = False
@@ -950,6 +980,33 @@ def two_view_survey(ctx):
 
     if not ok or len(captures) < 2:
         print("    Survey incomplete; the descent is unaffected and continues.")
+        return None
+
+    # THE POSES MUST ACTUALLY BE APART, measured from FK rather than assumed
+    # from the request. Two frames taken from nearly the same place triangulate
+    # to a confident, arbitrary point: the rays are almost parallel, so a pixel
+    # of detection noise moves the answer by tens of millimetres. The parallax
+    # gate inside locate_brick_two_view catches the worst of it, but it is
+    # computed from the same poses -- if the arm never moved, both agree with
+    # each other about a baseline that was not there.
+    #
+    # Wanted 2 x baseline. Accept SERVO_VISUAL_TWO_VIEW_MIN_SEPARATION_FRAC of
+    # it, because the pan budget legitimately shrinks a leg and the tangential
+    # direction is re-measured at each pose, so the two legs are not exactly
+    # collinear.
+    separation = float(np.linalg.norm(pose_tips[1] - pose_tips[0])) * 1000.0
+    wanted = 2.0 * baseline_mm
+    print(f"    poses {separation:.1f} mm apart (wanted {wanted:.0f})")
+    if separation < wanted * config.SERVO_VISUAL_TWO_VIEW_MIN_SEPARATION_FRAC:
+        print(f"    *** REFUSING TO TRIANGULATE. The two poses are only "
+              f"{separation:.1f} mm apart,")
+        print(f"        under {config.SERVO_VISUAL_TWO_VIEW_MIN_SEPARATION_FRAC:.0%} "
+              f"of the {wanted:.0f} mm asked for. One of the legs did not")
+        print(f"        happen -- see the VERIFIED lines above for which. Rays "
+              f"this close to")
+        print(f"        parallel give a confident answer built from detection "
+              f"noise.")
+        print(f"    The descent is unaffected and continues.")
         return None
 
     target = PickPipeline(calibrator=PixelToWorldCalibrator()).locate_brick_two_view(

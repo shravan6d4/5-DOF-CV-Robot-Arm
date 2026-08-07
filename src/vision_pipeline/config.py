@@ -1063,6 +1063,27 @@ SERVO_VISUAL_TWO_VIEW_BASELINE_MM = 24.0
 # the brick every step and corrects, while triangulation gets two frames and is
 # scored on them.
 SERVO_VISUAL_TWO_VIEW_SETTLE_S = 2.0
+#
+# How much of the intended 2 x baseline separation the two poses must ACTUALLY
+# have, measured from FK at each capture rather than assumed from the request.
+#
+# THE REQUEST IS NOT EVIDENCE. CartesianActuator.apply returns the amount it
+# settled on after the pan-budget shrink loop, not the amount the joint moved,
+# and a solve can legitimately come back a no-op. The operator reported the
+# survey "didn't go left" on 2026-08-07 and nothing in the output could confirm
+# or deny it.
+#
+# Two frames taken from nearly the same place triangulate to a confident,
+# arbitrary point -- the rays are almost parallel, so a pixel of detection noise
+# moves the answer tens of millimetres. locate_brick_two_view's parallax gate
+# catches the worst of it, but it is computed from the same poses: if the arm
+# never moved, the gate and the solve agree with each other about a baseline
+# that was not there. This is the independent check.
+#
+# 0.6 rather than 1.0 because two things shrink the separation honestly: the pan
+# budget can cut a leg, and the tangential direction is re-measured at each pose,
+# so the two legs are not exactly collinear.
+SERVO_VISUAL_TWO_VIEW_MIN_SEPARATION_FRAC = 0.6
 
 # Sideways companion to AIM_OFFSET_Y, and the same kind of quantity: the claw
 # does not sit under the pixel the camera calls centre, so the aim point is the
