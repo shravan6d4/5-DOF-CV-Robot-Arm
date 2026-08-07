@@ -600,12 +600,16 @@ SERVO_MAX_MOVE_DELTA_TICKS = 400
 SERVO_WATCH_POWER_MOVE_DEG = 45.0
 
 # How fast a commanded joint move is allowed to run, in ticks/s (4096 ticks is a
-# full turn, so 200 ~= 18 deg/s). The servos default to full speed, which during
+# full turn, so 160 ~= 14 deg/s). The servos default to full speed, which during
 # bring-up means a wrong move completes before anyone can react to it. Capping
 # the SIZE of a step bounds where the joint stops; this bounds how fast it gets
 # there, which is what actually makes an unexpected move watchable.
 # SRAM on the servo: reset by every power cycle, so it is re-applied per run.
-SERVO_MOVE_SPEED_TICKS_S = 200
+#
+# LOWERED 200 -> 160 on 2026-08-07, together with halving PICK_STEP_PAUSE_S
+# below. Those two moved in opposite directions on purpose -- see the note on
+# the pause for why the pair is the setting, not either number alone.
+SERVO_MOVE_SPEED_TICKS_S = 160
 # Ramp rate in units of 100 ticks/s^2. A low speed with maximum acceleration
 # still starts with a jerk that rocks the whole arm.
 SERVO_MOVE_ACCEL = 10
@@ -618,13 +622,60 @@ SERVO_MOVE_ACCEL = 10
 # stoppable by hand. Distinct from SERVO_MOVE_SPEED_TICKS_S, which caps how fast
 # a single hop runs -- these cap how far it goes and how long the arm rests.
 PICK_STEP_TICKS = 60           # ~5.3 deg per hop on J1-J5
-PICK_STEP_PAUSE_S = 0.5
+#
+# HALVED 0.5 -> 0.25 on 2026-08-07 at the operator's request: the arm spent most
+# of a paced move standing still, and a long run of hops is mostly dead time.
+# SERVO_MOVE_SPEED_TICKS_S dropped 200 -> 160 in the same change, so the arm
+# ends up only a little quicker overall while the STOPS get much shorter:
+#
+#     per 60-tick hop     travel      pause      total     effective
+#     before              0.30 s      0.50 s     0.80 s    75 ticks/s
+#     after               0.375 s     0.25 s     0.625 s   96 ticks/s   (x1.28)
+#
+# The two are one setting and should be changed together. Shortening the pause
+# alone would have made it x1.6, and the pause is not idle time -- it is the
+# window in which a wrong move can be caught by hand. Slowing the hop itself
+# buys back part of that window in a better form: during a pause the arm is
+# already where the bad command put it, whereas during the travel it is still
+# on its way there and a freeze still helps.
+PICK_STEP_PAUSE_S = 0.25
 
-# Gripper (J6) open/closed positions, expressed as an angle offset (radians) from
-# the servo's calibrated home. Converted to ticks through the same per-servo
-# calibration as the arm joints. Tune to your claw's actual open/closed spread.
-SERVO_GRIPPER_OPEN_RAD = 0.0    # home position = fully open
-SERVO_GRIPPER_CLOSE_RAD = 0.2   # ~11.5 deg of claw rotation to close
+# --- Gripper (J6) -----------------------------------------------------------
+#
+# MEASURED ON HARDWARE 2026-08-07. The operator hand-positioned the claw at each
+# of these and read the ticks off hold_pose.py:
+#
+#     3219   fully OPEN (the open end of travel)
+#     3003   closed ON THE BRICK -- the working grip
+#     2732   fully closed, jaws touching. "It should never be this much."
+#
+# Ticks DECREASE as the claw closes. J6's home_tick is 2741, i.e. home is 9 ticks
+# off the full-close stop, which is why the two constants below were previously
+# both wrong AND inverted: OPEN_RAD = 0.0 meant "open the claw" commanded it to
+# home, 9 ticks from clamped shut, and CLOSE_RAD = +0.2 rad (2806) opened it
+# slightly from there. Nothing caught it because no script had ever driven J6 --
+# the gripper is the one joint the pick path never exercised on hardware.
+#
+# Kept in RADIANS because that is what RobotInterface.set_gripper speaks, with
+# the measured ticks in the comments and tests/test_gripper.py pinning the
+# conversion against data/servo_calibration.json so the two cannot drift.
+SERVO_GRIPPER_OPEN_RAD = 1.4665    # 3219 ticks: (3219 - 2741) / 325.95
+SERVO_GRIPPER_CLOSE_RAD = 0.8038   # 3003 ticks: the grip on the brick
+#
+# The floor, and it is a DAMAGE limit rather than a position anyone should ask
+# for: at 2732 the jaws are shut on themselves, so a close commanded to it with
+# a brick in the way stalls the servo against the brick. Also written into J6's
+# min_tick in data/servo_calibration.json, which is what actually enforces it --
+# this constant is here so scripts can name the number when they refuse.
+SERVO_GRIPPER_FULL_CLOSE_TICKS = 2732
+SERVO_GRIPPER_OPEN_TICKS = 3219
+SERVO_GRIPPER_GRIP_TICKS = 3003
+#
+# How far close_claw.py moves per operator-approved jog. 40 ticks is ~7 deg of
+# servo rotation and about a fifth of the open->grip travel, so the approach to
+# the brick takes ~6 approvals: enough to stop between "not touching" and
+# "gripping" without making the operator hold down a key.
+SERVO_GRIPPER_JOG_TICKS = 40
 
 # Total servos on the bus: J1..J5 (arm) + J6 (gripper).
 NUM_JOINTS = 6
@@ -817,9 +868,16 @@ SERVO_VISUAL_MAX_REAIM_STEPS = 6
 # box later does not silently move the aim point with it -- those are two
 # separate decisions and coupling them would hide one inside the other.
 #
-# The box spans x 95-185 of 640, comfortably on screen. -275 would clip it and
-# report_aim_reachability says so; -270 was the last full box length that fits,
-# and the descent that worked ran there before this was moved back.
+# -158 since 2026-08-07: a QUARTER box length (22 px) back toward centre from
+# -180, after the descent at -180 worked but finished slightly outboard of the
+# brick. The step size shrank deliberately -- the walk out was in whole box
+# lengths because nothing was known, and now it is being trimmed rather than
+# searched. A quarter box is inside the acceptance half-width (45 px), so this
+# does not move the aim point out of the box it was already converging into; it
+# shifts where in that box the run settles.
+#
+# The box spans x 117-207 of 640, comfortably on screen. -275 would clip it and
+# report_aim_reachability says so; -270 was the last full box length that fits.
 #
 # Worth keeping in view: even 180 px is 28% of the frame width for what is
 # nominally the sideways camera-to-claw offset, which is a lot for a lens sitting
@@ -827,7 +885,7 @@ SERVO_VISUAL_MAX_REAIM_STEPS = 6
 # the number -- a rotated camera mount, or a scale error on the sideways axis --
 # because past some point it stops being an offset and becomes a lever arm no
 # fixed pixel count can describe.
-SERVO_VISUAL_AIM_OFFSET_X_PX = -180
+SERVO_VISUAL_AIM_OFFSET_X_PX = -158
 
 # --- Hand-eye: the acceptance test, and why capture geometry decides it ------
 #

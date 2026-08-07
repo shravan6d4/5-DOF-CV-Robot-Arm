@@ -525,6 +525,8 @@ python scripts/goto_point.py --x 145 --y 35 --z -64 --hover-only   # ruler-drive
 python scripts/jog_joint.py --joint 5 --ticks 150                  # one joint, dir_sign check
 python scripts/goto_tick.py --joint 2 --ticks 2883                 # one joint to a tick
 python scripts/find_joint_limits.py --joint 3                      # measure travel
+python scripts/close_claw.py                  # J6 only, one approved jog at a time
+python scripts/close_claw.py --open           # let go
 
 # HARDWARE — recovery
 python scripts/freeze.py                      # STOP the arm without dropping it
@@ -640,7 +642,23 @@ The arm-side chain is **live and validated on the vertical axis**; the camera-si
 
 **What Stage D established, and the trap in reading it.** The script prints an FK-vs-IK error, and *that number cannot validate `dir_sign` or `ticks_per_rad`* — `rad_to_ticks` and `ticks_to_rad` apply the same calibration on the way out and back, so it cancels and reports ~0 even with a sign inverted. **Only a ruler against the physical arm closes that loop.** Doing it: a 45 mm commanded lift moved the FK tip 40.7 mm (the servos settled 15–47 ticks short of goal — ~4 mm of real open-loop positioning error, which FK tracked correctly because it reads back actual positions). The operator measured the gap under the claw before and after: 5 mm → 44 mm, a 39 mm physical rise. **FK 40.7 vs ruler 39.** The two implied tabletop heights (−75.7, −74.0), taken 40 mm apart vertically, agree to 1.7 mm — a wrong vertical scale would have made them diverge. So the vertical kinematic chain (`ticks_per_rad` × link lengths, through the frame conversion) is good to ~2 mm over a 40 mm move, and J3/J4's `dir_sign` is confirmed by the arm having gone *up*.
 
-**Still open on the arm side:** the lateral probes (`forward`/`left`/`right` — where a J1/J5 sign or scale error would surface, since vertical barely exercises them), and J6's open/closed tick range against `SERVO_GRIPPER_OPEN_RAD`/`CLOSE_RAD`. The `back` probe is *expected* to be refused by the tick cap: the arm works close in (tip x ≈ 75 mm) where the tip is near the J1 axis, so small Cartesian moves demand large J1/J5 swings. That refusal is the safety system working, not a driver bug.
+**Still open on the arm side:** the lateral probes (`forward`/`left`/`right` — where a J1/J5 sign or scale error would surface, since vertical barely exercises them). **J6 is now measured** — see "The gripper" below. The `back` probe is *expected* to be refused by the tick cap: the arm works close in (tip x ≈ 75 mm) where the tip is near the J1 axis, so small Cartesian moves demand large J1/J5 swings. That refusal is the safety system working, not a driver bug.
+
+#### The gripper: measured at last, and the placeholder was inverted (2026-08-07)
+
+J6 is the one joint the pick path never exercised on hardware, so its config placeholder survived every check by never being executed. Operator-measured, read off `hold_pose.py`:
+
+| J6 tick | |
+|---|---|
+| **3219** | fully OPEN |
+| **3003** | closed ON THE BRICK — the working grip |
+| **2732** | fully closed, jaws touching. *"It should never be this much."* |
+
+**Ticks DECREASE as the claw closes**, and J6's `home_tick` is **2741** — nine ticks off the jaws being shut. So `SERVO_GRIPPER_OPEN_RAD = 0.0` ("home position = fully open") meant *open the claw* commanded it to clamp, and `CLOSE_RAD = +0.2` (2806) opened it slightly from there. Both wrong, and inverted relative to each other. Now 1.4665 / 0.8038 rad, with `tests/test_gripper.py` pinning the conversion against `data/servo_calibration.json` so the tick measurement and the radian constant cannot drift apart — the same guard `test_poses.py` puts on `home_tick`.
+
+**2732 is a damage limit, not a target.** It is J6's `min_tick` (its `limit_basis` is the first on this arm where *both* ends are real ends of travel rather than ground-collision stops), so `ServoBus` refuses it independently of any script. A close driven into that stop with a brick in the jaws stalls the servo against the brick, and a stalled servo draws heavy current — that is what put the checksum storm on the bus during the 2026-08-07 descent.
+
+[`scripts/close_claw.py`](scripts/close_claw.py) drives it, J6 only, **one operator-approved jog at a time** (`SERVO_GRIPPER_JOG_TICKS` = 40, so open→grip is ~6 approvals). **A stall while closing is SUCCESS** — that is the one way it differs from `goto_tick.py`, where a joint stopping short means it is obstructed and the script backs off. Here the obstruction is the brick, which is the point: the claw has gripped, and it says so and stops rather than pushing.
 
 #### J5's `dir_sign` is probably inverted — the likely cause of the hand-eye failure (2026-08-04, UNRESOLVED)
 
@@ -750,6 +768,8 @@ Sideways error still goes through a J1 jog on purpose: J1 is base yaw, it cannot
 - **The power cut** drops holding torque on *every* joint simultaneously and the arm falls under its own weight; there is no way to power down one servo independently. Use it when freeze doesn't visibly stop the arm within a second, or when the bus is unresponsive. On 2026-08-04 a mid-move power cut dropped the arm face-first and back-drove J3 hard enough to trip its overload protection — the servo came back answering the bus normally, at healthy voltage with no fault flags, but with torque disabled and the joint sagged 54°. `scripts/servo_torque.py` reports the Torque Enable register (the only thing that distinguishes this from a dead servo) and re-enables a limp joint *at its present position*, so it holds rather than snapping back to a stale goal.
 
 **Servo speed is capped in software, not by the servos.** `config.SERVO_MOVE_SPEED_TICKS_S` / `SERVO_MOVE_ACCEL` are written via `ServoBus.set_motion_profile`; without them every move runs at the servo's full default speed, which ends each step in a hard stop and puts peak torque far above what the pose needs statically. They live in the servo's SRAM, so they reset on every power cycle and must be re-applied per run — `goto_point.py` does this at startup and prints the limit.
+
+**Speed and pacing are ONE setting.** `SERVO_MOVE_SPEED_TICKS_S` caps how fast a single hop runs; `PICK_STEP_PAUSE_S` is the rest between hops. On 2026-08-07 the pause was halved (0.5 → 0.25 s) at the operator's request — a long paced move was mostly dead time — and the speed dropped with it (200 → 160), so a 60-tick hop goes from 0.30 + 0.50 s to 0.375 + 0.25 s: **×1.28 overall, with the stops cut in half.** Shortening the pause alone would have been ×1.6. The pause is not idle time, it is the window in which a wrong move gets caught by hand, and slowing the hop buys part of that window back in a better form — during a pause the arm is already wherever the bad command put it, whereas during travel it is still on its way and a freeze still helps.
 
 ## Tuning is centralized in config.py
 
