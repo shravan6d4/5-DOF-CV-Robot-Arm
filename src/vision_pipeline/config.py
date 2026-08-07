@@ -792,13 +792,17 @@ SERVO_VISUAL_TOLERANCE_Y_PX = 55
 # frame centre pushed by the camera-to-claw offset. Y covers the "camera is
 # above and behind" part; this covers the sideways part.
 #
-# Set 2026-08-07 at the operator's request, from watching a run: one box length
-# LEFT of the detection. TOLERANCE_X is a HALF-width, so the box is 90 px across
-# and one box length is 90 px, negative being left in image coordinates. Written
-# as a plain pixel count rather than derived from TOLERANCE_X, so that widening
-# the acceptance box later does not silently move the aim point with it -- those
-# are two separate decisions and coupling them would hide one inside the other.
-SERVO_VISUAL_AIM_OFFSET_X_PX = -90
+# Set 2026-08-07 at the operator's request, from watching a run: TWO box lengths
+# LEFT of the detection (-90 after the first look, -180 after the second).
+# TOLERANCE_X is a HALF-width, so the box is 90 px across and one box length is
+# 90 px, negative being left in image coordinates. Written as a plain pixel
+# count rather than derived from TOLERANCE_X, so that widening the acceptance
+# box later does not silently move the aim point with it -- those are two
+# separate decisions and coupling them would hide one inside the other.
+#
+# Room left: the box spans x 95-185 of 640, so it is comfortably on screen and
+# report_aim_reachability stays quiet. It would start clipping at -275.
+SERVO_VISUAL_AIM_OFFSET_X_PX = -180
 
 # --- Hand-eye: the acceptance test, and why capture geometry decides it ------
 #
