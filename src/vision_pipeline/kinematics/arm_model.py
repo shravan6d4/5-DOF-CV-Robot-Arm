@@ -131,10 +131,22 @@ def tip_position(theta1: float, theta2: float, theta3: float,
     roll, so to the tip it contributes only through LATERAL_OFFSET_MM, which is
     unmeasured and currently zero.
 
+    THE FRAME IS NOT THE IMPORTED MODEL'S BASE FRAME, and the difference is
+    deliberate. x and y are measured from the BASE YAW AXIS -- the column the arm
+    actually turns about -- because that is what the survey was taken from and
+    what physically exists. The imported model's origin is a CAD artefact sitting
+    81 mm away from that axis (`scripts/audit_model_axes.py`), which is exactly
+    the sort of number this module exists to stop inheriting. z IS shared with the
+    pipeline: it is measured from the base origin, so `table_z()` places the table
+    in it and the two agree vertically.
+
+    A consumer mixing this with `MatlabIKClient` poses must therefore offset x and
+    y by the yaw axis position (`MatlabIKClient.base_yaw_axis_xy()`), or work in
+    radial/tangential terms, which need no origin at all.
+
     Returns:
-        (3,) array (x, y, z) in metres, in the same PHYSICAL base frame the rest
-        of the pipeline uses -- so z is measured from the base origin, not the
-        table, and `table_z()` gives where the table sits in it.
+        (3,) array (x, y, z) in metres. Orientation is the physical convention:
+        +Z up, +X the arm's forward at yaw zero, +Y left.
     """
     forward, up = tip_in_plane(theta2, theta3, theta4)
     x = forward * np.cos(theta1) - LATERAL_OFFSET_MM * np.sin(theta1)
