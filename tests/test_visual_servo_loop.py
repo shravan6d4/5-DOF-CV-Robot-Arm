@@ -46,6 +46,14 @@ class FakeBus:
         if not isinstance(servo_id, int) or isinstance(servo_id, bool):
             raise TypeError(f"{servo_id!r} is not a servo ID")
 
+    def limits_not_required(self, servo_id):
+        # Default to the honest answer: a joint with no limits here is one
+        # nobody has measured, not one that needs none. Tests wanting the
+        # deliberate case say so explicitly.
+        self._check(servo_id)
+        return bool(self.calibration.get(str(servo_id), {})
+                    .get("limits_not_required", False))
+
     def read_position(self, servo_id):
         self._check(servo_id)
         return self.ticks[servo_id]
@@ -961,6 +969,27 @@ def descent_estimates(ctx):
     """
     actuator = vs.JointActuator(1, ctx.args.probe_ticks)
     return [(("x", actuator), vs.probe_axis(ctx, "x", actuator))]
+
+
+def test_a_joint_with_no_limits_by_design_is_not_reported_as_a_gap(capsys):
+    """"Unmeasured" and "needs no limits" both read as None from travel_limits,
+    and they call for opposite responses. J5 is a continuous roll with no stop
+    to find, so telling the operator to go measure it is noise -- and noise in a
+    warning list is not harmless, because the REAL gap hides in it. J4 reached
+    its hard stop on 2026-08-07 while a standing note about J1 sat above it."""
+    ctx, bus, _world = descent_ctx()
+    bus.calibration["5"]["limits_not_required"] = True
+
+    vs.descend(ctx, [((("y"), vs.JointActuator(3)), 1.0)])
+    out = capsys.readouterr().out
+
+    measure_line = [ln for ln in out.splitlines() if "find_joint_limits" in ln]
+    assert measure_line, "the genuinely unmeasured joints must still be named"
+    assert not any("--joint 5" in ln for ln in measure_line), \
+        "J5 has no stop to find; asking for it trains the operator to skim"
+    assert "no travel limits by design" in out
+    assert "SERVO_VISUAL_MAX_ROLL_DEG" in out, \
+        "say what guards it instead, or the note reads as an unprotected joint"
 
 
 def test_the_descent_actually_descends():

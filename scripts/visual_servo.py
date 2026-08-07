@@ -1096,17 +1096,39 @@ def descend(ctx, estimates):
     # backstops were blind to the same missing measurement -- and a joint
     # stalled against a stop draws heavy current, which is where the checksum
     # errors on the bus came from.
-    unmeasured = [j for j in IK_JOINTS if ctx.bus.travel_limits(j) is None]
+    # "No limits recorded" and "no limits needed" are different states and must
+    # read differently, or the genuine gap hides in a list the operator has
+    # learned to ignore. J5 is a continuous roll with no stop to find, so
+    # telling anyone to go measure it is noise; J4 was a real gap and cost a
+    # jammed joint. limits_not_required marks the deliberate case.
+    unmeasured, unlimited = [], []
+    for j in IK_JOINTS:
+        if ctx.bus.travel_limits(j) is not None:
+            continue
+        (unlimited if ctx.bus.limits_not_required(j) else unmeasured).append(j)
+
     if unmeasured:
         names = ", ".join(f"J{j}" for j in unmeasured)
         print(f"\n  NOTE: {names} {'has' if len(unmeasured) == 1 else 'have'} no "
               f"measured travel limits. The descent solves IK, which is free to "
               f"spend them, and neither the servo bus nor the solver can refuse a "
               f"move on a joint whose range it does not know.")
+        print(f"    Worse, a missing entry is not a neutral default: init_arm.m "
+              f"substitutes +-90 deg, wider than some measured ranges, so IK "
+              f"spends the unmeasured joints FIRST. That is how J4 reached its "
+              f"stop on 2026-08-07 while J2 and J3 still had headroom.")
         print(f"    Measure them and BOTH gain a backstop -- init_arm.m reads the "
               f"same file the bus does:")
         for j in unmeasured:
             print(f"      python scripts/find_joint_limits.py --joint {j}")
+
+    if unlimited:
+        names = ", ".join(f"J{j}" for j in unlimited)
+        print(f"\n  {names} {'has' if len(unlimited) == 1 else 'have'} no travel "
+              f"limits by design (continuous rotation, nothing to measure). The "
+              f"guard there is config.SERVO_VISUAL_MAX_ROLL_DEG "
+              f"({config.SERVO_VISUAL_MAX_ROLL_DEG:.0f} deg per solve), because "
+              f"the constraint is leverage, not travel.")
 
     if (x_actuator is not None and not ctx.args.no_sideways
             and x_actuator.kind == "joint"

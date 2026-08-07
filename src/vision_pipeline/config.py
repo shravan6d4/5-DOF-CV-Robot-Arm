@@ -965,6 +965,17 @@ SERVO_VISUAL_MAX_PAN_DEG = 1.5
 # keeping the rest of the solution executes 1% of the request; the only sound
 # response is to reject the whole solution and ask for less.
 #
+# THIS IS THE ONLY CONSTRAINT J5 HAS, so it carries the weight a travel limit
+# would elsewhere. J5 spins continuously and has no stop to hit, but its lever
+# arm is the SHORTEST on the arm — tip motion per +2° of each joint, measured
+# from the hover:
+#     J3 4.14 mm    J4 3.61 mm    J2 1.34 mm    J5 0.85 mm
+# roughly a quarter of the elbow's effect. So it is a fine-adjustment joint:
+# gross motion bought through J5 costs a great deal of rotation for very little
+# travel, and the camera bolted to the wrist pays that rotation in full. Express
+# this HERE and not as a min_tick/max_tick — the joint really can turn further,
+# and faking a travel limit to encode a preference puts a lie in the data.
+#
 # 6° is set where the probe's own solves land (5.2° at 8 mm, 1.8° at 2 mm) so an
 # ordinary nudge passes, while the 23-35° solutions that stalled the centring
 # loop are shrunk until they are honest.

@@ -738,6 +738,23 @@ class ServoBus:
             return None
         return int(lo) - self.limit_margin_ticks, int(hi) + self.limit_margin_ticks
 
+    def limits_not_required(self, servo_id: int) -> bool:
+        """Does this joint have no travel limits BY DESIGN, rather than by omission?
+
+        travel_limits() returns None for both, and they need opposite responses:
+        an unmeasured joint is a gap to close, a continuously-rotating one has
+        no stop to find and telling anyone to go measure it is noise. Noise in a
+        warning list is not harmless -- the real gap hides in it. J4 reached its
+        hard stop on 2026-08-07 while the operator had learned to read past a
+        standing note about J1.
+
+        Set by hand in the calibration (`limits_not_required`), never inferred,
+        with the reasoning in the joint's `limit_basis`. J5 is the case this
+        exists for: a wrist roll that spins freely, whose real constraint is
+        leverage rather than travel (see config.SERVO_VISUAL_MAX_ROLL_DEG).
+        """
+        return bool(self._cal(servo_id).get("limits_not_required", False))
+
     def _check_travel_limits(self, servo_id: int, start_ticks: int, target_ticks: int) -> None:
         """Refuse a move that would leave this joint's measured travel range.
 
