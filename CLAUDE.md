@@ -10,7 +10,7 @@ The full path is implemented end-to-end against a **simulated** robot: detect br
 
 See [README.md](README.md) for a quick project overview, setup, and the command list; this file goes deeper on architecture, the data flow, and the merge path onto real hardware. Session narratives live in `SESSION_LOG_2026-07-22.md` (bring-up) and `SESSION_LOG_2026-08-04.md` (hand-eye diagnosis, joint limits, the arm-drop incident).
 
-**Current state in one line:** the vision pipeline is merge-ready and fully tested; the arm's model geometry is now ruler-confirmed and all five `dir_sign` values are confirmed by physical jog; **`data/hand_eye.json` is still wrong and no saved capture can fix it** — every attempt so far rotated about too few axes to observe the camera's position (see "One diagnostic" below), so the open-loop pick path stays blocked. The CLOSED-LOOP path (`scripts/visual_servo.py`) needs no hand-eye and is the way forward; a pick is additionally limited by ground-derived joint limits capping forward reach at ~180 mm.
+**Current state in one line:** the vision pipeline is merge-ready and fully tested; the arm's model geometry is now ruler-confirmed and **four of five `dir_sign` values are confirmed by physical jog — J2 has never been tested**; **`data/hand_eye.json` is still wrong and no saved capture can fix it** — every attempt so far rotated about too few axes to observe the camera's position (see "One diagnostic" below), so the open-loop pick path stays blocked. The CLOSED-LOOP path (`scripts/visual_servo.py`) needs no hand-eye and is the way forward; a pick is additionally limited by ground-derived joint limits capping forward reach at ~180 mm.
 
 ## COORDINATE FRAMES — the imported model is upside-down (read before touching kinematics)
 
@@ -139,25 +139,41 @@ spreads **73.1 mm**. Re-solved under all 32 `dir_sign` combinations:
 
 It also corroborates the hand-eye `--search`, which ranked J3/J4-flipped best (board spread 10.0 vs 15.0 mm, TSAI-vs-PARK 1.2 mm/0.2° vs 2.5 mm/5.8°) and was recorded as a hypothesis. J1 is indifferent here — it cannot change tip height — and J5 is unresolved either way (7.6 vs 7.7 mm).
 
-**DO NOT FLIP ON THIS EVIDENCE.** The rule stands: only a physical jog or a ruler
-settles a `dir_sign`, and `dir_sign_basis` records all three of these as
-CONFIRMED BY PHYSICAL JOG on 2026-08-06. That is a direct conflict with a direct
-observation, and a sign flip inverts every motion the arm makes.
+### …and the jog REFUTED it. The signs are right (2026-08-07)
 
-**The jog that settles it**, from ticks `J1 1794 J2 3293 J3 2911 J4 1462 J5 2744`,
-all well inside travel:
+`jog_joint.py --joint 3 --ticks 150` predicted, under the stored signs, that the
+claw would move **16.1 mm in and 30.8 mm DOWN**. The operator reported it matched,
+and volunteered the magnitude: **37.0 mm travelled against 36.1 mm predicted
+(×1.02)**. So J3's `dir_sign` AND its `ticks_per_rad` are confirmed by direct
+observation, and the flip hypothesis is dead — J3 and J4 are both jog-confirmed,
+and flipping **J2 alone** makes things worse, not better (46.1 mm spread, and a
+table at +116.7 mm, above the base origin, which is nonsense).
 
-| jog | stored predicts | flipped predicts |
+**This is why the rule exists.** Four mutually consistent statistical arguments,
+one of them cross-validated against an independent ruler reading, all pointed the
+wrong way. A single physical jog settled it in thirty seconds. Statistical
+agreement among analyses of the same data set is not evidence — the same lesson
+the hand-eye solvers taught (five methods agreeing at 80 mm against a 24 mm ruler).
+
+**Gravitational sag was also refuted.** It predicts error tracking the moment arm;
+within one posture cluster the arm swings 81.7 → 116.5 mm while FK z moves only
+56.7 → 53.2. The residual tracks J2's ANGLE, not load.
+
+**What is left, and it is the one untested parameter on the arm: J2's `dir_sign`
+has never been jogged.** From `J1 2007 J2 3213 J3 2698 J4 1615 J5 2745`, with 613
+ticks of headroom below:
+
+| jog | `J2 = -1` (stored) predicts | `J2 = +1` predicts |
 |---|---|---|
-| **J3 +150** | **18.2 mm DOWN** | **33.0 mm UP** |
-| J2 +150 | 2.2 mm up | 33.2 mm up |
-| J4 +150 | 10.0 mm up | 5.1 mm up |
+| **J2 −150** | **7.4 mm UP** | **13.6 mm DOWN** |
+| J2 +150 | 4.3 mm down | 12.0 mm up |
 
-J3 is the discriminator — opposite directions, both large. `python scripts/jog_joint.py --joint 3 --ticks 150`, watch the claw, and one of the two columns is wrong.
+`python scripts/jog_joint.py --joint 2 --ticks -150 --clearance-mm <measured>`.
+Opposite directions again, so it cannot be misread.
 
-**Whichever way it goes, `TABLE_Z_IN_BASE = -0.0732` stands**: the flipped fit
-gives −73.2 directly, the stored signs give −73.7 via home's 6 mm gap, and the
-ruler gave −74.0. Four routes inside 2.5 mm.
+**`TABLE_Z_IN_BASE = -0.0732` stands regardless**: the flipped fit gave −73.2, the
+stored signs give −73.7 via home's 6 mm gap, and the ruler gave −74.0. Four routes
+inside 2.5 mm.
 
 ## FK's ABSOLUTE height is not trustworthy; its DIFFERENTIAL height is (2026-08-07)
 
@@ -488,7 +504,7 @@ The agreement point with the robot code is the `Pose`/`PickTarget` convention: b
 The arm-side chain is **live and validated on the vertical axis**; the camera-side calibration is still placeholders. Bring-up ran in lettered stages, each a script kept in `scripts/`:
 
 - **Stage B — read-only health** ([`check_servo_health.py`](scripts/check_servo_health.py)): bus enumeration, read stability, home agreement, and a MATLAB FK cross-check against the physical arm. Commands no motion; safe to run any time and the first thing to run after a power cycle.
-- **Stage C — `dir_sign` per joint** ([`jog_joint.py`](scripts/jog_joint.py)): jogs ONE joint by a raw tick delta and compares the physical result against an FK prediction. **All five confirmed by physical jog.** Raw ticks, not IK, deliberately: going through IK would fold the unknown sign into the solve. It predicts **claw-tip** motion, not wrist — J4's first attempt was void because the operator watched the claw while the script predicted the wrist, and for wrist joints those describe different axes.
+- **Stage C — `dir_sign` per joint** ([`jog_joint.py`](scripts/jog_joint.py)): jogs ONE joint by a raw tick delta and compares the physical result against an FK prediction. **Four of five confirmed by physical jog: J1, J3, J4, J5. J2's `dir_sign_basis` reads "provenance not recorded" and it is the one that has never been tested** — this file claimed all five until 2026-08-07, when `check_servo_health.py` B5 was actually read. Raw ticks, not IK, deliberately: going through IK would fold the unknown sign into the solve. It predicts **claw-tip** motion, not wrist — J4's first attempt was void because the operator watched the claw while the script predicted the wrist, and for wrist joints those describe different axes.
 - **Stage D — IK round-trip** ([`validate_ik_roundtrip.py`](scripts/validate_ik_roundtrip.py)): the first stage where IK commands the arm. Lifts first, then probes ±15 mm on each axis from the raised pose, then descends to the real pick height. **Vertical axis passed**; lateral probes outstanding.
 
 **What Stage D established, and the trap in reading it.** The script prints an FK-vs-IK error, and *that number cannot validate `dir_sign` or `ticks_per_rad`* — `rad_to_ticks` and `ticks_to_rad` apply the same calibration on the way out and back, so it cancels and reports ~0 even with a sign inverted. **Only a ruler against the physical arm closes that loop.** Doing it: a 45 mm commanded lift moved the FK tip 40.7 mm (the servos settled 15–47 ticks short of goal — ~4 mm of real open-loop positioning error, which FK tracked correctly because it reads back actual positions). The operator measured the gap under the claw before and after: 5 mm → 44 mm, a 39 mm physical rise. **FK 40.7 vs ruler 39.** The two implied tabletop heights (−75.7, −74.0), taken 40 mm apart vertically, agree to 1.7 mm — a wrong vertical scale would have made them diverge. So the vertical kinematic chain (`ticks_per_rad` × link lengths, through the frame conversion) is good to ~2 mm over a 40 mm move, and J3/J4's `dir_sign` is confirmed by the arm having gone *up*.
