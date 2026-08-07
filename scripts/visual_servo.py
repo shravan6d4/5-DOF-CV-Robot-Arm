@@ -1392,7 +1392,7 @@ def probe_axis(ctx, axis, actuator):
     after = axis_error(axis, *pixel_error(centroid, frame.shape,
                                           ctx.aim(frame.shape)))
 
-    est = estimate_axis(amount, before, after)
+    est = estimate_axis(amount, before, after, unit=actuator.unit)
     print(f"  brick moved {est.response_px:+.1f} px on {axis}")
     print(f"  MEASURED {est.ticks_per_px:+.3g} {actuator.unit}/px "
           f"(direction {est.direction:+d})")

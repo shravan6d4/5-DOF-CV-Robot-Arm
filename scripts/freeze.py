@@ -21,13 +21,30 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 from vision_pipeline import config
 from vision_pipeline.robot_interface.servo_driver import ServoBus
 
-bus = ServoBus(config.SERVO_PORT, config.SERVO_BAUD)
-with bus:
-    held = bus.freeze(range(1, 7))
+def main() -> None:
+    bus = ServoBus(config.SERVO_PORT, config.SERVO_BAUD)
+    with bus:
+        held = bus.freeze(range(1, 7))
 
-if held:
-    print("FROZEN — holding at " + ", ".join(f"J{j}={p}" for j, p in sorted(held.items())))
-missing = [j for j in range(1, 7) if j not in held]
-if missing:
-    print("COULD NOT FREEZE: " + ", ".join(f"J{j}" for j in missing))
-    print("CUT POWER if the arm is still moving.")
+    if held:
+        print("FROZEN — holding at "
+              + ", ".join(f"J{j}={p}" for j, p in sorted(held.items())))
+    missing = [j for j in range(1, 7) if j not in held]
+    if missing:
+        print("COULD NOT FREEZE: " + ", ".join(f"J{j}" for j in missing))
+        print("CUT POWER if the arm is still moving.")
+
+
+# BEHIND A MAIN GUARD, and it did not used to be: this script's body ran at
+# module level, so merely IMPORTING it opened the serial port and commanded all
+# six joints. Anything that imports scripts -- a test collector, an editor's
+# autocomplete, a lint pass, a human checking whether the file parses -- would
+# have driven the arm as a side effect. Discovered 2026-08-07 by an import check
+# that froze the arm mid-session.
+#
+# Harmless in THIS script's case, since a freeze writes each joint's present
+# position and travels nowhere. That is exactly why it went unnoticed, and why
+# the guard belongs here anyway: the next script written to this pattern will
+# not be a no-op.
+if __name__ == "__main__":
+    main()

@@ -2577,3 +2577,61 @@ def test_answering_flat_never_builds_a_height_model():
     ctx = _flat_q_ctx("y")
     assert not ctx.height_model.ready
     assert ctx.height_model.n == 0 and ctx.height_model.runs == 0
+
+
+# --- the error paths must survive being taken ---------------------------------
+#
+# estimate_axis is unit-agnostic BY DESIGN -- a probe is raw ticks for a
+# JointActuator and millimetres for a CartesianActuator -- so its argument is
+# routinely a float. Its refusal message formatted it with `:+d`, which raises
+# ValueError from inside the error path. That is the worst possible place: the
+# crash replaces the diagnosis the operator needed with a traceback about string
+# formatting. Live failure 2026-08-07 on `--- PROBE y: radial nudge +8 mm ---`.
+
+def test_a_dead_probe_is_reported_not_crashed_for_a_CARTESIAN_actuator():
+    from vision_pipeline.planning.visual_servo import estimate_axis
+
+    with pytest.raises(vs.ServoAbort) as e:
+        estimate_axis(8.0, 100.0, 100.2, unit="mm")     # float probe, no response
+    assert "8" in str(e.value) and "mm" in str(e.value)
+    assert "px" in str(e.value), "the operator needs the numbers, not a type error"
+
+
+def test_a_dead_probe_is_reported_for_a_JOINT_actuator_too():
+    from vision_pipeline.planning.visual_servo import estimate_axis
+
+    with pytest.raises(vs.ServoAbort) as e:
+        estimate_axis(40, 100.0, 100.2, unit="ticks")
+    assert "40" in str(e.value) and "ticks" in str(e.value)
+
+
+def test_a_zero_probe_is_reported_without_a_unit_being_required():
+    from vision_pipeline.planning.visual_servo import estimate_axis
+
+    with pytest.raises(vs.ServoAbort):
+        estimate_axis(0.0, 100.0, 100.0)
+
+
+def test_probe_axis_tells_estimate_axis_what_the_units_are():
+    """Otherwise the refusal says 'units', which is true but unhelpful."""
+    src = _source_of(vs.probe_axis)
+    assert "unit=actuator.unit" in src
+
+
+def test_no_integer_format_code_survives_in_the_unit_agnostic_layer():
+    """planning/visual_servo.py is the module that must not assume ticks. Any
+    `:d` in it is a float waiting to raise from an error path."""
+    import ast
+    import re
+    from vision_pipeline.planning import visual_servo as pvs
+
+    tree = ast.parse(Path(pvs.__file__).read_text(encoding="utf-8"))
+    bad = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.FormattedValue) or node.format_spec is None:
+            continue
+        spec = "".join(v.value for v in node.format_spec.values
+                       if isinstance(v, ast.Constant))
+        if re.search(r"[+\- #0]*\d*d$", spec):
+            bad.append((node.lineno, ast.unparse(node.value), spec))
+    assert not bad, f"integer format codes in a unit-agnostic module: {bad}"

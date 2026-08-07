@@ -119,7 +119,8 @@ def pixel_error(centroid_px: tuple[float, float],
 def estimate_axis(probe_ticks: int,
                   error_before_px: float,
                   error_after_px: float,
-                  min_response_px: float = config.SERVO_MIN_PROBE_RESPONSE_PX
+                  min_response_px: float = config.SERVO_MIN_PROBE_RESPONSE_PX,
+                  unit: str = ""
                   ) -> AxisEstimate:
     """Turn one probe move into a signed ticks-per-pixel estimate.
 
@@ -132,6 +133,9 @@ def estimate_axis(probe_ticks: int,
         error_before_px: pixel error on this axis before the probe.
         error_after_px: pixel error on this axis after it.
         min_response_px: below this the probe told us nothing.
+        unit: what probe_ticks is measured in, for the messages only -- "ticks"
+            for a joint probe, "mm" for a Cartesian one. The maths here is
+            unit-agnostic and stays that way; only the prose needs to know.
 
     Raises:
         ServoAbort: if the probe produced no usable response. That means this
@@ -142,12 +146,19 @@ def estimate_axis(probe_ticks: int,
             would slam the joint to its clamp in that invented direction.
     """
     if probe_ticks == 0:
-        raise ServoAbort("Probe of 0 ticks cannot measure anything.")
+        raise ServoAbort(f"Probe of 0 {unit or 'units'} cannot measure anything.")
 
     response = error_after_px - error_before_px
     if abs(response) < min_response_px:
+        # NOT `:+d`. This function is unit-agnostic by design -- a probe is raw
+        # ticks for a JointActuator and millimetres for a CartesianActuator --
+        # so probe_ticks is routinely a float, and an integer format code here
+        # raises ValueError from inside the error path. That is the worst place
+        # for it: the crash replaces the diagnosis the operator needed with a
+        # traceback about string formatting. Found the hard way 2026-08-07, on a
+        # radial probe that legitimately produced no response.
         raise ServoAbort(
-            f"Probe of {probe_ticks:+d} ticks moved the brick only "
+            f"Probe of {probe_ticks:+g} {unit or 'units'} moved the brick only "
             f"{response:+.1f} px (need {min_response_px:.1f}). This joint does "
             f"not control this axis, the arm did not actually move, or the "
             f"detection is jumping between objects. Not guessing a gain from it."
