@@ -820,12 +820,24 @@ SERVO_VISUAL_MIN_STEP_TICKS = 25
 # up" behaviour, arrived at through the existing reach term rather than a new
 # mechanism.
 #
-# THE TRADE IS REAL AND THIS IS NOT THE GRASP VALUE. The camera sits above and
+# THE TRADE IS REAL AND 0 WAS NOT THE GRASP VALUE. The camera sits above and
 # behind the claw, so at offset 0 a centred brick is NOT under the claw -- it is
-# short by the camera-to-claw offset, which is what 240 measured. Expect the
-# claw to stop behind the brick. Restore the measured value, or pass
-# --aim-offset-y, before trying to actually close on one.
-SERVO_VISUAL_AIM_OFFSET_Y_PX = 0
+# short by the camera-to-claw offset, which is what 240 measured.
+#
+# +28 since 2026-08-07: a QUARTER box length lower, at the operator's request.
+# TOLERANCE_Y is a HALF-height, so the box is 110 px tall and a quarter of it is
+# 27.5 px; positive is DOWN the frame, per the sign convention above. Same
+# method as the X offset -- the walk out was in whole box lengths because
+# nothing was known, and this is trimming.
+#
+# This is a step back TOWARD the measured 240 rather than a new guess, and the
+# direction is the one the geometry predicts: aiming lower makes the loop hold
+# the brick further down the frame, which is where it must sit for the claw to
+# be over it. A quarter box is inside the acceptance half-height (55 px), so the
+# aim point does not leave the box the run was already converging into -- it
+# moves where in that box the run settles. Expect the claw to stop slightly less
+# short of the brick, not to land on it.
+SERVO_VISUAL_AIM_OFFSET_Y_PX = 28
 #
 # The tolerance is a BOX, and it is deliberately generous. Two reasons. The
 # descent re-centres at every step, so the approach corrects itself on the way
