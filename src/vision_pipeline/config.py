@@ -1002,11 +1002,17 @@ SERVO_VISUAL_BLIND_DROP_MAX_MM = 60.0
 # mostly ALONG its own view, which is the direction triangulation learns least
 # from.
 #
-# 24 mm at the working radius (~205 mm) is ~6.7 deg of parallax against
-# TWO_VIEW_MIN_PARALLAX_DEG of 5, so it clears the gate with margin. It also has
-# to fit the tangential pan budget: 24 mm needs 6.7 deg of base yaw and
-# SERVO_VISUAL_MAX_TANGENTIAL_PAN_DEG is 8, so it passes whole rather than being
-# halved. Going much larger fails that budget before it fails anything else.
+# THIS IS THE HALF-BASELINE. The survey goes LEFT by this much for pose 1, back
+# through centre, RIGHT by this much for pose 2, then back to centre
+# (operator-specified 2026-08-07). So the two views end up 2 x this apart --
+# 48 mm, ~13 deg of parallax at the working radius -- while each individual MOVE
+# is only 24 mm and therefore still fits the tangential pan budget. A single
+# 48 mm move would not: it needs 13.4 deg of base yaw against
+# SERVO_VISUAL_MAX_TANGENTIAL_PAN_DEG of 8, so it would be halved and the
+# baseline lost. Symmetry buys the parallax the budget would otherwise refuse.
+#
+# Measured 2026-08-07: a 24 mm tangential nudge came back as J1 +85 ticks,
+# 7.47 deg of camera pan, and moved the brick 165 px across the frame.
 SERVO_VISUAL_TWO_VIEW_BASELINE_MM = 24.0
 
 # Sideways companion to AIM_OFFSET_Y, and the same kind of quantity: the claw

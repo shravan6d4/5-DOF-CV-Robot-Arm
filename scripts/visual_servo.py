@@ -831,13 +831,34 @@ def two_view_survey(ctx):
 
     baseline_mm = config.SERVO_VISUAL_TWO_VIEW_BASELINE_MM
     print(f"\n--- TWO-VIEW SURVEY ---")
-    print(f"  Two poses {baseline_mm:.0f} mm apart, tangentially, then back. "
-          f"The brick must")
-    print(f"  stay visible in BOTH -- triangulation needs the same point twice.")
+    print(f"  Base LEFT {baseline_mm:.0f} mm -> pose 1, back to centre, RIGHT "
+          f"{baseline_mm:.0f} mm -> pose 2,")
+    print(f"  back to centre. The two views end {2 * baseline_mm:.0f} mm apart, "
+          f"so the parallax is")
+    print(f"  double what one move buys while each move stays inside the pan "
+          f"budget.")
+    print(f"  The brick must stay visible in BOTH -- triangulation needs the "
+          f"same point twice.")
 
     actuator = CartesianActuator("tangential")
     captures = []
-    moved = 0.0
+    offset = 0.0                  # where the base is now, relative to centred
+
+    def go(to_offset, label):
+        """Drive the base to a signed tangential offset from the centred pose.
+
+        Tracked as an ABSOLUTE offset rather than a running total of deltas so
+        that a move the pan budget shrinks does not silently leave the arm off
+        centre: the next go() sees the real offset and closes whatever gap the
+        shrink left.
+        """
+        nonlocal offset
+        delta = to_offset - offset
+        if abs(delta) < 0.1:
+            return
+        print(f"    -> {label}")
+        offset += actuator.apply(ctx, delta)
+        wait_watching(max(ctx.args.settle, 0.3), ctx, [f"two-view: {label}"])
 
     def capture(label):
         detection, frame = detect_brick(ctx)
@@ -850,23 +871,34 @@ def two_view_survey(ctx):
               f"{detection.centroid_px[1]:.0f} px, tip z {tip[2] * 1000:+.1f} mm")
         return True
 
+    ok = False
     try:
-        if not capture("view 1"):
+        # OUT ONE WAY, BACK THROUGH CENTRE, OUT THE OTHER. Operator-specified
+        # 2026-08-07, and it is the better geometry as well as the requested
+        # one: the two views end up 2 x baseline apart, so the parallax doubles
+        # while each individual MOVE stays at baseline and therefore still fits
+        # the tangential pan budget. A single move of 48 mm would not.
+        #
+        # Returning through centre between them is not decoration. It re-reads
+        # the arm from the pose the descent will actually start from, so a move
+        # the budget shrank shows up as a gap to close rather than as an
+        # accumulated drift nobody measured.
+        go(-baseline_mm, "pose 1: base LEFT")
+        if not capture("view 1 (left)"):
             return None
-        moved = actuator.apply(ctx, baseline_mm)
-        wait_watching(max(ctx.args.settle, 0.3), ctx, ["two-view: second pose"])
-        ok = capture("view 2")
+        go(0.0, "back to centre")
+        go(+baseline_mm, "pose 2: base RIGHT")
+        ok = capture("view 2 (right)")
     except (ServoAbort, ServoSafetyError) as e:
         print(f"    survey move refused: {e}")
         ok = False
     finally:
-        # ALWAYS GO BACK, including on the failure paths. A descent that starts
-        # from a swung base is a descent whose probe gains describe a different
-        # posture, which is the 2026-08-05 runaway in miniature.
-        if moved:
+        # ALWAYS BACK TO CENTRE, including on the failure paths. A descent that
+        # starts from a swung base is a descent whose probe gains describe a
+        # different posture, which is the 2026-08-05 runaway in miniature.
+        if abs(offset) > 0.1:
             try:
-                actuator.apply(ctx, -moved)
-                wait_watching(max(ctx.args.settle, 0.3), ctx, ["two-view: back"])
+                go(0.0, "back to centre")
             except Exception as e:                                # noqa: BLE001
                 raise ServoAbort(
                     f"the two-view survey could not return to the centred pose "

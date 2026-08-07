@@ -2424,3 +2424,74 @@ def test_locate_brick_two_view_accepts_a_raw_matrix_as_well_as_a_pose():
     # No brick, so it returns None -- but it must reach that point without
     # tripping over the matrix where it expected a Pose.
     assert PickPipeline(detector=NoBricks()).locate_brick_two_view(captures) is None
+
+
+def test_the_survey_goes_left_then_centre_then_right():
+    """Operator-specified 2026-08-07, and the better geometry: the two views end
+    2 x baseline apart so the parallax doubles, while each MOVE stays at the
+    baseline and therefore still fits the tangential pan budget."""
+    ctx, _bus = _survey_ctx()
+
+    # Spy on the REQUESTS rather than on J1, because the planar FakeIK answers a
+    # tangential nudge with the pitch chain and never moves the base. What is
+    # under test is the pattern the survey asks for, not the fake's kinematics.
+    asked, offsets, running = [], [], [0.0]
+    real_apply = vs.CartesianActuator.apply
+
+    def spy_apply(self, ctx_, amount_mm):
+        asked.append(amount_mm)
+        running[0] += amount_mm
+        return amount_mm
+
+    real_detect = vs.detect_brick
+
+    def spy_detect(c, attempts=None):
+        offsets.append(running[0])
+        return real_detect(c) if attempts is None else real_detect(c, attempts)
+
+    vs.CartesianActuator.apply = spy_apply
+    vs.detect_brick = spy_detect
+    try:
+        vs.two_view_survey(ctx)
+    finally:
+        vs.CartesianActuator.apply = real_apply
+        vs.detect_brick = real_detect
+
+    half = config.SERVO_VISUAL_TWO_VIEW_BASELINE_MM
+    assert len(offsets) == 2, "exactly two views"
+    assert offsets == [-half, +half], (
+        f"the views must straddle the centred pose, got {offsets}")
+    assert asked == [-half, +half, +half, -half], (
+        f"left, back to centre, right, back to centre -- got {asked}")
+    assert running[0] == pytest.approx(0.0), "the arm must end where it started"
+
+
+def test_the_survey_passes_through_centre_between_the_two_poses():
+    """Not decoration: it re-reads the arm from the pose the descent will start
+    from, so a move the pan budget shrank shows up as a gap to close rather than
+    as drift nobody measured."""
+    src = _source_of(vs.two_view_survey)
+    left = src.index('"pose 1: base LEFT"')
+    centre = src.index('go(0.0, "back to centre")')
+    right = src.index('"pose 2: base RIGHT"')
+    assert left < centre < right
+
+
+def test_the_survey_tracks_an_absolute_offset_not_a_running_total():
+    """A move the budget shrinks must not silently leave the arm off centre."""
+    src = _source_of(vs.two_view_survey)
+    assert "delta = to_offset - offset" in src
+
+
+def test_the_two_views_end_up_double_the_baseline_apart():
+    """Which is the whole reason for the symmetry -- a single move that far
+    would be refused by the pan budget and halved."""
+    import numpy as np
+    half = config.SERVO_VISUAL_TWO_VIEW_BASELINE_MM
+    one_move = np.degrees(half / 205.0)
+    both = np.degrees(2 * half / 205.0)
+    assert one_move <= config.SERVO_VISUAL_MAX_TANGENTIAL_PAN_DEG
+    assert both > config.SERVO_VISUAL_MAX_TANGENTIAL_PAN_DEG, (
+        "if a single move of the full baseline fits the budget, the symmetry "
+        "is buying nothing and this test is the wrong shape")
+    assert both > 2 * config.TWO_VIEW_MIN_PARALLAX_DEG
