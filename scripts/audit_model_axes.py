@@ -243,7 +243,72 @@ def main():
             print("      which rules this out as the calibration failure.")
 
         print("\n" + "=" * 78)
-        print("D.  RULER SHEET — every number here is measurable on the real arm")
+        print("D.  MOMENT ARMS — how far the tip sits from each joint's own axis")
+        print("=" * 78)
+        print("""
+THE CHECK THIS SCRIPT WAS MISSING, and it is the one a jog can falsify with a
+ruler in ten seconds. Sections A-C test axis DIRECTIONS and link LENGTHS at
+home; both were clean while the model still misplaced the claw by 74 mm.
+
+For a serial arm the tip's distance from a joint's axis is what converts that
+joint's rotation into tip travel: sweep = 2*r*sin(theta/2). J2 is upstream of
+J3, which is upstream of J4, so in any ordinary posture J2 should have the
+LARGEST arm of the three -- it carries everything beyond it. A downstream joint
+showing a bigger arm than the joint above it is not proof of a fault (a folded
+arm can swing the tip back toward an upper axis), but it is the shape of one,
+and it is what an operator notices immediately: "J2 moves the claw much more
+than J3, and far more than J4".
+
+Measured 2026-08-07 at the pose a jog started from, the model gave J2 63.1 mm
+while a 12.6 deg jog swept the claw 30.0 mm -- which needs 137 mm. The model
+understated J2's arm by 74 mm, and reported J3 at 151 mm, larger than the joint
+above it. That single inversion is worth more than every statistical fit run
+against the touch data, all of which pointed elsewhere.
+
+AT SEVERAL POSES, not just home. At home the inversion is marginal (157 vs 160
+mm) and reads as noise; at a working posture it is 63 vs 151.
+""")
+        from vision_pipeline.robot_interface import servo_calibration as sc
+
+        cal = sc.load_calibration()
+        poses = {"home (all joints zero)": [0.0] * 5}
+        try:
+            poses["hover (SERVO_HOVER_TICKS)"] = [
+                sc.ticks_to_rad(cal, j, config.SERVO_HOVER_TICKS[j])
+                for j in range(1, 6)]
+        except (KeyError, TypeError):
+            pass                      # no hover recorded; home alone still says a lot
+
+        for label, angles in poses.items():
+            axp, _Tw, Tt = screw_axes(srv, angles, physical=phys)
+            tip_p = Tt[:3, 3]
+            arms = {}
+            for j in range(1, 6):
+                n, p = axp[j]
+                v = tip_p - p
+                arms[j] = float(np.linalg.norm(v - np.dot(v, n) * n))
+
+            print(f"  {label}:")
+            inverted = [j for j in (3, 4) if arms[j] > arms[2]]
+            for j in range(1, 6):
+                note = "   <== LARGER than J2, which is UPSTREAM of it" \
+                    if j in inverted else ""
+                print(f"    J{j} ({JOINT_ROLE[j]:11}): tip is {arms[j] * 1000:6.1f} mm "
+                      f"from its axis{note}")
+            if inverted:
+                worst = max(inverted, key=lambda j: arms[j])
+                sweep2 = 2 * arms[2] * np.sin(np.deg2rad(6.0))
+                sweepw = 2 * arms[worst] * np.sin(np.deg2rad(6.0))
+                print(f"    -> FALSIFY IT WITH A RULER. Jog J2 and J{worst} by the same")
+                print(f"       12 deg and measure the claw: the model predicts "
+                      f"{sweep2 * 1000:.0f} mm")
+                print(f"       for J2 and {sweepw * 1000:.0f} mm for J{worst}. If J2 moves "
+                      f"the claw FURTHER,")
+                print(f"       the model's J2 geometry is wrong -- not your measurement.")
+            print()
+
+        print("\n" + "=" * 78)
+        print("E.  RULER SHEET — every number here is measurable on the real arm")
         print("=" * 78)
         print("\nPark the arm at HOME (python scripts/goto_pose.py --pose home)")
         print("before measuring the heights. Shaft centre to shaft centre.\n")
