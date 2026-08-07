@@ -103,6 +103,32 @@ Every radial nudge asked for a component the shoulder/elbow chain could supply o
 
 **Tangential was already right** and stays geometric: computed −47.8° against J1's actual tip motion at −46.8°. It is perpendicular to the radius by construction, which is exactly what base yaw does, and that holds however close in the tool sits.
 
+#### The pan budget was capping the one axis base yaw is FOR (2026-08-07)
+
+**Tangential was geometrically right and administratively throttled.** The pan guard rejects a solve that spends more than `SERVO_VISUAL_MAX_PAN_DEG` (1.5°) of base yaw, because for a *radial* nudge — reach, which lives in the shoulder/elbow plane — any yaw is redundancy the solver spent uninstructed, and the camera on the wrist pays for it. Applied to a *tangential* nudge that reasoning inverts: J2/J3/J4 are parallel pitches confined to one vertical plane and J5's lever arm is the shortest on the arm, so **sideways motion of the claw is what J1 is**, and the angle is fixed by geometry rather than chosen:
+
+```
+theta = d / r        d = the nudge, r = tip radius from the yaw axis
+```
+
+No solution uses less. A flat angle ceiling therefore does not limit waste there — **it limits the step size, to `MAX_PAN_DEG · r`,** while reporting the optimal solve as "over budget".
+
+Measured mid-descent at r = 205 mm. The loop asked for 12 mm against a 55 px error — the right amount, as the part that did execute later confirmed at 4.7 px/mm:
+
+| request | pan needed | |
+|---|---|---|
+| 12 mm | 3.35° | REFUSED, halve |
+| 6 mm | 1.68° | REFUSED, halve |
+| 3 mm | 0.84° | accepted — moved **14 px of the 55** |
+
+The descent was injecting **~14 px of sideways error per step by itself**, visible in steps 1–5 before the sideways loop had engaged at all (+40, +29, +25, +10, −9 px). So the corrector was pinned at exactly break-even, the error never closed, and the `ProgressMonitor` stopped the run — correctly, for a cause it could not see. **The operator's report is the tell: J1 turned 0.79°, three times, invisibly, on a loop asking to turn it four times as far.** A correction that is capped rather than wrong-signed looks identical to a dead axis from outside.
+
+Note also that the guard's own error message names 130 mm as the radius that fixes the conditioning problem, and the arm was at **205 mm** — well inside the regime the guard calls clean. It was not diagnosing conditioning; it was rate-limiting.
+
+`CartesianActuator._pan_budget_deg` now gives tangential `d/r · SERVO_VISUAL_TANGENTIAL_PAN_SLACK` (1.4), floored at the flat ceiling so the fix can only loosen, capped at `SERVO_VISUAL_MAX_TANGENTIAL_PAN_DEG` (8°), and falling back to the flat ceiling below `SERVO_VISUAL_MIN_TANGENTIAL_RADIUS_M` where `d/r` explodes. **The slack is what still catches the case the guard was written for** — near the base axis the claw's 27 mm offset makes the tip's bearing hypersensitive to J1 and a solve wants many times `d/r`. Pinned by `test_a_tangential_nudge_may_spend_the_yaw_its_geometry_requires` (full 12 mm executes, above the flat ceiling) and `test_a_tangential_solve_that_wastes_yaw_is_still_shrunk` (3× the requirement executes under a quarter).
+
+**Still open from that run: the descent's sideways coupling is unmodelled.** `DescentModel` fits the vertical axis (`dpx = a·dz + b·dr`) and the sideways axis has no model at all — it is corrected reactively, one step behind. ~14 px per step is not noise, it is a systematic term, and it is large because the aim point sits 158 px off the optical axis where camera pitch produces x motion. The corrector can now out-run it; modelling it would mean not having to.
+
 #### Never delete a joint from an IK solution
 
 The same run produced a worse mistake, now reverted. The `lock` field is ignored by the server (below), so `visual_servo.py` briefly enforced it by simply not commanding the held joints — on the theory that J5 is a wrist roll and therefore pure null space. Both halves were wrong. **The claw tip sits off the roll axis, so J5 translates it**; and an IK solution is a *coordinated* answer — the other joints are where they are BECAUSE the deleted one was going to move.

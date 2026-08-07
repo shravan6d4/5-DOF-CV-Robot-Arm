@@ -484,6 +484,63 @@ class CartesianActuator:
             return []
         return [1, 5] if self.direction == "radial" else [5]
 
+    def _pan_budget_deg(self, ctx, tip, attempt_mm):
+        """How much base yaw this particular nudge is allowed to spend.
+
+        FOR A RADIAL NUDGE, BASE YAW IS WASTE. Radial means "change how far the
+        arm reaches", which happens entirely in the shoulder/elbow plane, so any
+        yaw in the answer is redundancy the solver spent uninstructed -- and
+        since the camera rides on the wrist, it pans the image the loop is
+        reading. A flat ceiling is the right guard and it stays.
+
+        FOR A TANGENTIAL NUDGE, BASE YAW IS THE ACTUATOR. J2/J3/J4 are parallel
+        pitches confined to one vertical plane and J5's lever arm is the
+        shortest on the arm; sideways motion of the claw is what J1 IS. The
+        angle is then fixed by geometry rather than chosen by the solver:
+
+            theta = d / r        d = the nudge, r = tip radius from the yaw axis
+
+        No solution uses less, so a flat angle ceiling does not limit waste
+        there -- it silently limits the STEP SIZE to MAX_PAN_DEG * r, and says
+        "over budget" about a solve that was optimal.
+
+        THAT IS WHAT STALLED THE 2026-08-07 DESCENT. At r = 205 mm the loop
+        asked for 12 mm of tangential correction against a 55 px error -- the
+        right amount, as the executed part later confirmed at 4.7 px/mm -- and
+        needed 3.3 deg to get it. The 1.5 deg ceiling refused, halved to 6 mm
+        (1.7 deg, still refused), halved again to 3 mm, and moved 14 px. The
+        descent was injecting ~14 px of sideways error per step on its own, so
+        the corrector was capped at exactly break-even and the run diverged.
+        The operator's report is the tell: J1 turned 0.79 deg, three times,
+        invisibly, on a loop that was asking to turn it four times as far.
+
+        So the tangential budget is the REQUIRED angle plus slack. That still
+        refuses the thing the flat ceiling was written for -- a solve leaning on
+        yaw far harder than the geometry demands, which is what happens close to
+        the base axis where the claw's 27 mm offset makes the tip's bearing
+        hypersensitive to J1 -- because there the solve wants many times d/r.
+        What it no longer refuses is a nudge that is simply large.
+
+        Two things still bound it, and neither is this function: the absolute
+        ceiling below, and config.SERVO_VISUAL_SIDEWAYS_BUDGET_TICKS, the
+        cumulative travel cap across the whole descent that holds even when the
+        pixel measurements themselves are wrong.
+        """
+        flat = config.SERVO_VISUAL_MAX_PAN_DEG
+        if self.direction != "tangential":
+            return flat
+
+        radius_m = reach_from_axis((tip[0], tip[1]), yaw_axis_xy(ctx))
+        if radius_m < config.SERVO_VISUAL_MIN_TANGENTIAL_RADIUS_M:
+            # Too close in for d/r to mean anything: the radius is small, the
+            # required angle explodes, and a budget derived from it would
+            # authorise the very swing the flat ceiling exists to refuse.
+            return flat
+
+        required = np.degrees(abs(attempt_mm) / 1000.0 / radius_m)
+        allowed = required * config.SERVO_VISUAL_TANGENTIAL_PAN_SLACK
+        return float(min(max(flat, allowed), config.SERVO_VISUAL_MAX_TANGENTIAL_PAN_DEG))
+
     def apply(self, ctx, amount_mm):
         if abs(amount_mm) < config.SERVO_VISUAL_MIN_STEP_MM:
             return 0.0
@@ -530,6 +587,7 @@ class CartesianActuator:
             pan_deg = abs(moved[1]) / 651.89 * 180 / np.pi
             roll_deg = abs(moved[5]) / 651.89 * 180 / np.pi
             biggest = max(abs(d) for d in moved.values())
+            pan_budget_deg = self._pan_budget_deg(ctx, tip, attempt_mm)
 
             # REJECT AND SHRINK. NEVER DELETE A JOINT FROM THE SOLUTION.
             #
@@ -558,12 +616,12 @@ class CartesianActuator:
             # what makes one unacceptable, and the answer to an unacceptable
             # solution is a smaller request, not a censored one. This is the same
             # loop the pan guard has always used; the roll guard just joins it.
-            if (pan_deg <= config.SERVO_VISUAL_MAX_PAN_DEG
+            if (pan_deg <= pan_budget_deg
                     and roll_deg <= config.SERVO_VISUAL_MAX_ROLL_DEG
                     and biggest <= config.SERVO_VISUAL_MAX_SOLVE_TICKS):
                 break
 
-            over = ("base yaw" if pan_deg > config.SERVO_VISUAL_MAX_PAN_DEG
+            over = ("base yaw" if pan_deg > pan_budget_deg
                     else "wrist roll" if roll_deg > config.SERVO_VISUAL_MAX_ROLL_DEG
                     else "joint travel")
             if abs(attempt_mm) / 2 < config.SERVO_VISUAL_MIN_STEP_MM:
@@ -571,7 +629,7 @@ class CartesianActuator:
                     f"Cartesian control is too poorly conditioned here to use. A "
                     f"{attempt_mm:+.1f} mm {self.direction} nudge needs "
                     f"{pan_deg:.1f} deg of base yaw (limit "
-                    f"{config.SERVO_VISUAL_MAX_PAN_DEG}) and {roll_deg:.1f} deg of "
+                    f"{pan_budget_deg:.1f}) and {roll_deg:.1f} deg of "
                     f"wrist roll (limit {config.SERVO_VISUAL_MAX_ROLL_DEG}); "
                     f"{over} is over budget and swings the camera further than "
                     f"the correction is worth.\n"

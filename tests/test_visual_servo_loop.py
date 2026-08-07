@@ -29,6 +29,7 @@ sys.path.insert(0, str(ROOT / "src"))
 sys.path.insert(0, str(ROOT / "scripts"))
 
 import visual_servo as vs  # noqa: E402
+from vision_pipeline import config  # noqa: E402
 from vision_pipeline.planning.visual_servo import AxisEstimate  # noqa: E402
 
 
@@ -420,6 +421,145 @@ def test_a_solve_that_swings_the_base_is_refused_not_executed():
     with pytest.raises(vs.ServoAbort, match="poorly conditioned"):
         vs.CartesianActuator("tangential").apply(ctx, 10.0)
     assert bus.stepped == [], "nothing should have been commanded"
+
+
+# --- the pan budget is not the same quantity on both axes --------------------
+#
+# For a RADIAL nudge base yaw is waste: reach happens in the shoulder/elbow
+# plane, so yaw in the answer is redundancy spent uninstructed. A flat ceiling
+# is right.
+#
+# For a TANGENTIAL nudge base yaw IS the actuator, and the angle is fixed by
+# geometry rather than chosen: theta = d / r. No solution uses less, so a flat
+# ceiling does not limit waste there -- it limits the STEP SIZE to
+# MAX_PAN_DEG * r while calling the optimal solve "over budget".
+#
+# THAT STALLED THE 2026-08-07 DESCENT. At r = 205 mm the loop asked for 12 mm
+# against a 55 px error -- the right amount, confirmed afterwards at 4.7 px/mm --
+# needed 3.35 deg, and was halved twice to 3 mm. It moved 14 px against a descent
+# injecting ~14 px per step, so the corrector sat at exactly break-even until the
+# progress monitor stopped the run.
+
+class TangentialIK(FakeIK):
+    """Solves a tangential nudge with base yaw and nothing else.
+
+    `waste` is how many times the geometric requirement (theta = d / r) the
+    solve spends. 1.0 is the optimal answer -- what a well-conditioned pose
+    returns -- and anything above it is the solver leaning on yaw harder than
+    the geometry demands, which is the near-base-axis failure the flat ceiling
+    was written for.
+    """
+
+    TICKS_PER_RAD = 651.89
+
+    def __init__(self, bus, radius=0.150, waste=1.0):
+        super().__init__(bus)
+        self.radius = radius
+        self.waste = waste
+
+    def _tip(self, angles=None):
+        return np.array([self.radius, 0.0, 0.080])
+
+    def request_ik(self, x, y, z, seed_rad=None, lock=None):
+        self.locks.append(tuple(lock or ()))
+        self.solves.append({"tangential_mm": y * 1000.0})
+        ticks = (y / self.radius) * self.TICKS_PER_RAD * self.waste
+        return [self.bus.ticks[1] + ticks, self.bus.ticks[2],
+                self.bus.ticks[3], self.bus.ticks[4], self.bus.ticks[5]], 0.0
+
+
+def _tangential_ctx(**kw):
+    bus = CartesianBus()
+    world = FakeWorld(bus)
+    args = Namespace(settle=0.0, deadband=12.0, view=False, max_iterations=10)
+    return vs.Context(bus, FakeCamera(world), FakeDetector(world), args, None,
+                      ik=TangentialIK(bus, **kw))
+
+
+def test_a_tangential_nudge_may_spend_the_yaw_its_geometry_requires():
+    """THE 2026-08-07 REGRESSION. The full request must execute, not a quarter.
+
+    12 mm at r = 150 mm needs 4.6 deg, three times the flat ceiling, and there
+    is no cheaper answer -- J1 is the only joint that moves the claw sideways.
+    """
+    ctx = _tangential_ctx()
+    executed = vs.CartesianActuator("tangential").apply(ctx, 12.0)
+
+    assert executed == pytest.approx(12.0), "the nudge was shrunk"
+    assert len(ctx.ik.solves) == 1, "it should not have needed to shrink at all"
+
+    panned = ctx.bus.stepped[-1][1] - 2000
+    pan_deg = abs(panned) / TangentialIK.TICKS_PER_RAD * 180 / np.pi
+    assert pan_deg > config.SERVO_VISUAL_MAX_PAN_DEG, (
+        "this test is pointless unless the accepted pan exceeds the flat "
+        "ceiling -- that is the whole regression")
+    assert pan_deg == pytest.approx(np.degrees(0.012 / 0.150), abs=0.05), (
+        "and it must be the geometric requirement, not merely a bigger number")
+
+
+def test_a_tangential_solve_that_wastes_yaw_is_still_shrunk():
+    """The loosening is against the GEOMETRY, not a blanket exemption.
+
+    Close to the base axis the claw's 27 mm offset makes the tip's bearing
+    hypersensitive to J1 and the solver buys millimetres with degrees. That is
+    what the guard exists for and it must survive the fix.
+    """
+    ctx = _tangential_ctx(waste=3.0)
+    executed = vs.CartesianActuator("tangential").apply(ctx, 12.0)
+
+    assert abs(executed) < 12.0 / 4, (
+        f"a solve spending 3x the geometric requirement executed {executed} mm")
+    assert len(ctx.ik.solves) > 3, "it should have shrunk repeatedly"
+
+
+def test_a_radial_nudge_keeps_the_flat_ceiling():
+    """Direction-specific, and it has to be: the same 4.6 deg that is the only
+    way to move sideways is pure waste on an axis base yaw cannot serve."""
+    # FakeIK, not TangentialIK: a radial nudge measures its direction by
+    # perturbing the pitch chain, so the FK has to respond to its angles.
+    class YawingRadialIK(FakeIK):
+        def request_ik(self, x, y, z, seed_rad=None, lock=None):
+            self.locks.append(tuple(lock or ()))
+            self.solves.append({})
+            # 4.6 deg -- accepted tangentially above, waste here.
+            return [self.bus.ticks[1] + 52, self.bus.ticks[2],
+                    self.bus.ticks[3], self.bus.ticks[4], self.bus.ticks[5]], 0.0
+
+    bus = CartesianBus()
+    world = FakeWorld(bus)
+    args = Namespace(settle=0.0, deadband=12.0, view=False, max_iterations=10)
+    ctx = vs.Context(bus, FakeCamera(world), FakeDetector(world), args, None,
+                     ik=YawingRadialIK(bus))
+
+    with pytest.raises(vs.ServoAbort, match="poorly conditioned"):
+        vs.CartesianActuator("radial").apply(ctx, 12.0)
+    assert bus.stepped == []
+
+
+def test_close_to_the_yaw_axis_the_geometric_budget_is_not_used():
+    """d/r explodes as r shrinks, so a budget derived from it would authorise
+    exactly the swing the flat ceiling refuses. Fall back below MIN_RADIUS."""
+    act = vs.CartesianActuator("tangential")
+    ctx = _tangential_ctx(radius=0.150)
+    near = _tangential_ctx(radius=0.020)
+
+    tip_far = np.array([0.150, 0.0, 0.080])
+    tip_near = np.array([0.020, 0.0, 0.080])
+
+    assert act._pan_budget_deg(ctx, tip_far, 12.0) > config.SERVO_VISUAL_MAX_PAN_DEG
+    assert act._pan_budget_deg(near, tip_near, 12.0) == config.SERVO_VISUAL_MAX_PAN_DEG
+
+
+def test_the_tangential_budget_is_never_stricter_than_the_flat_one():
+    """The fix only ever loosens. A small nudge has a tiny geometric
+    requirement, and clamping to it would refuse nudges that work today."""
+    act = vs.CartesianActuator("tangential")
+    ctx = _tangential_ctx()
+    tip = np.array([0.150, 0.0, 0.080])
+    for mm in (0.5, 1.0, 2.0, 4.0, 12.0, 40.0):
+        assert act._pan_budget_deg(ctx, tip, mm) >= config.SERVO_VISUAL_MAX_PAN_DEG
+    assert act._pan_budget_deg(ctx, tip, 400.0) == \
+        config.SERVO_VISUAL_MAX_TANGENTIAL_PAN_DEG
 
 
 def test_the_reach_direction_is_measured_not_inferred_from_the_yaw_axis():

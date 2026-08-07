@@ -1071,7 +1071,66 @@ SERVO_VISUAL_SIDEWAYS_BUDGET_TICKS = 200.0
 #     radius 160 mm -> 0.79 deg             (clean)
 # The fix is operational — work further out — but the loop must not quietly
 # thrash when it is not.
+#
+# THIS CEILING APPLIES TO A RADIAL NUDGE, NOT A TANGENTIAL ONE, and conflating
+# the two stalled the 2026-08-07 descent. See the three constants below.
 SERVO_VISUAL_MAX_PAN_DEG = 1.5
+#
+# --- ...and why a TANGENTIAL nudge gets a different one ----------------------
+#
+# For a radial nudge base yaw is waste: radial motion happens in the
+# shoulder/elbow plane, so yaw in the answer is redundancy the solver spent
+# uninstructed, and the camera on the wrist pays for it. A flat ceiling is
+# right.
+#
+# For a tangential nudge base yaw is THE ACTUATOR. J2/J3/J4 are parallel pitches
+# confined to one vertical plane, so sideways motion of the claw is what J1 is.
+# The angle is then fixed by geometry, not chosen:
+#
+#     theta = d / r          d = the nudge, r = tip radius from the yaw axis
+#
+# No solution uses less. A flat angle ceiling therefore does not limit waste
+# there -- it limits the STEP SIZE, to MAX_PAN_DEG * r, while reporting the
+# optimal solve as "over budget".
+#
+# MEASURED, 2026-08-07, mid-descent at r = 205 mm. The loop asked for 12 mm of
+# sideways correction against a 55 px error -- the right amount, as the part
+# that did execute confirmed at 4.7 px/mm -- and needed 3.35 deg:
+#
+#     12 mm -> 3.35 deg   REFUSED, halve
+#      6 mm -> 1.68 deg   REFUSED, halve
+#      3 mm -> 0.84 deg   accepted, moved 14 px of the 55
+#
+# The descent was injecting ~14 px of sideways error per step by itself (visible
+# in steps 1-5, before the sideways loop had engaged at all: +40, +29, +25, +10,
+# -9 px). So the corrector was pinned at exactly break-even, the error never
+# closed, and the progress monitor stopped the run -- correctly, for a cause it
+# could not see. The operator's report is the tell: J1 turned 0.79 deg, three
+# times, invisibly, on a loop asking to turn it four times as far.
+#
+# The budget for a tangential nudge is therefore the REQUIRED angle plus slack.
+# The slack is what still catches the case the flat ceiling was written for: a
+# solve leaning on yaw far harder than geometry demands, which happens close to
+# the base axis where the claw's 27 mm offset makes the tip's bearing
+# hypersensitive to J1. 1.4 lets an ordinary solve through -- IK lands within a
+# few percent of d/r when it is well conditioned -- while a solve wanting 2x the
+# geometric answer is shrunk.
+SERVO_VISUAL_TANGENTIAL_PAN_SLACK = 1.4
+#
+# Below this radius, d/r is meaningless as a budget: the radius is small, the
+# required angle explodes, and a budget derived from it would authorise exactly
+# the swing MAX_PAN_DEG exists to refuse. Fall back to the flat ceiling there.
+# Set to SERVO_VISUAL_MIN_RADIUS_M (120 mm), the radius below which Cartesian
+# re-centring is already declared poor -- one threshold, not two.
+SERVO_VISUAL_MIN_TANGENTIAL_RADIUS_M = 0.120
+#
+# The absolute ceiling, and the one thing that is a flat angle cap on purpose.
+# At the working radius (~205 mm) 8 deg is ~29 mm of sideways travel in a single
+# nudge, far more than any real correction, so this bounds a runaway without
+# being reachable in normal operation. It is not the primary backstop --
+# SERVO_VISUAL_SIDEWAYS_BUDGET_TICKS is, being cumulative and independent of the
+# pixel measurements being right -- it just stops one solve being enormous.
+SERVO_VISUAL_MAX_TANGENTIAL_PAN_DEG = 8.0
 #
 # The same guard for J5, the WRIST ROLL, which spins the camera about its own
 # optical axis and so ROTATES the image: a brick 100 px off centre swings
