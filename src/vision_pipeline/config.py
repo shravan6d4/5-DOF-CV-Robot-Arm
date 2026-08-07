@@ -987,6 +987,23 @@ SERVO_VISUAL_BLIND_DROP_MM = 25.0
 # descent is by definition running with nothing reading the image.
 SERVO_VISUAL_BLIND_DROP_MAX_MM = 60.0
 #
+# Descent step for the two paths. A raised brick is CLOSER to the camera at the
+# same tip height, so it fills more of the frame and slides out of the bottom of
+# it sooner -- the first four raised runs each managed exactly ONE sighting
+# before going blind, against nine and ten for the flat ones.
+#
+# That starves the thing the raised path depends on. HeightModel needs two
+# descents that each saw the brick three or more times, and a run contributing
+# one sighting contributes no usable pairs at all. Halving the step roughly
+# doubles the sightings taken in the same vertical distance, which is the
+# cheapest way to buy them: nothing else about the descent changes, and the
+# smaller step is independently a little safer near the table.
+#
+# Applied automatically when the operator answers "not flat", and only if they
+# have not asked for a step themselves.
+DESCEND_STEP_MM = 8.0
+SERVO_VISUAL_RAISED_DESCEND_STEP_MM = 4.0
+#
 # --- the two-view survey: two struck poses between centring and descent ------
 #
 # The arm strikes two poses a fixed distance apart, with the brick in view from

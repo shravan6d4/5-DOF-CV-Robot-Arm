@@ -2528,3 +2528,52 @@ def test_the_survey_settles_at_every_pose_including_the_returns():
 
     assert len(waits) == 4, f"expected a settle per move, got {waits}"
     assert all(w >= config.SERVO_VISUAL_TWO_VIEW_SETTLE_S for w in waits)
+
+
+# --- answering "not flat" also buys more sightings ----------------------------
+
+def _flat_q_ctx(answer, descend_step=None):
+    bus = HoverBus()
+    args = Namespace(settle=0.0, deadband=12.0, view=False, max_iterations=10,
+                     no_wait=False, no_grasp=False, raised=False, flat=False,
+                     descend_step=(config.DESCEND_STEP_MM if descend_step is None
+                                   else descend_step))
+    ctx = vs.Context(bus, None, None, args, None, ik=None)
+    ctx.bus = bus
+    import builtins
+    real, builtins.input = builtins.input, lambda _p="": answer
+    try:
+        vs.ask_flat_on_board(ctx)
+    finally:
+        builtins.input = real
+    return ctx
+
+
+def test_answering_not_flat_halves_the_descent_step():
+    """A raised brick is closer, so it leaves the frame sooner: the first four
+    raised runs managed ONE sighting each against nine and ten for the flat
+    ones, and a one-sighting run yields no usable training pairs at all."""
+    ctx = _flat_q_ctx("n")
+    assert ctx.flat_on_board is False
+    assert ctx.args.descend_step == config.SERVO_VISUAL_RAISED_DESCEND_STEP_MM
+    assert config.SERVO_VISUAL_RAISED_DESCEND_STEP_MM < config.DESCEND_STEP_MM
+
+
+def test_answering_flat_leaves_the_descent_step_alone():
+    ctx = _flat_q_ctx("y")
+    assert ctx.flat_on_board is True
+    assert ctx.args.descend_step == config.DESCEND_STEP_MM
+
+
+def test_an_explicit_descend_step_is_not_overridden():
+    """Someone who typed a number meant it."""
+    ctx = _flat_q_ctx("n", descend_step=15.0)
+    assert ctx.args.descend_step == 15.0
+
+
+def test_answering_flat_never_builds_a_height_model():
+    """THE OPERATOR'S REQUIREMENT. Not a branch guard -- fit_height_model is
+    never called, so there is nothing there to read by accident."""
+    ctx = _flat_q_ctx("y")
+    assert not ctx.height_model.ready
+    assert ctx.height_model.n == 0 and ctx.height_model.runs == 0

@@ -792,6 +792,27 @@ def ask_flat_on_board(ctx):
     if not ctx.flat_on_board:
         ctx.height_model = blind_travel.fit_height_model(ctx.blind_history,
                                                          flat_on_board=False)
+        # AND HALVE THE DESCENT STEP, because a raised brick starves the model
+        # that is meant to guide it. Being closer to the camera at the same tip
+        # height, it fills more of the frame and leaves the bottom of it sooner:
+        # the first four raised runs managed exactly ONE sighting each, against
+        # nine and ten for the flat ones, and a run with one sighting yields no
+        # usable training pairs at all. A smaller step takes more pictures over
+        # the same vertical distance -- the cheapest way to buy them, and a
+        # little safer near the table besides.
+        #
+        # Only when the operator has not asked for a step themselves. Comparing
+        # against the default rather than tracking "was it passed" is enough
+        # here: someone who explicitly types the default gets the default, which
+        # is what they asked for.
+        if ctx.args.descend_step == config.DESCEND_STEP_MM:
+            ctx.args.descend_step = config.SERVO_VISUAL_RAISED_DESCEND_STEP_MM
+            print(f"\n  Descent step {config.DESCEND_STEP_MM:.0f} -> "
+                  f"{ctx.args.descend_step:.0f} mm for a raised brick: it goes "
+                  f"out of frame")
+            print(f"  sooner, and the height model needs sightings before that "
+                  f"happens. Pass")
+            print(f"  --descend-step to override.")
 
     for line in blind_travel.summarise(ctx.blind_history):
         print(f"  {line}")
@@ -2331,8 +2352,14 @@ def main() -> None:
                          "within the same move. The hover is automatic (skipped "
                          "only by --no-hover, or when already within 40 ticks of "
                          "it) -- there is no need to run goto_pose.py first")
-    ap.add_argument("--descend-step", type=float, default=8.0,
-                    help="millimetres of descent per step (default 8)")
+    ap.add_argument("--descend-step", type=float,
+                    default=config.DESCEND_STEP_MM,
+                    help=f"millimetres of descent per step (default "
+                         f"{config.DESCEND_STEP_MM:.0f}; automatically "
+                         f"{config.SERVO_VISUAL_RAISED_DESCEND_STEP_MM:.0f} on "
+                         f"a NOT-flat brick, which needs more sightings before "
+                         f"it loses sight. Passing this explicitly overrides "
+                         f"that.)")
     ap.add_argument("--descend-probe-mm", type=float,
                     default=config.SERVO_VISUAL_DESCEND_PROBE_MM,
                     help="radial offset added to the SECOND descent step so the "
