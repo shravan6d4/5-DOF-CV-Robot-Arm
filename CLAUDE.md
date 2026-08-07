@@ -117,7 +117,45 @@ That is a centring loop commanding 9 mm, moving 0.1 mm, seeing no pixel response
 
 A solution is now taken or refused **whole**, with `SERVO_VISUAL_MAX_ROLL_DEG` joining the pan guard and shrinking the request until a solve fits. Deletion is pinned shut by `test_an_ik_solution_is_commanded_whole_never_censored`.
 
-## The touch plane says J2, J3 and J4 are sign-flipped — UNCONFIRMED (2026-08-07)
+## THE MODEL'S J2 MOMENT ARM IS WRONG — confirmed by jog (2026-08-07)
+
+**The fault is in the imported model, not in any JSON.** `data/servo_calibration.json`
+is now fully confirmed: all five `dir_sign` by physical jog, J3's `ticks_per_rad`
+at ×1.02. What is wrong is where the model puts the claw relative to J2's axis.
+
+Three independent confirmations:
+
+1. **A jog measured it.** `jog_joint.py --joint 2 --ticks -150` predicted 13.8 mm of claw travel; the operator measured **30.0 mm** (×2.17). At 12.6° that needs a moment arm of **137 mm**; the model says **63.1 mm**. Understated by 74 mm.
+2. **The model contradicts the chain order.** J2 is upstream of J3, which is upstream of J4, so J2 must have the largest moment arm to the claw — it carries everything beyond it. The model inverts this: at the hover, J2 38.5 mm against J3 116.5 and J4 103.4. `audit_model_axes.py` section D reports and flags this.
+3. **The operator falsified it with a ruler.** Jogged the same 12° on J2 and J3 from the hover: the model predicts 8 mm and 24 mm. **J2 moved the claw further**, which is the opposite of the prediction and the correct physical behaviour.
+
+**This explains the whole 2026-08-07 cluster of symptoms**, all of which resisted
+every calibration-layer fix:
+
+- the seven-touch plane spreading **73 mm** with a residual that tracked J2's ANGLE;
+- FK's absolute height being wrong (53 mm at one pose, 111 mm at another) while its DIFFERENTIALS stayed good — a wrong moment arm scales displacement with joint angle, so a small jog looks fine and a large excursion does not;
+- the descent driving past the tabletop until J2 stalled 34 ticks from its limit.
+
+**Do not chase this in `servo_calibration.json` again.** It was scanned
+exhaustively and refuted: `ticks_per_rad` scale and `home_tick` offset on J2/J3/J4
+singly and as 2-D grids (all ran to the edge of their range), all 32 `dir_sign`
+combinations, and gravitational sag (refuted — within one posture cluster the
+moment arm swings 81.7 → 116.5 mm while FK z moves only 56.7 → 53.2). The fix is
+in `Robomainassemjoints.slx` / `Robomainassem_DataFile.m`, or in how `init_arm.m`
+maps servo 2 onto a model body.
+
+**A METHOD NOTE WORTH MORE THAN THE FINDING.** Four statistical arguments agreed
+with each other that J2/J3/J4 were sign-flipped — including an implied table
+height landing within 0.8 mm of an independent ruler reading the fit never saw —
+and all four were wrong. One jog refuted them in thirty seconds. The operator got
+there from first principles instead: *J2 is earliest in the chain, so it must move
+the claw more than J3 and far more than J4.* The numbers proving it had already
+been generated (4.14 mm for J3 against 1.34 for J2 per 2°) and read past. Prefer a
+structural check with a falsifiable ruler prediction over any fit to one data set;
+this is the same lesson as the five hand-eye solvers agreeing at 80 mm against a
+24 mm ruler.
+
+## The touch plane said J2, J3 and J4 are sign-flipped — REFUTED (2026-08-07)
 
 Seven touches of the tabletop across three distinct postures
 ([`scripts/measure_table_plane.py`](scripts/measure_table_plane.py)) are all one
