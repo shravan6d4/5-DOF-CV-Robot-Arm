@@ -676,6 +676,27 @@ SERVO_GRIPPER_GRIP_TICKS = 3003
 # the brick takes ~6 approvals: enough to stop between "not touching" and
 # "gripping" without making the operator hold down a key.
 SERVO_GRIPPER_JOG_TICKS = 40
+#
+# --- squeezing, after the claw has already met the brick ---------------------
+#
+# The approach jog stops the moment the claw stops moving, which is where the
+# jaws TOUCH the brick -- not necessarily where they hold it. Closing further
+# from there is how a Feetech servo is asked to grip harder: it converts goal
+# position error into torque, so a goal a little past the brick is a squeeze.
+#
+# Smaller than the approach jog because it buys force rather than travel, and
+# the operator is choosing it one press at a time with the brick already in the
+# jaws. 20 ticks is ~3.5 deg of servo rotation.
+SERVO_GRIPPER_SQUEEZE_TICKS = 20
+#
+# Advisory ceiling on the ACCUMULATED position error past first contact. Not a
+# hard limit -- the full-close stop (min_tick) is what actually refuses -- but
+# past this the servo is holding substantial torque against a load that is not
+# moving, which is the condition that overloaded J3 on 2026-08-04 and put the
+# checksum storm on the bus during the 2026-08-07 descent. 120 ticks is ~21 deg
+# of commanded error, well past what a Lego brick needs and well short of the
+# ~271 ticks between the grip position and the jaws touching.
+SERVO_GRIPPER_MAX_SQUEEZE_TICKS = 120
 
 # Total servos on the bus: J1..J5 (arm) + J6 (gripper).
 NUM_JOINTS = 6
@@ -865,6 +886,20 @@ SERVO_VISUAL_TOLERANCE_Y_PX = 55
 # error to halve several times over at the loop's gains without letting a stalled
 # correction grind indefinitely.
 SERVO_VISUAL_MAX_REAIM_STEPS = 6
+
+# How far off the hover ticks a joint may land and still count as arrived.
+#
+# The move is paced and each hop is re-checked against the travel limits, so a
+# joint that is out of range gets refused part-way while the others arrive --
+# and the run then continues from a pose that LOOKS like the hover in the log,
+# because the move was commanded, and is not one. This is the threshold at which
+# go_to_hover names the joint and says which limits refused it.
+#
+# 15 ticks is ~1.3 deg: past ordinary settling and servo deadband, well short of
+# anything that changes the view. Deliberately tighter than poses.at_pose's
+# 40-tick default, which answers a different question ("close enough to skip the
+# move?") and should stay loose.
+SERVO_VISUAL_HOVER_TOLERANCE_TICKS = 15
 
 # Sideways companion to AIM_OFFSET_Y, and the same kind of quantity: the claw
 # does not sit under the pixel the camera calls centre, so the aim point is the

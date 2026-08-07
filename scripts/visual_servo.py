@@ -671,6 +671,88 @@ class CartesianActuator:
         return f"tip ({tip[0] * 1000:+.0f},{tip[1] * 1000:+.0f},{tip[2] * 1000:+.0f})"
 
 
+def hover_residual(bus):
+    """Per-joint (landed, target, delta) for the hover pose. Reads only."""
+    return [(j, bus.read_position_retrying(j), int(t),
+             bus.read_position_retrying(j) - int(t))
+            for j, t in sorted(poses.HOVER.items())]
+
+
+def go_to_hover(ctx):
+    """Drive to the hover pose, then ASK whether to do it again. MOVES THE ARM.
+
+    THE AUTOMATIC MOVE IS NOT ALWAYS THE WHOLE MOVE, which is the reason for the
+    prompt. `poses.goto` walks every joint together in sub-cap hops and each hop
+    is re-checked against the travel limits, so a joint that is out of range --
+    back-driven by a power cut, or left there by a descent that stalled -- gets
+    refused part-way while the others arrive. The run then continues from a pose
+    that LOOKS like the hover in the log because the move was commanded, and is
+    not one. Re-running the move is what recovers it: the second attempt starts
+    from wherever the first got to, so it makes progress the first could not.
+
+    It is also the natural moment to reposition the brick. The hover swings the
+    camera somewhere the operator did not choose, and the go-ahead that follows
+    asks them to approve that view -- so the useful order is "look, adjust the
+    brick or the arm, hover again, then approve".
+
+    Repeating is bounded by the operator answering, not by a count: every
+    iteration is a fresh explicit yes, and the move itself is the same paced,
+    limit-checked, Ctrl-C-freezable one either way.
+
+    Skipped entirely under --no-wait, which is the flag that means "ask me
+    nothing", the same one that skips the go-ahead.
+    """
+    bus = ctx.bus
+    attempt = 0
+
+    while True:
+        attempt += 1
+        already = poses.at_pose(bus, "hover")
+
+        if already:
+            print("\nAlready at the hover pose." if attempt == 1
+                  else "\n  Already at the hover pose; nothing to command.")
+        else:
+            print("\n--- TO HOVER ---" if attempt == 1
+                  else f"\n--- TO HOVER (attempt {attempt}) ---")
+            for line in poses.describe_move(bus, poses.HOVER):
+                print(line)
+            if attempt == 1:
+                print("  This is where runs start: brick in view, same")
+                print("  geometry every time. --no-hover skips it.")
+            poses.goto(bus, "hover", label="hover",
+                       progress=live_progress(ctx, "to hover")
+                       or (lambda k, n: print(f"    hop {k}/{n}", flush=True)))
+            wait_watching(max(ctx.args.settle, 0.4), ctx, ["at hover"])
+
+        residual = hover_residual(bus)
+        short = [(j, landed, want, d) for j, landed, want, d in residual
+                 if abs(d) > config.SERVO_VISUAL_HOVER_TOLERANCE_TICKS]
+        print("\n  hover:  " + "   ".join(
+            f"J{j} {landed}" + (f" ({d:+d})" if abs(d) > 2 else "")
+            for j, landed, _want, d in residual))
+        if short:
+            print(f"  *** {len(short)} joint{'s' if len(short) > 1 else ''} did "
+                  f"not arrive:")
+            for j, landed, want, d in short:
+                print(f"      J{j} is at {landed}, wanted {want} ({d:+d} ticks). "
+                      f"Limits {bus.travel_limits(j)}")
+            print("      Driving to hover again usually closes this -- the next")
+            print("      attempt starts from here, so it can make progress this")
+            print("      one could not. If it does not, the joint is against a")
+            print("      stop or outside its recorded range: scripts/goto_tick.py")
+
+        if ctx.args.no_wait:
+            return
+        try:
+            again = input("\n  Drive to hover again? [y/N] ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return
+        if again not in ("y", "yes"):
+            return
+
+
 def offer_grasp(ctx):
     """Offer to close the claw, now that the descent has put it in place.
 
@@ -737,13 +819,95 @@ def offer_grasp(ctx):
                                    config.SERVO_GRIPPER_JOG_TICKS, approve, print)
     print(f"\n  {result.message}")
     if result.holding:
-        print("  Lift by hand or with goto_pose; releasing is "
-              "scripts/close_claw.py --open.")
+        squeeze_and_lift(ctx, result)
     elif result.outcome == gripper.REACHED:
         print("  It met nothing on the way, so the jaws shut on air. The claw is")
         print("  not where the brick is -- and the last-seen pixel error above")
         print("  says in which direction.")
     return result
+
+
+def squeeze_and_lift(ctx, grip):
+    """After the claw has gripped: squeeze more, or accept and go to hover.
+
+    THE STALL IS WHERE THE JAWS TOUCH, NOT WHERE THEY HOLD. close_in_jogs stops
+    the instant the claw stops moving, which is first contact -- a Lego brick is
+    smooth plastic and first contact will drop it. Closing further from there is
+    how a Feetech servo is asked to grip harder: it turns goal-position error
+    into torque, so a goal a little past the brick is a squeeze rather than a
+    move. Hence Enter repeating rather than one bigger number: the right amount
+    of grip is something the operator can feel and no sensor here can measure.
+
+    'k' accepts and drives to the hover pose. That is the useful next move and
+    the reason it is offered HERE rather than left to a second script: the claw
+    is at table height holding a brick, and every moment spent typing a command
+    is a moment the servo is holding it. HOVER deliberately omits J6, so driving
+    there cannot open the claw -- the grip survives the lift.
+    """
+    bus = ctx.bus
+    contact = grip.ticks
+    past = 0
+    step = config.SERVO_GRIPPER_SQUEEZE_TICKS
+
+    print(f"\n  --- GRIP: squeeze or lift? ---")
+    print(f"    The claw stopped at {contact} because it MET the brick. That is")
+    print(f"    where the jaws touch, which is not necessarily where they hold.")
+    print(f"    Enter   squeeze {step} ticks further (repeat as often as you like)")
+    print(f"    k       accept this grip and drive to the hover pose")
+    print(f"    n       leave it exactly here and stop")
+
+    while True:
+        try:
+            reply = input(f"\n    [Enter/k/n] ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print("\n    Leaving the grip as it is.")
+            return
+
+        if reply in ("n", "no", "q"):
+            print(f"    Left at {bus.read_position(gripper.GRIPPER_JOINT)}. "
+                  f"Release with: python scripts/close_claw.py --open")
+            return
+
+        if reply in ("k", "y", "yes"):
+            lift_to_hover(ctx)
+            return
+
+        if reply != "":
+            print("    Enter to squeeze, k to accept and hover, n to stop.")
+            continue
+
+        squeeze = gripper.squeeze_once(bus, contact, past, step)
+        past = squeeze.commanded_past
+        if squeeze.refused:
+            print(f"    {squeeze.message}")
+            print(f"    Nothing further to give. k accepts this grip, n stops.")
+            continue
+        print(f"    {squeeze.message}")
+
+
+def lift_to_hover(ctx):
+    """Drive to the hover pose WITH the brick held. MOVES THE ARM.
+
+    Safe to do while gripping only because HOVER omits J6 (pinned by
+    test_the_hover_pose_does_not_touch_the_gripper) -- the joint that is holding
+    the brick is not in the pose, so it is not commanded, so it keeps holding.
+    """
+    print("\n  --- LIFT TO HOVER (holding the brick) ---")
+    for line in poses.describe_move(ctx.bus, poses.HOVER):
+        print(line)
+    print("    J6 is NOT in this pose, so the grip is not commanded and holds.")
+    try:
+        poses.goto(ctx.bus, "hover", label="lift to hover",
+                   progress=live_progress(ctx, "lifting")
+                   or (lambda k, n: print(f"      hop {k}/{n}", flush=True)))
+    except Exception as e:                                        # noqa: BLE001
+        print(f"\n  LIFT FAILED: {e}")
+        print("  The claw is still gripping wherever the arm stopped.")
+        return
+    held = ctx.bus.read_position(gripper.GRIPPER_JOINT)
+    print(f"\n  At the hover pose, J6 holding at {held} "
+          f"({gripper.describe(held)}).")
+    print("  Release with: python scripts/close_claw.py --open")
 
 
 def wait_for_go(ctx):
@@ -1947,19 +2111,7 @@ def main() -> None:
                 # which is part of why a gain measured before a descent stopped
                 # describing the arm during it on 2026-08-05.
                 if not args.no_hover:
-                    if poses.at_pose(bus, "hover"):
-                        print("\nAlready at the hover pose.")
-                    else:
-                        print("\n--- TO HOVER ---")
-                        for line in poses.describe_move(bus, poses.HOVER):
-                            print(line)
-                        print("  This is where runs start: brick in view, same")
-                        print("  geometry every time. --no-hover skips it.")
-                        poses.goto(bus, "hover", label="hover",
-                                   progress=live_progress(ctx, "to hover")
-                                   or (lambda k, n: print(f"    hop {k}/{n}",
-                                                          flush=True)))
-                        wait_watching(max(ctx.args.settle, 0.4), ctx, ["at hover"])
+                    go_to_hover(ctx)
 
                 # Conditioning warning, judged AT THE HOVER POSE. It used to run
                 # before the hover, where it measured whatever posture the last

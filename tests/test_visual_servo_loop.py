@@ -1554,7 +1554,7 @@ def _source_of(func):
 
 def test_the_hover_is_commanded_before_the_go_ahead_is_requested():
     src = _source_of(vs.main)
-    hover = src.index('poses.goto(bus, "hover"')
+    hover = src.index("go_to_hover(ctx)")
     # The go-ahead inside the real-run branch, i.e. the one that is NOT guarded
     # by --dry-run. Take the LAST occurrence: dry-run's copy comes earlier.
     go = src.rindex("wait_for_go(ctx)")
@@ -1604,7 +1604,7 @@ def test_the_reach_conditioning_check_is_made_at_the_hover_pose():
     """It used to run before the hover, measuring whatever posture the previous
     run left behind -- a number about a pose this run never visits."""
     src = _source_of(vs.main)
-    hover = src.index('poses.goto(bus, "hover"')
+    hover = src.index("go_to_hover(ctx)")
     check = src.index("SERVO_VISUAL_MIN_RADIUS_M")
     go = src.rindex("wait_for_go(ctx)")
     assert hover < check < go, (
@@ -1768,3 +1768,211 @@ def test_the_offer_and_close_claw_share_one_implementation():
     import close_claw
     assert "gripper.close_in_jogs" in _source_of(close_claw.main)
     assert "gripper.close_in_jogs" in _source_of(vs.offer_grasp)
+
+
+# --- the hover is offered again after the automatic move ---------------------
+#
+# poses.goto walks every joint in sub-cap hops and re-checks the travel limits
+# per hop, so a joint that is out of range is refused part-way while the others
+# arrive. The run then continues from a pose that LOOKS like the hover in the
+# log -- the move was commanded -- and is not one.
+
+class HoverBus(FakeBus):
+    """Reports hover ticks, except for joints listed in `stuck`."""
+
+    def __init__(self, stuck=None):
+        super().__init__(start=dict(config.SERVO_HOVER_TICKS))
+        self.stuck = dict(stuck or {})
+        self.ticks.update(self.stuck)
+        self.gotos = 0
+
+    def read_position_retrying(self, servo_id):
+        return self.ticks[servo_id]
+
+    def travel_limits(self, servo_id):
+        return (500, 3900)
+
+    def _cal(self, servo_id):
+        return {"ticks_per_rad": 651.89}
+
+    def move_joints_stepped(self, targets, **kw):
+        self.gotos += 1
+        for j, t in targets.items():
+            if j not in self.stuck:
+                self.ticks[j] = int(t)
+
+
+def _hover_ctx(bus, answers, no_wait=False):
+    args = Namespace(settle=0.0, deadband=12.0, view=False, max_iterations=10,
+                     no_wait=no_wait)
+    ctx = vs.Context(bus, None, None, args, None, ik=None)
+    ctx.bus = bus
+    return ctx
+
+
+def test_the_operator_is_asked_to_hover_again_after_the_automatic_move(monkeypatch):
+    bus = HoverBus(stuck={2: 3000})
+    replies = iter(["y", "n"])
+    monkeypatch.setattr("builtins.input", lambda _p="": next(replies))
+    vs.go_to_hover(_hover_ctx(bus, replies))
+
+    assert bus.gotos == 2, "answering yes must re-command the move"
+
+
+def test_declining_the_second_hover_returns_immediately(monkeypatch):
+    bus = HoverBus(stuck={2: 3000})
+    monkeypatch.setattr("builtins.input", lambda _p="": "n")
+    vs.go_to_hover(_hover_ctx(bus, None))
+    assert bus.gotos == 1
+
+
+def test_a_joint_that_did_not_arrive_is_named(monkeypatch, capsys):
+    """The failure this prompt exists for, and it is silent otherwise: the move
+    was commanded, so the log says 'to hover' either way."""
+    bus = HoverBus(stuck={2: 3000})
+    monkeypatch.setattr("builtins.input", lambda _p="": "n")
+    vs.go_to_hover(_hover_ctx(bus, None))
+
+    out = capsys.readouterr().out
+    assert "did not arrive" in out
+    assert "J2 is at 3000" in out
+    assert str(config.SERVO_HOVER_TICKS[2]) in out
+
+
+def test_a_clean_hover_says_nothing_about_joints_not_arriving(monkeypatch, capsys):
+    bus = HoverBus()
+    monkeypatch.setattr("builtins.input", lambda _p="": "n")
+    vs.go_to_hover(_hover_ctx(bus, None))
+    assert "did not arrive" not in capsys.readouterr().out
+
+
+def test_no_wait_asks_nothing_at_all():
+    """--no-wait means 'ask me nothing' -- the same flag that skips the
+    go-ahead. An unattended run must not block on a prompt."""
+    bus = HoverBus(stuck={2: 3000})
+
+    def explode(_p=""):
+        raise AssertionError("--no-wait must not prompt")
+
+    import builtins
+    real, builtins.input = builtins.input, explode
+    try:
+        vs.go_to_hover(_hover_ctx(bus, None, no_wait=True))
+    finally:
+        builtins.input = real
+    assert bus.gotos == 1
+
+
+def test_the_hover_tolerance_is_tighter_than_at_poses_skip_test():
+    """They answer different questions. at_pose asks 'close enough to skip the
+    move?' and should stay loose; this asks 'did the move actually land?'."""
+    assert config.SERVO_VISUAL_HOVER_TOLERANCE_TICKS < 40
+
+
+# --- at the grip: squeeze more, or accept and lift ---------------------------
+#
+# close_in_jogs stops the instant the claw stops moving, which is where the jaws
+# TOUCH the brick and not where they hold it. A Lego brick is smooth plastic and
+# first contact will drop it. Closing further is how a Feetech servo is asked to
+# grip harder -- it turns goal-position error into torque.
+
+class GripBus(HoverBus):
+    """HoverBus plus a J6 that meets a brick and then refuses to move."""
+
+    def __init__(self, j6=3093, **kw):
+        super().__init__(**kw)
+        self.ticks[6] = j6
+        self.j6_commands = []
+
+    def read_position(self, servo_id):
+        return self.ticks[servo_id]
+
+    def set_motion_profile(self, ids, speed, accel):
+        pass
+
+    def move_and_verify(self, servo_id, target):
+        assert servo_id == 6, "only the gripper may be commanded here"
+        self.j6_commands.append(target)
+        return self.ticks[6]          # the brick is in the way: never moves
+
+
+def _grip_ctx(bus, replies, monkeypatch):
+    it = iter(replies)
+    monkeypatch.setattr("builtins.input", lambda _p="": next(it))
+    args = Namespace(settle=0.0, deadband=12.0, view=False, max_iterations=10,
+                     no_wait=False)
+    ctx = vs.Context(bus, None, None, args, None, ik=None)
+    ctx.bus = bus
+    return ctx
+
+
+def _gripped(ticks):
+    from vision_pipeline.robot_interface import gripper as g
+    return g.GripResult(g.GRIPPED, ticks, "gripped")
+
+
+def test_enter_squeezes_again_and_again(monkeypatch):
+    bus = GripBus()
+    ctx = _grip_ctx(bus, ["", "", "", "n"], monkeypatch)
+    vs.squeeze_and_lift(ctx, _gripped(3093))
+
+    assert len(bus.j6_commands) == 3, "each Enter must command one more squeeze"
+    assert bus.gotos == 0, "n must not move the arm"
+
+
+def test_each_squeeze_steps_by_the_squeeze_size_not_the_approach_jog(monkeypatch):
+    bus = GripBus()
+    ctx = _grip_ctx(bus, ["", "n"], monkeypatch)
+    vs.squeeze_and_lift(ctx, _gripped(3093))
+
+    assert bus.j6_commands == [3093 - config.SERVO_GRIPPER_SQUEEZE_TICKS]
+
+
+def test_k_accepts_the_grip_and_drives_to_hover(monkeypatch):
+    bus = GripBus()
+    ctx = _grip_ctx(bus, ["k"], monkeypatch)
+    vs.squeeze_and_lift(ctx, _gripped(3093))
+
+    assert bus.gotos == 1, "k must lift to the hover pose"
+    assert bus.j6_commands == [], "accepting must not squeeze first"
+
+
+def test_the_lift_never_commands_the_gripper(monkeypatch):
+    """The joint holding the brick must not appear in the pose, or the lift
+    would let go at the top. HOVER omits J6; this pins that the lift path
+    depends on it."""
+    bus = GripBus()
+    ctx = _grip_ctx(bus, ["k"], monkeypatch)
+    vs.squeeze_and_lift(ctx, _gripped(3093))
+    assert bus.ticks[6] == 3093
+    assert 6 not in config.SERVO_HOVER_TICKS
+
+
+def test_squeezing_then_accepting_does_both_in_order(monkeypatch):
+    bus = GripBus()
+    ctx = _grip_ctx(bus, ["", "", "k"], monkeypatch)
+    vs.squeeze_and_lift(ctx, _gripped(3093))
+
+    assert len(bus.j6_commands) == 2
+    assert bus.gotos == 1
+
+
+def test_an_unrecognised_key_asks_again_rather_than_guessing(monkeypatch):
+    """Guessing here either squeezes a brick harder or swings the arm."""
+    bus = GripBus()
+    ctx = _grip_ctx(bus, ["x", "?", "n"], monkeypatch)
+    vs.squeeze_and_lift(ctx, _gripped(3093))
+
+    assert bus.j6_commands == []
+    assert bus.gotos == 0
+
+
+def test_squeezing_stops_at_the_full_close_stop_and_keeps_offering(monkeypatch):
+    """The floor refuses, and the run does not end there -- k and n must still
+    work, or the operator is stuck holding a brick with no way to lift it."""
+    bus = GripBus(j6=config.SERVO_GRIPPER_FULL_CLOSE_TICKS)
+    ctx = _grip_ctx(bus, ["", "k"], monkeypatch)
+    vs.squeeze_and_lift(ctx, _gripped(config.SERVO_GRIPPER_FULL_CLOSE_TICKS))
+
+    assert bus.j6_commands == [], "nothing may be commanded past the floor"
+    assert bus.gotos == 1, "k must still lift"

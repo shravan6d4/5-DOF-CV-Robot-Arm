@@ -121,6 +121,91 @@ def settled(bus, timeout_s: float = 3.0, sleep=None) -> int:
         sleep(0.15)
 
 
+@dataclass
+class SqueezeResult:
+    ticks: int              # where J6 ended up
+    moved: int              # how far it actually travelled this squeeze
+    commanded_past: int     # cumulative ticks commanded beyond the contact point
+    message: str
+    refused: bool = False
+
+
+def squeeze_once(bus, contact_ticks: int, commanded_past: int, step: int,
+                 settle=None) -> SqueezeResult:
+    """One more closing jog from wherever the claw is. Floors at full close.
+
+    A SQUEEZE THAT DOES NOT MOVE IS THE POINT, and that is what makes this a
+    different function rather than another call to close_in_jogs. There, no
+    motion means the claw met the brick and the loop stops. Here the claw has
+    ALREADY met the brick, and commanding further shut is how a Feetech servo is
+    asked to hold harder -- position error is what it converts into torque. So
+    "moved 0" is a normal outcome and not a stop condition.
+
+    What bounds it is therefore not motion but the accumulated position error,
+    tracked as `commanded_past`: how far beyond the contact point the goal has
+    been pushed. Past config.SERVO_GRIPPER_MAX_SQUEEZE_TICKS the servo is being
+    asked for a lot of torque against a stationary load, which is the condition
+    that overloaded J3 on 2026-08-04 and put the checksum storm on the bus
+    during the 2026-08-07 descent. The caller is told; the floor is what
+    actually refuses.
+
+    Args:
+        contact_ticks: where the claw first stalled -- the brick's surface.
+        commanded_past: ticks already commanded beyond that, from prior calls.
+        step: ticks to squeeze by.
+
+    Returns:
+        SqueezeResult. `refused` means nothing was commanded.
+    """
+    from vision_pipeline.robot_interface.servo_driver import ServoSafetyError
+
+    if settle is None:
+        settle = settled
+
+    try:
+        current = bus.read_position(GRIPPER_JOINT)
+    except Exception as e:                                        # noqa: BLE001
+        return SqueezeResult(-1, 0, commanded_past,
+                             f"could not read J6: {e}", refused=True)
+
+    floor = config.SERVO_GRIPPER_FULL_CLOSE_TICKS
+    target = max(current - abs(int(step)), floor)
+    if target >= current:
+        return SqueezeResult(
+            current, 0, commanded_past,
+            f"J6 is at {current} and the full-close stop is {floor}. There is "
+            f"nothing left to squeeze -- the jaws are shut on themselves.",
+            refused=True)
+
+    try:
+        bus.move_and_verify(GRIPPER_JOINT, target)
+    except ServoSafetyError as e:
+        return SqueezeResult(current, 0, commanded_past,
+                             f"refused by the servo bus: {e}", refused=True)
+    except Exception as e:                                        # noqa: BLE001
+        return SqueezeResult(current, 0, commanded_past,
+                             f"move failed: {e}", refused=True)
+
+    arrived = settle(bus)
+    moved = arrived - current
+    past = commanded_past + (current - target)
+
+    if abs(moved) < STALL_TICKS:
+        note = (f"commanded {current - target} ticks further, moved {abs(moved)} "
+                f"-- the claw is loading against the brick, not closing on it")
+    else:
+        note = (f"closed {abs(moved)} more ticks to {arrived} -- it was still "
+                f"finding the brick")
+
+    if past > config.SERVO_GRIPPER_MAX_SQUEEZE_TICKS:
+        note += (f"\n      *** {past} ticks past first contact, over the "
+                 f"{config.SERVO_GRIPPER_MAX_SQUEEZE_TICKS}-tick advisory. The "
+                 f"servo is holding a lot of\n          torque against a "
+                 f"stationary load; that is what overloaded J3 on 2026-08-04.")
+
+    return SqueezeResult(arrived, moved, past, note)
+
+
 def close_in_jogs(bus, target: int, step: int, approve: Callable[[str], bool],
                   say: Callable[[str], None], settle=settled) -> GripResult:
     """Walk J6 to `target` in `step`-tick jogs, asking `approve` before each.

@@ -229,3 +229,69 @@ def test_describe_names_the_three_measured_landmarks():
     assert gripper.describe(GRIP) == "at the grip position"
     assert "FULLY CLOSED" in gripper.describe(SHUT)
     assert "%" in gripper.describe((OPEN + GRIP) // 2)
+
+
+# --- squeezing, after first contact ------------------------------------------
+#
+# close_in_jogs stops the instant the claw stops moving, which is where the jaws
+# TOUCH the brick -- not where they hold it. Closing further from there is how a
+# Feetech servo is asked to grip harder: it turns goal-position error into
+# torque. So a squeeze that produces no motion is the POINT, which is exactly
+# the outcome close_in_jogs treats as a stop condition.
+
+def test_a_squeeze_that_does_not_move_is_not_an_error():
+    """The opposite reading from close_in_jogs, on the same observation."""
+    bus = FakeGripperBus(start=GRIP + 90, stops_at=GRIP + 90)
+    r = gripper.squeeze_once(bus, GRIP + 90, 0, 20, settle=lambda b: b.ticks)
+
+    assert not r.refused
+    assert r.moved == 0
+    assert r.commanded_past == 20
+    assert "loading against the brick" in r.message
+
+
+def test_squeezing_accumulates_the_commanded_error_across_calls():
+    """What bounds a squeeze is not motion -- there is none -- but how far past
+    contact the goal has been pushed, since that is what the servo turns into
+    torque."""
+    bus = FakeGripperBus(start=GRIP + 90, stops_at=GRIP + 90)
+    past = 0
+    for _ in range(3):
+        past = gripper.squeeze_once(bus, GRIP + 90, past, 20,
+                                    settle=lambda b: b.ticks).commanded_past
+    assert past == 60
+
+
+def test_a_squeeze_past_the_advisory_says_so():
+    bus = FakeGripperBus(start=GRIP + 90, stops_at=GRIP + 90)
+    r = gripper.squeeze_once(bus, GRIP + 90,
+                             config.SERVO_GRIPPER_MAX_SQUEEZE_TICKS, 20,
+                             settle=lambda b: b.ticks)
+    assert "overloaded J3" in r.message
+
+
+def test_a_squeeze_stops_at_the_full_close_stop():
+    """The advisory warns; the floor refuses."""
+    bus = FakeGripperBus(start=SHUT)
+    r = gripper.squeeze_once(bus, SHUT, 0, 20, settle=lambda b: b.ticks)
+
+    assert r.refused
+    assert bus.commanded == []
+    assert "nothing left to squeeze" in r.message
+
+
+def test_a_squeeze_never_commands_past_the_floor():
+    bus = FakeGripperBus(start=SHUT + 5)
+    gripper.squeeze_once(bus, SHUT + 5, 0, 20, settle=lambda b: b.ticks)
+    assert bus.commanded == [SHUT], "a 20-tick squeeze must clamp to the floor"
+
+
+def test_a_squeeze_that_still_finds_travel_reports_it_differently():
+    """Not every stall is the brick -- a jog can end early on the servo's own
+    settling, and the next squeeze then really does close further."""
+    bus = FakeGripperBus(start=GRIP + 90, stops_at=GRIP + 78)
+    r = gripper.squeeze_once(bus, GRIP + 90, 0, 20, settle=lambda b: b.ticks)
+
+    assert not r.refused
+    assert r.moved == -12
+    assert "still finding the brick" in r.message
