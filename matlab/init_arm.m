@@ -181,3 +181,65 @@ ik = inverseKinematics('RigidBodyTree', robot);
 ik.SolverParameters.MaxIterations = 800;
 
 fprintf('init_arm: robot ready (%d bodies), ClawTip EE, IK solver built.\n', robot.NumBodies);
+
+%% ===== PART 3: GEOMETRY SELF-CHECK =====
+%
+% WHY THIS EXISTS. revNums above maps servo k onto "Revolute <n>" in the
+% Simscape model, and it is a HARDCODED GUESS. The assert after it only checks
+% that six blocks were found -- never that they are the right six, or that they
+% come in chain order. A wrong mapping produces a fully working solver that
+% describes a different arm, which is indistinguishable from a correct one until
+% somebody measures the physical machine.
+%
+% That is not hypothetical. On 2026-08-07 a jog measured the claw sweeping
+% 30.0 mm where the model predicted 13.8 (x2.17): the model puts the tip 63 mm
+% from J2's axis when the arm really has it at ~137 mm. Three sessions of
+% calibration work went into servo_calibration.json before anyone checked the
+% model's own geometry, and every one of those parameters turned out to be
+% correct.
+%
+% The invariant below needs no ruler and no hardware. For a serial arm the tip's
+% perpendicular distance to a joint's axis is what turns that joint's rotation
+% into tip travel (sweep = 2*r*sin(theta/2)). J2 carries J3, J4, J5 and the claw,
+% so in an ordinary posture its arm must be the LARGEST of the pitch joints. A
+% downstream joint reporting a bigger arm is not proof on its own -- a folded arm
+% can swing the tip back toward an upper axis -- but at the ZERO configuration
+% checked here it means the chain order is wrong.
+cfg0chk  = homeConfiguration(robot);
+T_tipchk = getTransform(robot, cfg0chk, endEffector);
+p_tip    = T_tipchk(1:3,4);
+
+fprintf('init_arm: servo -> model mapping (was silent until 2026-08-07):\n');
+armR = zeros(1,5);
+for k = 1:5
+    Tb   = getTransform(robot, cfg0chk, motorBodies{k});
+    ax_l = robot.Bodies{motorIdx(k)}.Joint.JointAxis(:);
+    n    = Tb(1:3,1:3) * (ax_l / norm(ax_l));
+    v    = p_tip - Tb(1:3,4);
+    armR(k) = norm(v - (v.'*n)*n);
+    fprintf('init_arm:   servo %d -> Revolute %-2d  body %-10s  tip %6.1f mm from its axis\n', ...
+            k, revNums(k), motorBodies{k}, 1000*armR(k));
+end
+
+bad = find(armR(3:4) > armR(2)) + 2;
+if ~isempty(bad)
+    fprintf(2, ['init_arm: *** GEOMETRY WARNING. J%s has a LARGER moment arm to the\n' ...
+                'init_arm:     claw than J2, which is upstream of it. At the zero\n' ...
+                'init_arm:     configuration that means revNums maps the servos onto\n' ...
+                'init_arm:     the wrong Revolute blocks, or the imported link\n' ...
+                'init_arm:     transforms are wrong. FK will be confidently incorrect.\n' ...
+                'init_arm:     Check with: python scripts/audit_model_axes.py (section D)\n'], ...
+            strjoin(arrayfun(@(j) sprintf('%d', j), bad, 'UniformOutput', false), ', '));
+end
+
+% Heights a ruler can check at the home pose, printed so a mismatch is caught on
+% the day rather than inferred from a failed pick weeks later. MODEL frame here:
+% model +Z is physically DOWN (see CLAUDE.md), so these are heights BELOW the
+% base origin on the real arm, and the claw tip must come out on the far side of
+% the wrist from the shoulder.
+T_sh = getTransform(robot, cfg0chk, motorBodies{2});
+T_el = getTransform(robot, cfg0chk, motorBodies{3});
+T_wr = getTransform(robot, cfg0chk, motorBodies{5});
+fprintf(['init_arm: model-frame z at home -- shoulder %.1f, elbow %.1f, ' ...
+         'wrist %.1f, claw tip %.1f mm\n'], ...
+        1000*T_sh(3,4), 1000*T_el(3,4), 1000*T_wr(3,4), 1000*p_tip(3));
