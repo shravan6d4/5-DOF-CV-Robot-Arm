@@ -1467,8 +1467,17 @@ def main() -> None:
     print("Ctrl-C freezes it in place; so does q in the --view window.")
     print("=" * 70)
     print(f"descend      {'yes, ' + str(args.descend_step) + ' mm per step, on your say-so' if args.descend else 'no'}")
-    print(f"aim          crosshair {args.aim_offset_y:.0f} px ABOVE the brick "
-          f"(camera sits above the claw)")
+    if args.aim_offset_y:
+        print(f"aim          crosshair {args.aim_offset_y:.0f} px ABOVE the brick "
+              f"(camera sits above the claw)")
+    else:
+        # Saying "0 px above the brick" would read as a grasp geometry rather
+        # than the deliberate abandonment of one. The camera sits above and
+        # behind the claw, so a brick centred in the image is short of it.
+        print("aim          frame CENTRE — not the grasp point. The camera sits")
+        print("             above and behind the claw, so the claw will stop")
+        print("             BEHIND a centred brick. Keeps it in frame during the")
+        print("             descent; pass --aim-offset-y to aim to grasp.")
     print(f"target box   {args.tolerance_x:.0f} x {args.tolerance_y:.0f} px "
           f"around the aim point")
     report_aim_reachability(args)

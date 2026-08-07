@@ -736,10 +736,27 @@ SERVO_VISUAL_MIN_STEP_TICKS = 25
 # view. In a 480 px frame that puts the aim point on the BOTTOM EDGE, y = 480,
 # so only the upper half of the acceptance box is on screen and the brick has to
 # finish in the last ~55 rows. That is legal but tight, and it is the reason
-# visual_servo.py now reports how much of the box is actually visible at
-# startup: an aim point the camera cannot see is a loop that can never converge,
-# and nothing else about the run would look wrong.
-SERVO_VISUAL_AIM_OFFSET_Y_PX = 240
+# visual_servo.py reports how much of the box is actually visible at startup:
+# an aim point the camera cannot see is a loop that can never converge, and
+# nothing else about the run would look wrong.
+#
+# BACK TO 0 on 2026-08-07, at the operator's request, after watching a descent.
+# The arm reaches FORWARD as it descends -- that is the coupling DescentModel
+# exists to model -- which drives the brick DOWN the frame. Aiming at the bottom
+# edge asks the loop to hold it there, so the brick has nowhere to go but out of
+# view, and a brick that leaves the frame ends the run whatever else is working.
+# An aim point at the centre gives it half a frame of room, and the correction
+# it produces is exactly the wanted one: the loop holds the brick at the aim
+# point by pulling REACH BACK, which is the "move it back / get the brick higher
+# up" behaviour, arrived at through the existing reach term rather than a new
+# mechanism.
+#
+# THE TRADE IS REAL AND THIS IS NOT THE GRASP VALUE. The camera sits above and
+# behind the claw, so at offset 0 a centred brick is NOT under the claw -- it is
+# short by the camera-to-claw offset, which is what 240 measured. Expect the
+# claw to stop behind the brick. Restore the measured value, or pass
+# --aim-offset-y, before trying to actually close on one.
+SERVO_VISUAL_AIM_OFFSET_Y_PX = 0
 #
 # The tolerance is a BOX, and it is deliberately generous. Two reasons. The
 # descent re-centres at every step, so the approach corrects itself on the way
