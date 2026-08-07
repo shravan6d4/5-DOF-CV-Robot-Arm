@@ -25,6 +25,90 @@ global robot ik motorIdx homeAngles endEffector wristBody maxReach IK_TOL
 % below work no matter where the caller was started from.
 cd(fileparts(mfilename('fullpath')));
 
+%% ===== GEOMETRY SOURCE =====================================================
+%
+% TRUE  -> build the arm from the RULER SURVEY (build_arm_from_survey.m)
+% FALSE -> the legacy path: importrobot on Robomainassemjoints.slx
+%
+% Default TRUE since 2026-08-07, because the imported CAD is the wrong shape.
+% At the home pose, heights above the tabletop: shoulder model 158.2 / ruler 90,
+% elbow 106.4 / 146, wrist pitch 108.0 / 152. The shoulder settles it -- that
+% shaft is bolted to the base column, so no joint angle or calibration constant
+% can move it, and the CAD reports 158.2 at every pose. The survey tree puts
+% seven held-out tabletop touches within a 6.0 mm spread; the CAD spreads them
+% over 73.1 mm. See test_arm_from_survey.m, which checks this offline.
+%
+% This matters most for IK, not FK: a wrong FK gives a bad reading, but a wrong
+% IK means every commanded pose is solved in an arm that does not exist. That is
+% what drove the claw past the tabletop on 2026-08-07 until J2 stalled 34 ticks
+% from its limit.
+%
+% Flip to FALSE to get the old behaviour back; nothing below this block changed.
+USE_SURVEY_GEOMETRY = true;
+
+if USE_SURVEY_GEOMETRY
+    [robot, motorIdx, endEffector, wristBody] = build_arm_from_survey();
+
+    % ---- put it in the frame the rest of the project already speaks ---------
+    %
+    % build_arm_from_survey works in the natural frame: origin ON the base yaw
+    % axis at TABLE level, +X the arm's forward, +Z up. Everything above the
+    % wire speaks the legacy MODEL frame instead, where MatlabIKClient applies
+    % physical = model(x, -y, -z) and heights are measured from the base origin
+    % with the table at TABLE_Z_IN_BASE. Converting HERE keeps that contract, so
+    % no Python changes and the 26 files that call this server are untouched.
+    %
+    % Z is matched exactly, which is the axis that matters: it is the one
+    % target_z and the floor guard are expressed in. X and Y are NOT rotated
+    % onto the CAD's axes -- they now mean "the arm's forward" and "left", which
+    % is what they should always have meant. The CAD frame was ~89.4 deg off the
+    % arm's own forward (audit_model_axes.py section C), a known unfixed wart, so
+    % nothing correct depended on it. The descent is unaffected either way: it
+    % builds targets as tip + delta, so the absolute frame cancels, and its reach
+    % direction is measured (visual_servo.reach_axis_xy) rather than assumed.
+    TABLE_Z_M = -0.0732;                       % config.TABLE_Z_IN_BASE
+    flipX = [1 0 0 0; 0 -1 0 0; 0 0 -1 0; 0 0 0 1];
+    baseTf = flipX * trvec2tform([0 0 TABLE_Z_M]);
+    firstJoint = robot.Bodies{motorIdx(1)}.Joint;
+    setFixedTransform(firstJoint, baseTf * firstJoint.JointToParentTransform);
+
+    % ---- joint limits, same file and same meaning as the legacy path --------
+    limitsFile = fullfile('..','data','joint_limits_rad.json');
+    if isfile(limitsFile)
+        lim = jsondecode(fileread(limitsFile));
+        for k = 1:5
+            f = sprintf('x%d', k);
+            if isfield(lim, f)
+                robot.Bodies{motorIdx(k)}.Joint.PositionLimits = ...
+                    [lim.(f).min_rad, lim.(f).max_rad];
+                fprintf('init_arm: J%d limits from file: [%.1f %.1f] deg\n', ...
+                        k, rad2deg(lim.(f).min_rad), rad2deg(lim.(f).max_rad));
+            else
+                fprintf(2, ['init_arm: *** J%d has NO measured limits -- it keeps ' ...
+                            'the +-pi default, which is WIDER than several measured\n' ...
+                            'init_arm:     ranges, so IK will spend it before joints ' ...
+                            'that ARE limited. python scripts/find_joint_limits.py --joint %d\n'], k, k);
+            end
+        end
+    end
+
+    homeAngles = zeros(1,6);
+    maxReach   = 0.32;
+    IK_TOL     = 0.010;
+    ik = inverseKinematics('RigidBodyTree', robot);
+    ik.SolverParameters.MaxIterations = 800;
+
+    cfgChk = homeConfiguration(robot);
+    Tchk = getTransform(robot, cfgChk, endEffector);
+    fprintf(['init_arm: SURVEY geometry. Claw tip at home, model frame: ' ...
+             '(%.1f, %.1f, %.1f) mm\n'], 1000*Tchk(1,4), 1000*Tchk(2,4), 1000*Tchk(3,4));
+    fprintf(['init_arm:   -> physical z %.1f mm, i.e. %.1f mm above the table. ' ...
+             'The ruler says 0.\n'], -1000*Tchk(3,4), -1000*Tchk(3,4) - 1000*TABLE_Z_M);
+    fprintf('init_arm: robot ready (%d bodies), ClawTip EE, IK solver built.\n', ...
+            robot.NumBodies);
+    return;   % skip the legacy import entirely
+end
+
 % smiData the model is parameterized against. importrobot evaluates these
 % during its compile step, so load them first. (If the model's PreLoadFcn also
 % loads them this is a harmless reassignment.)
