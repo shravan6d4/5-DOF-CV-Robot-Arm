@@ -934,6 +934,24 @@ SERVO_VISUAL_SIDEWAYS_BUDGET_TICKS = 200.0
 # The fix is operational — work further out — but the loop must not quietly
 # thrash when it is not.
 SERVO_VISUAL_MAX_PAN_DEG = 1.5
+#
+# The same guard for J5, the WRIST ROLL, which spins the camera about its own
+# optical axis and so ROTATES the image: a brick 100 px off centre swings
+# 100·sin(θ), about 10 px at this limit, against a 55 px acceptance box.
+#
+# It is a conditioning guard, not a null-space guard, and the distinction cost a
+# run. J5 is not free motion the solver is wasting — the claw tip sits OFF the
+# roll axis, so J5 genuinely translates it, and a solve can lean on the wrist to
+# reach sideways instead of using the shoulder/elbow chain. Measured 2026-08-07
+# from the hover, a 9 mm radial nudge came back wanting 260 ticks (23°) of roll
+# and doing 99% of its work with them. Refusing to COMMAND that motion while
+# keeping the rest of the solution executes 1% of the request; the only sound
+# response is to reject the whole solution and ask for less.
+#
+# 6° is set where the probe's own solves land (5.2° at 8 mm, 1.8° at 2 mm) so an
+# ordinary nudge passes, while the 23-35° solutions that stalled the centring
+# loop are shrunk until they are honest.
+SERVO_VISUAL_MAX_ROLL_DEG = 6.0
 # Below this tip radius, warn that Cartesian re-centring will be poor.
 SERVO_VISUAL_MIN_RADIUS_M = 0.120
 # A "nudge" whose solution moves some joint this far is not a nudge: it is the

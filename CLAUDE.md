@@ -82,6 +82,41 @@ That single mistake was live in three places:
 
 **Also open: at all-zero joints the arm reaches along bearing −89.4°**, not +X, so every Cartesian x/y target is rotated ~90° from the arm's own forward. Stage D only ever validated the VERTICAL axis, which a rotation about Z leaves untouched — which is why nothing has caught it. **Hand-eye is immune** (`AX=XB` uses relative gripper poses, and a fixed base-frame change cancels exactly), so this is not the calibration failure. It does mean `goto_point.py --x` does not drive the direction it names. Unfixed: the visual-servo path does not use base X/Y (it works in radial/tangential, now correct), so it is not blocking a descend run.
 
+### "Radial" was not a direction the arm could reach in (2026-08-07)
+
+The yaw-axis fix above was necessary and not sufficient. Radial was still *inferred* — the horizontal direction from the base yaw axis out to the tool — and that is the direction the arm reaches **only when the tool is well away from that axis**. Reach comes from the **pitch chain**: J2/J3/J4 are parallel, so they move the tip in one fixed vertical plane, and J1 alone decides that plane's horizontal bearing. Nothing makes it point away from the yaw axis.
+
+At the hover pose it does not come close. The tool sits **8.7 mm** from the yaw axis, so "radial" is the bearing of a near-zero vector:
+
+```
+tip (+71.4, +17.7) mm    yaw axis (+77.8, +23.6) mm
+computed radial   -137.8 deg
+pitch chain        +94.4 deg      <- 52.1 deg apart
+```
+
+Every radial nudge asked for a component the shoulder/elbow chain could supply only 61% of, and IK made up the rest with the two joints that could: base yaw and wrist roll. A 9 mm ask came back wanting **260 ticks (23°) of J5**. `scripts/visual_servo.py:reach_axis_xy` measures the direction instead — perturb a pitch joint, watch the tip, two FK calls — using whichever of J2/J3/J4 gives the largest horizontal response, since at a folded pose J3 is nearly pure vertical (0.47 mm of 4.14) while J4 gives 3.37 mm. **Pose-dependent, so never cached**, unlike the yaw axis.
+
+| 9 mm nudge along | pan | roll | verdict |
+|---|---|---|---|
+| old radial | 0.35° / 15.56° | **22.85° / 20.04°** | shrink |
+| measured reach | 0.09° / 0.53° | **0.00° / 0.53°** | accepted |
+
+**Tangential was already right** and stays geometric: computed −47.8° against J1's actual tip motion at −46.8°. It is perpendicular to the radius by construction, which is exactly what base yaw does, and that holds however close in the tool sits.
+
+#### Never delete a joint from an IK solution
+
+The same run produced a worse mistake, now reverted. The `lock` field is ignored by the server (below), so `visual_servo.py` briefly enforced it by simply not commanding the held joints — on the theory that J5 is a wrist roll and therefore pure null space. Both halves were wrong. **The claw tip sits off the roll axis, so J5 translates it**; and an IK solution is a *coordinated* answer — the other joints are where they are BECAUSE the deleted one was going to move.
+
+| nudge | held | actually executed |
+|---|---|---|
+| radial −9 mm | J1, J5 | **−0.11 mm — 1.2% of the request** |
+| radial +9 mm | J1, J5 | +1.23 mm — 13.7% |
+| tangential −9 mm | J5 | **+15.17 mm — the wrong way** |
+
+That is a centring loop commanding 9 mm, moving 0.1 mm, seeing no pixel response and asking again with the same numbers — which is exactly how the run stalled at 99 px with J3 requesting the same −18 ticks twelve times running. **The tell was the request not changing**: the loop re-reads the arm's angles every iteration, so an unchanging ask means an unmoving arm.
+
+A solution is now taken or refused **whole**, with `SERVO_VISUAL_MAX_ROLL_DEG` joining the pan guard and shrinking the request until a solve fits. Deletion is pinned shut by `test_an_ik_solution_is_commanded_whole_never_censored`.
+
 ## home_tick was wrong by up to 268 ticks, and nothing could see it (2026-08-05)
 
 **`matlab/init_arm.m` defines home as all five joint angles ZERO** (`homeAngles = zeros(1,6)`, `HomePosition` reset to 0 per motor joint). FK there returns claw tip `(+70.0, −0.1, −67.7)` mm — 70 mm in front of the base, dead centre in y, hanging below the wrist. That is the arm's reference frame; `home_tick` in `data/servo_calibration.json` is the tick reading at that physical pose, and nothing else.

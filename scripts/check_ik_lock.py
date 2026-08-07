@@ -132,44 +132,38 @@ def main() -> int:
                   f"{'honoured' if drift < 2 else 'IGNORED (as expected)'}")
 
         if not blocking and solutions:
-            print("\n2) What Python actually commands (this is the load-bearing one)\n")
+            print("\n2) Will the guards accept these solves? (the load-bearing one)\n")
+            print("   The loop takes a solution WHOLE or asks for a smaller one. It")
+            print("   never deletes a joint from the answer -- doing that executed")
+            print("   1% of the request and stalled the 2026-08-07 run.\n")
             for axis, solution in solutions.items():
-                held = set(AXES[axis])
                 want = {j: bus.rad_to_ticks(j, a)
                         for j, a in zip(IK_JOINTS, solution)}
-                sent = {j: (ticks[j] if j in held else want[j]) for j in IK_JOINTS}
+                moved = {j: want[j] - ticks[j] for j in IK_JOINTS}
+                pan = abs(moved[1]) / TICKS_PER_RAD * 180 / np.pi
+                roll = abs(moved[5]) / TICKS_PER_RAD * 180 / np.pi
 
-                dropped = {j: want[j] - ticks[j] for j in held
-                           if abs(want[j] - ticks[j]) > 2}
-                moved = {j: sent[j] - ticks[j] for j in IK_JOINTS}
-                biggest = max(abs(d) for d in moved.values())
+                over = []
+                if pan > config.SERVO_VISUAL_MAX_PAN_DEG:
+                    over.append("pan")
+                if roll > config.SERVO_VISUAL_MAX_ROLL_DEG:
+                    over.append("roll")
+                if max(abs(d) for d in moved.values()) > config.SERVO_VISUAL_MAX_SOLVE_TICKS:
+                    over.append("travel")
 
-                print(f"  {axis} nudge, holding {sorted(held)}:")
-                print("      solver wanted: "
-                      + "  ".join(f"J{j}{want[j] - ticks[j]:+6d}" for j in IK_JOINTS))
-                print("      we command:    "
+                print(f"  {axis} nudge:")
+                print("      solver wants:  "
                       + "  ".join(f"J{j}{moved[j]:+6d}" for j in IK_JOINTS))
-                if dropped:
-                    print("      dropped:       "
-                          + ", ".join(f"J{j}{d:+d}" for j, d in sorted(dropped.items()))
-                          + " ticks of null-space motion the camera never sees")
+                print(f"      pan {pan:5.2f} deg (max {config.SERVO_VISUAL_MAX_PAN_DEG})"
+                      f"   roll {roll:5.2f} deg (max {config.SERVO_VISUAL_MAX_ROLL_DEG})"
+                      f"   -> {'SHRINK: ' + '+'.join(over) if over else 'accepted as is'}")
 
-                # A held joint reading anything but zero would mean the drop
-                # itself is broken, which no amount of MATLAB-side fixing covers.
-                leaked = {j: moved[j] for j in held if abs(moved[j]) > 2}
-                if leaked:
-                    print(f"      *** LEAK: held joint(s) still moving {leaked}")
-                    blocking.append("the Python-side hold is not dropping the joint")
-
-                # Holding a joint can leave nothing to move with. The nudge then
-                # reports its requested size while the arm stands still, and the
-                # probe divides a pixel shift by a move that never happened --
-                # manufacturing a gain out of detection noise.
-                if dropped and biggest < 2:
-                    print(f"      *** the hold leaves no motion at all on this axis")
-                    blocking.append(
-                        f"a {axis} nudge from this pose is only reachable through "
-                        f"the joints it holds")
+            # Shrinking is normal and self-correcting, so it does not block. What
+            # blocks is a pose where every size is over budget, and that only
+            # shows up by running the real loop -- flagged, not asserted.
+            print("\n   A shrink is not a fault: the loop halves until a solve fits,")
+            print("   and a smaller step that really executes beats a large one")
+            print("   that does not. It aborts only if it runs out of room.")
 
     print()
     if blocking:
@@ -180,11 +174,12 @@ def main() -> int:
         print("  MATLAB lock has never worked and the run does not rely on it.")
         return 1
 
-    print("  Null-space motion is suppressed where it counts. J5 stays put on")
-    print("  every nudge and J1 on radial ones, so the image only moves for")
-    print("  reasons the loop asked for, and a probe gain means what it says.")
+    print("  Solves are reachable and the guards can judge them. Whatever the")
+    print("  loop commands, it commands in full, so a probe gain is measured")
+    print("  against a move the arm actually made.")
     print("\n  MATLAB's own lock is ignoring the request (section 1) -- that is the")
-    print("  documented status quo, not a regression. Python drops the joints.")
+    print("  documented status quo, not a regression. The pan/roll budget is what")
+    print("  keeps the camera still enough to servo against.")
     return 0
 
 

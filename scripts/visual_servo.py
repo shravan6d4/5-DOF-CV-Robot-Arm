@@ -429,34 +429,42 @@ class CartesianActuator:
         return f"{self.direction} nudge"
 
     def _unit_vector(self, ctx):
-        _angles, tip = tip_position(ctx)
-        radial, tangential = radial_tangential((tip[0], tip[1]), yaw_axis_xy(ctx))
-        vec = radial if self.direction == "radial" else tangential
+        angles, tip = tip_position(ctx)
+        if self.direction == "radial":
+            # MEASURED from the pitch chain, not inferred from the yaw axis --
+            # see reach_axis_xy for why the two differ by 52 deg at the hover.
+            vec = reach_axis_xy(ctx, angles)
+        else:
+            # Tangential stays geometric, and is checked: computed -47.8 deg
+            # against J1's actual tip motion at -46.8 deg (2026-08-07). It is
+            # perpendicular to the radius by construction, which is exactly what
+            # base yaw does, and that holds however close in the tool sits.
+            _radial, vec = radial_tangential((tip[0], tip[1]), yaw_axis_xy(ctx))
         return np.array([vec[0], vec[1], 0.0]), tip
 
     def locked_joints(self, ctx):
-        """Joints the solver must NOT spend on this nudge.
+        """Joints we would PREFER the solver not to spend on this nudge.
+
+        A REQUEST, NOT A GUARANTEE, and nothing here depends on it being
+        honoured -- the server's `lock` is ignored outright (see
+        MatlabIKClient.request_ik). It is still sent because it costs nothing and
+        would help if MATLAB were ever fixed. What actually protects the loop is
+        the pan/roll budget in apply(), which rejects a solution WHOLE and asks
+        for a smaller one. Do not reintroduce enforcement by deleting these
+        joints from the answer: see the comment in apply() for the measurement
+        showing that executes 1% of the request.
 
         Five joints against a 3-DOF position target leaves a 2-dimensional null
-        space, and a position-only solve has no preference inside it -- it takes
-        whatever its iteration lands on. That is free motion as far as the solver
-        is concerned and anything but free here, because THE CAMERA RIDES ON THE
-        WRIST: null-space motion moves the very image this loop measures.
+        space, and a position-only solve has no preference inside it. That is
+        free motion as far as the solver is concerned and anything but free
+        here, because THE CAMERA RIDES ON THE WRIST.
 
-        J5 IS ALWAYS LOCKED. It is the wrist ROLL, so it spins the camera about
-        its own optical axis and ROTATES THE IMAGE, while contributing almost
-        nothing to where the tool is. Measured 2026-08-06: 3 mm radial nudges came
-        back wanting 73-90 ticks of J5 (6-8 deg of roll), which swings a brick
-        100 px off-centre by ~14 px sideways. The run showed exactly that -- "y
-        correction gained -12 px but cost 17 px on x" -- and then stalled, the
-        loop chasing a disturbance it was generating itself.
-
-        J1 IS ALSO LOCKED FOR A RADIAL NUDGE. Radial means "change how far the
-        arm reaches", which happens entirely in the shoulder/elbow plane; base
-        yaw cannot change reach, it can only pan the view. Leaving it free had
-        the pan guard halving every radial nudge two or three times -- a
-        commanded 12 mm arriving as 1.5 mm -- so the loop crept. It stays free
-        for a TANGENTIAL nudge, where swinging the base is the entire point.
+        J5 is asked for on every nudge: it is the wrist ROLL, so it spins the
+        camera about its own optical axis and ROTATES the image. J1 is asked for
+        on a RADIAL nudge only -- radial means "change how far the arm reaches",
+        which happens in the shoulder/elbow plane, so base yaw can only pan the
+        view. It stays free for a TANGENTIAL nudge, where swinging the base is
+        the entire point.
         """
         # getattr, and defaulting to the SAFE side: a caller that predates the
         # flag gets the locking rather than the leak.
@@ -505,88 +513,69 @@ class CartesianActuator:
             targets = {j: ctx.bus.rad_to_ticks(j, a)
                        for j, a in zip(IK_JOINTS, solution)}
 
-            # ENFORCE THE LOCK HERE, not only by asking MATLAB nicely.
-            #
-            # The server's `lock` had no effect at all: with lock=[5], lock=[1]
-            # and lock=[1,5] the returned solution was byte-identical, J1+64.5
-            # and J5+33.7 ticks in every case (measured 2026-08-06, reproduce
-            # with scripts/check_ik_lock.py). Three separate attempts to fix it
-            # inside rigidBodyJoint.PositionLimits failed, so the request is now
-            # belt-and-braces and this is the brace: a locked joint is simply
-            # NOT COMMANDED, whatever the solver returned.
-            #
-            # The tool therefore does not land exactly on the requested point,
-            # and that is fine HERE in a way it would not be in an open-loop
-            # move: this module measures the pixel response of whatever the arm
-            # actually did and derives its gain from that. An unrequested joint
-            # motion is not a small error to be tolerated, it is a disturbance
-            # to the very image the loop reads -- the camera is on the wrist --
-            # so dropping it is strictly better than executing it, even at the
-            # cost of a less accurate nudge.
-            held = set(self.locked_joints(ctx))
-            dropped = {}
-            if held:
-                current = {j: ctx.bus.rad_to_ticks(j, a)
-                           for j, a in zip(IK_JOINTS, angles)}
-                dropped = {j: targets[j] - current[j]
-                           for j in held if abs(targets[j] - current[j]) > 2}
-                for j in held:
-                    targets[j] = current[j]
-                if dropped:
-                    print(f"      held {sorted(held)}: dropped "
-                          + ", ".join(f"J{j}{d:+d}" for j, d in sorted(dropped.items()))
-                          + " ticks the solver wanted but was told not to spend")
-
             moved = {j: targets[j] - ctx.bus.rad_to_ticks(j, a)
                      for j, a in zip(IK_JOINTS, angles)}
             pan_deg = abs(moved[1]) / 651.89 * 180 / np.pi
+            roll_deg = abs(moved[5]) / 651.89 * 180 / np.pi
             biggest = max(abs(d) for d in moved.values())
 
-            # HOLDING A JOINT CAN LEAVE NOTHING TO MOVE WITH. If the solver's
-            # whole answer was the joint we refused to spend, dropping it turns
-            # the nudge into a no-op that still returns amount_mm -- and the
-            # probe would then divide a pixel shift by a move that never
-            # happened, manufacturing a gain out of detection noise. Shrinking
-            # cannot rescue it either: a smaller request needs even less of the
-            # joints that remain free.
-            # `dropped` is the qualifier that matters: complain only when the
-            # lock actually took motion away and nothing was left. A solve that
-            # was already a no-op is a different situation (too small a request,
-            # or an axis with nothing to do) and is handled downstream.
-            if held and dropped and biggest < 2:
-                raise ServoAbort(
-                    f"A {self.direction} nudge here is only reachable through "
-                    f"joint(s) {sorted(held)}, which this axis holds. Dropping "
-                    f"them leaves no motion at all, so the axis cannot act from "
-                    f"this posture.\n"
-                    f"      J5 is the wrist ROLL and J1 is base yaw: neither "
-                    f"changes how far the arm reaches, so needing them for a "
-                    f"radial move means the shoulder/elbow chain is against its "
-                    f"limits or the tool is on the base axis.\n"
-                    f"      Re-run with --no-lock-null to allow it (accepting "
-                    f"that the camera will move), or --recentre joint."
-                )
-
+            # REJECT AND SHRINK. NEVER DELETE A JOINT FROM THE SOLUTION.
+            #
+            # An earlier version of this enforced the `lock` by simply not
+            # commanding the held joints, on the theory that J5 is a wrist ROLL
+            # and therefore pure null space for a position target. That theory is
+            # WRONG -- the claw tip sits off the roll axis, so J5 translates it --
+            # and the mechanism was wrong regardless of the theory. An IK solution
+            # is a COORDINATED answer: the other joints are wherever they are
+            # BECAUSE the deleted one was going to move. Take two out and the
+            # remaining three do not do their share, they do something else.
+            #
+            # Measured 2026-08-07 from the hover (scratch cost_of_drop.py):
+            #
+            #     nudge             held    executed
+            #     radial -9 mm      1, 5     -0.11 mm   ( 1.2% of the request)
+            #     radial +9 mm      1, 5     +1.23 mm   (13.7%)
+            #     tangential -9 mm  5       +15.17 mm   (the WRONG WAY)
+            #
+            # That is a centring loop commanding 9 mm, moving 0.1 mm, seeing no
+            # pixel response and asking again with the same numbers -- which is
+            # exactly how the 2026-08-07 run stalled at 99 px with J3 asking for
+            # the same -18 ticks twelve times running.
+            #
+            # So the solution is taken or refused WHOLE. The guards below say
+            # what makes one unacceptable, and the answer to an unacceptable
+            # solution is a smaller request, not a censored one. This is the same
+            # loop the pan guard has always used; the roll guard just joins it.
             if (pan_deg <= config.SERVO_VISUAL_MAX_PAN_DEG
+                    and roll_deg <= config.SERVO_VISUAL_MAX_ROLL_DEG
                     and biggest <= config.SERVO_VISUAL_MAX_SOLVE_TICKS):
                 break
+
+            over = ("base yaw" if pan_deg > config.SERVO_VISUAL_MAX_PAN_DEG
+                    else "wrist roll" if roll_deg > config.SERVO_VISUAL_MAX_ROLL_DEG
+                    else "joint travel")
             if abs(attempt_mm) / 2 < config.SERVO_VISUAL_MIN_STEP_MM:
                 raise ServoAbort(
                     f"Cartesian control is too poorly conditioned here to use. A "
                     f"{attempt_mm:+.1f} mm {self.direction} nudge needs "
                     f"{pan_deg:.1f} deg of base yaw (limit "
-                    f"{config.SERVO_VISUAL_MAX_PAN_DEG}), which pans the camera "
-                    f"further than the correction is worth.\n"
+                    f"{config.SERVO_VISUAL_MAX_PAN_DEG}) and {roll_deg:.1f} deg of "
+                    f"wrist roll (limit {config.SERVO_VISUAL_MAX_ROLL_DEG}); "
+                    f"{over} is over budget and swings the camera further than "
+                    f"the correction is worth.\n"
                     f"      The tip is {reach_from_axis((tip[0], tip[1]), yaw_axis_xy(ctx)) * 1000:.0f} mm "
                     f"from the base axis; the claw hangs ~27 mm off the arm's "
                     f"plane, so close in the tip's bearing is hypersensitive to "
                     f"J1. Working past ~130 mm fixes it (0.8 deg at 160 mm).\n"
+                    f"      A solve leaning this hard on the wrist is also the "
+                    f"solver reaching sideways with the roll instead of the "
+                    f"shoulder/elbow chain -- more reach usually cures it.\n"
                     f"      Move the brick further out, or re-run with "
                     f"--recentre joint --joint-y 3."
                 )
             attempt_mm /= 2
-            print(f"      solve needed {pan_deg:.1f} deg of camera pan; "
-                  f"halving the nudge to {attempt_mm:+.1f} mm")
+            print(f"      solve needed {pan_deg:.1f} deg pan / {roll_deg:.1f} deg "
+                  f"roll ({over} over budget); halving to {attempt_mm:+.1f} mm")
 
         busy = ", ".join(f"J{j}{d:+d}" for j, d in moved.items() if abs(d) >= 2)
         print(f"      IK residual {err_mm:.1f} mm; joints {busy or 'none moved'}"
@@ -936,6 +925,78 @@ def yaw_axis_xy(ctx):
     return tuple(ctx.ik.base_yaw_axis_xy())
 
 
+def reach_axis_xy(ctx, angles):
+    """The horizontal direction the arm can ACTUALLY reach in, from FK.
+
+    MEASURED, NOT INFERRED, and that is the whole point. "Radial" used to mean
+    the horizontal direction from the base yaw axis out to the tool, which is
+    only the direction the arm reaches when the tool is well away from that
+    axis. Reach is produced by the PITCH CHAIN -- J2, J3 and J4 are parallel to
+    0.0 deg (scripts/audit_model_axes.py), so they move the tip in ONE fixed
+    vertical plane, and the horizontal direction of that plane is set by J1
+    alone. Nothing guarantees it points away from the yaw axis.
+
+    At the hover pose it does not even come close. Measured 2026-08-07:
+
+        tip       (+71.4, +17.7) mm      yaw axis (+77.8, +23.6) mm
+        tip is 8.7 mm from the yaw axis, so "radial" is the bearing of an
+        8.7 mm vector: -137.8 deg
+        the pitch chain actually moves the tip along +94.4 deg -- 52.1 deg away
+
+    A radial nudge there asks for a direction the shoulder/elbow chain can only
+    supply 61% of, and IK makes up the rest with J1 and J5: a 9 mm ask came back
+    wanting 44 ticks of yaw and 108 of wrist roll. The loop was fighting the
+    arm's own geometry, and no amount of guarding the symptom fixes that.
+
+    Perturbing a joint and watching the tip costs two FK calls and is immune to
+    all of it. All three pitch joints share this bearing, so the one with the
+    largest horizontal response is used -- at a folded pose J3 is nearly pure
+    vertical (0.47 mm of 4.14) while J4 gives 3.37 mm, and picking a fixed joint
+    would sometimes normalise noise.
+
+    POSE-DEPENDENT, SO NEVER CACHED, unlike the yaw axis: J1 turns this
+    direction with it.
+
+    Args:
+        angles: the arm's current J1..J5 angles in radians.
+
+    Returns:
+        (x, y) unit vector, oriented outward from the yaw axis where that has
+        meaning. Sitting ON the axis it has none -- both ways increase the
+        distance -- so the sign there is arbitrary, which is harmless because
+        the probe measures the pixel response and its sign empirically.
+    """
+    if ctx.ik is None:
+        raise ValueError(
+            "the reach direction is measured from FK and needs the MATLAB "
+            "server; there is no sound way to infer it from the pose alone.")
+
+    _wrist, t0 = ctx.ik.request_fk_tip(list(angles))
+    tip0 = t0[:3, 3]
+
+    best, best_len = None, 0.0
+    for k in (3, 1, 2):                      # J4, J2, J3 by index
+        pert = list(angles)
+        pert[k] += np.deg2rad(2.0)
+        _wrist, t1 = ctx.ik.request_fk_tip(pert)
+        d = (t1[:3, 3] - tip0)[:2]
+        if np.linalg.norm(d) > best_len:
+            best, best_len = d, float(np.linalg.norm(d))
+
+    if best_len < 1e-5:                      # 0.01 mm per 2 deg: no plane at all
+        raise ServoAbort(
+            "The pitch chain moves the tool almost purely vertically from this "
+            "pose, so there is no horizontal reach direction to nudge along. "
+            "Unfold the arm (--recentre joint) or start from a different hover."
+        )
+
+    u = best / best_len
+    away = np.array(ctx.ik.base_yaw_axis_xy()) - tip0[:2]
+    if np.linalg.norm(away) > 0.020 and float(u @ away) > 0:
+        u = -u                                # point outward, not back at the base
+    return u
+
+
 def report_starting_error(ctx, centroid, frame):
     """Print where the brick sits relative to the aim point. Returns the aim px.
 
@@ -1085,9 +1146,17 @@ def descend(ctx, estimates):
             print(f"    brick {describe(ex, ey)} of the aim point. The arm is holding.")
             return False
 
+        # The reach offset must go along the direction the arm can ACTUALLY
+        # reach in, which is the pitch chain's own plane -- not the direction
+        # from the base yaw axis, which is 52 deg away from it at the hover and
+        # undefined when the tool sits on the axis. The descent's whole job is
+        # to reach out by the amount that cancels the swing the descent causes,
+        # so an offset the pitch chain cannot deliver is a correction IK has to
+        # buy with base yaw and wrist roll, moving the image it was meant to
+        # steady. See reach_axis_xy.
         try:
-            radial, _tangential = radial_tangential((tip[0], tip[1]), yaw_axis_xy(ctx))
-        except ValueError as e:
+            radial = reach_axis_xy(ctx, angles)
+        except (ValueError, ServoAbort) as e:
             print(f"\n  STOPPED: {e}")
             return False
         target_xyz = (tip[0] + radial[0] * dr_mm / 1000.0,

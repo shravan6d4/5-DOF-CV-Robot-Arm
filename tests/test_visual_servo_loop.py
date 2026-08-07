@@ -259,14 +259,22 @@ class FakeIK:
         self.solves = []
         self.locks = []
 
-    def _tip(self):
+    def _tip(self, angles=None):
         # Reach grows with both joints; a purely notional 1 mm per tick each.
-        reach = (self.bus.ticks[2] - 2900) * 0.001 + (self.bus.ticks[3] - 600) * 0.001
+        # CartesianBus makes an "angle" numerically equal to a tick, so the two
+        # entry points below share one formula.
+        t2, t3 = ((self.bus.ticks[2], self.bus.ticks[3]) if angles is None
+                  else (angles[1], angles[2]))
+        reach = (t2 - 2900) * 0.001 + (t3 - 600) * 0.001
         return np.array([0.150 + reach, 0.0, 0.080])
 
-    def request_fk_tip(self, _angles):
+    def request_fk_tip(self, angles=None):
+        # MUST honour `angles` rather than reading the bus: reach_axis_xy
+        # measures the arm's real reach direction by perturbing a joint and
+        # watching the tip, so an FK that ignores its argument reports a
+        # motionless arm and no direction at all.
         T = np.eye(4)
-        T[:3, 3] = self._tip()
+        T[:3, 3] = self._tip(angles)
         return T, T
 
     def base_yaw_axis_xy(self):
@@ -406,40 +414,88 @@ def test_a_solve_that_swings_the_base_is_refused_not_executed():
     assert bus.stepped == [], "nothing should have been commanded"
 
 
-def test_a_radial_nudge_reachable_only_through_a_held_joint_is_refused():
-    """The failure mode holding a joint introduces. If the solver's whole answer
-    was the joint we refuse to spend, dropping it leaves NO motion -- and
-    returning the requested amount for a move that never happened would have the
-    probe divide a pixel shift by zero travel and invent a gain from noise."""
-    class OnlyYawIK(FakeIK):
-        def request_ik(self, x, y, z, seed_rad=None, lock=None):
-            super().request_ik(x, y, z, seed_rad, lock)
-            return [self.bus.ticks[1] + 40, self.bus.ticks[2],
-                    self.bus.ticks[3], self.bus.ticks[4], self.bus.ticks[5]], 0.0
+def test_the_reach_direction_is_measured_not_inferred_from_the_yaw_axis():
+    """THE 2026-08-07 ROOT CAUSE. "Radial" meant the horizontal direction from
+    the base yaw axis out to the tool, which is the direction the arm reaches
+    only when the tool is well away from that axis. Reach comes from the PITCH
+    CHAIN -- J2/J3/J4 are parallel, so they move the tip in one fixed vertical
+    plane whose horizontal bearing J1 alone decides.
 
-    bus = CartesianBus()
-    world = FakeWorld(bus)
-    args = Namespace(settle=0.0, deadband=12.0, view=False, max_iterations=10)
-    ctx = vs.Context(bus, FakeCamera(world), FakeDetector(world), args, None,
-                     ik=OnlyYawIK(bus))
+    At the hover the tool sits 8.7 mm from the yaw axis, so "radial" was the
+    bearing of a near-zero vector: -137.8 deg measured, against the pitch
+    chain's real +94.4 deg. 52 deg apart. Every radial nudge asked for a
+    component the shoulder/elbow chain could not supply and IK made it up with
+    base yaw and wrist roll -- 44 ticks of yaw and 108 of roll for a 3 mm ask.
 
-    with pytest.raises(vs.ServoAbort, match="cannot act"):
-        vs.CartesianActuator("radial").apply(ctx, 10.0)
-    assert bus.stepped == [], "a no-op must not be commanded or reported as a move"
+    This fake makes the two disagree by 90 deg, which no amount of guarding the
+    symptom would have caught."""
+    class PlanarIK:
+        """Pitch chain reaches along +Y, while the tool sits 5 mm from the yaw
+        axis along -X -- so the yaw-axis radial points along X and is wrong."""
+
+        def base_yaw_axis_xy(self):
+            return np.array([0.100, 0.0])
+
+        def request_fk_tip(self, angles):
+            T = np.eye(4)
+            reach = angles[1] + angles[2] + angles[3]   # J2, J3, J4 only
+            T[:3, 3] = [0.095, reach, 0.080]
+            return T, T
+
+    ctx = Namespace(ik=PlanarIK())
+    u = vs.reach_axis_xy(ctx, [0.0] * 5)
+
+    assert abs(u[1]) == pytest.approx(1.0, abs=1e-6), "reach must follow the pitch chain"
+    assert u[0] == pytest.approx(0.0, abs=1e-6)
+
+    # What the old geometry would have said, for the contrast.
+    radial, _t = vs.radial_tangential((0.095, 0.0), (0.100, 0.0))
+    assert abs(radial[0]) == pytest.approx(1.0, abs=1e-6), "the yaw axis says X"
+    assert abs(float(np.dot(u, radial))) < 1e-6, "and it is 90 deg from the truth"
 
 
-def test_a_held_joint_is_not_commanded_even_when_the_solver_asks_for_it():
-    """The brace behind the server's `lock`, which had no effect whatsoever:
-    with lock=[5], [1] and [1,5] the returned solution was identical every time.
-    Whatever the solver says, a held joint keeps its current tick."""
+def test_the_reach_direction_survives_sitting_on_the_yaw_axis():
+    """radial_tangential RAISES directly over the base axis, because every
+    horizontal direction is equally radial there. The pitch chain still has one
+    definite direction, so the measurement keeps working where the geometry
+    cannot -- which matters because the hover pose is very nearly that case."""
+    class OnAxisIK:
+        def base_yaw_axis_xy(self):
+            return np.array([0.0, 0.0])
+
+        def request_fk_tip(self, angles):
+            T = np.eye(4)
+            T[:3, 3] = [0.0, angles[1] + angles[2] + angles[3], 0.080]
+            return T, T
+
+    with pytest.raises(ValueError):
+        vs.radial_tangential((0.0, 0.0), (0.0, 0.0))
+
+    u = vs.reach_axis_xy(Namespace(ik=OnAxisIK()), [0.0] * 5)
+    assert abs(u[1]) == pytest.approx(1.0, abs=1e-6)
+
+
+def test_an_ik_solution_is_commanded_whole_never_censored():
+    """THE REGRESSION GUARD FOR 2026-08-07. An earlier version enforced the
+    server's dead `lock` by not commanding the held joints -- keeping the rest of
+    the solution and dropping J1 and J5 from it.
+
+    An IK solution is a COORDINATED answer: the other joints are where they are
+    BECAUSE the deleted one was going to move. Measured on the arm, a 9 mm radial
+    nudge minus its held joints executed -0.11 mm, and a tangential one went 15 mm
+    the WRONG WAY. The centring loop then commanded 9 mm, moved 0.1 mm, saw no
+    pixel response and asked again with the same numbers twelve times running.
+
+    So every joint the solver named must be commanded exactly as named."""
     class GreedyIK(FakeIK):
         def request_ik(self, x, y, z, seed_rad=None, lock=None):
             super().request_ik(x, y, z, seed_rad, lock)
             # +20 not -20: CartesianBus refuses J2 below its travel limit, and
-            # this test is about the LOCK, not about the limit guard.
-            return [self.bus.ticks[1] + 30, self.bus.ticks[2] + 20,
+            # this test is about censoring, not about the limit guard. J1+8 and
+            # J5+30 sit inside the pan and roll budgets so the solve is accepted.
+            return [self.bus.ticks[1] + 8, self.bus.ticks[2] + 20,
                     self.bus.ticks[3], self.bus.ticks[4],
-                    self.bus.ticks[5] + 90], 0.0
+                    self.bus.ticks[5] + 30], 0.0
 
     bus = CartesianBus()
     world = FakeWorld(bus)
@@ -451,9 +507,36 @@ def test_a_held_joint_is_not_commanded_even_when_the_solver_asks_for_it():
     vs.CartesianActuator("radial").apply(ctx, 10.0)
 
     commanded = bus.stepped[-1]          # CartesianBus records the target dict
-    assert commanded[1] == before[1], "J1 was held and must not have been commanded"
-    assert commanded[5] == before[5], "J5 was held and must not have been commanded"
-    assert commanded[2] != before[2], "the free joints must still do the work"
+    assert commanded[1] == before[1] + 8, "J1 must be commanded as the solver said"
+    assert commanded[5] == before[5] + 30, "J5 must be commanded as the solver said"
+    assert commanded[2] == before[2] + 20
+
+
+def test_a_roll_heavy_solve_is_refused_not_censored():
+    """J5 is the wrist ROLL, so it spins the camera about its own optical axis
+    and rotates the image. It is NOT free motion to be deleted, though -- the
+    claw tip sits off the roll axis, so J5 genuinely translates it and a solve
+    can lean on the wrist to reach sideways. The only sound response to a
+    solution that leans too hard is to ask for less, and to refuse if that does
+    not help. Nothing is commanded on the way out."""
+    class RollingIK(FakeIK):
+        def request_ik(self, x, y, z, seed_rad=None, lock=None):
+            super().request_ik(x, y, z, seed_rad, lock)
+            # 90 ticks = 7.9 deg, over SERVO_VISUAL_MAX_ROLL_DEG. Fixed
+            # regardless of the request, so shrinking cannot rescue it.
+            return [self.bus.ticks[1], self.bus.ticks[2] + 20,
+                    self.bus.ticks[3], self.bus.ticks[4],
+                    self.bus.ticks[5] + 90], 0.0
+
+    bus = CartesianBus()
+    world = FakeWorld(bus)
+    args = Namespace(settle=0.0, deadband=12.0, view=False, max_iterations=10)
+    ctx = vs.Context(bus, FakeCamera(world), FakeDetector(world), args, None,
+                     ik=RollingIK(bus))
+
+    with pytest.raises(vs.ServoAbort, match="wrist roll"):
+        vs.CartesianActuator("radial").apply(ctx, 10.0)
+    assert bus.stepped == [], "a refused solve must not be partially commanded"
 
 
 def test_a_branch_flipping_solve_is_refused():
@@ -819,9 +902,15 @@ class DescentIK:
         self.solves = []
         self.locks = []
 
-    def request_fk_tip(self, _angles):
+    def request_fk_tip(self, angles=None):
+        # HONOURS `angles`, which reach_axis_xy depends on: it finds the arm's
+        # real reach direction by perturbing a joint and watching the tip, so an
+        # FK that ignores its argument describes an arm that cannot move.
+        # angles[k] is joint k+1's tick here (see request_ik): [1] is height in
+        # mm, [2] is reach in mm.
         T = np.eye(4)
-        T[:3, 3] = self.world.tip()
+        T[:3, 3] = (self.world.tip() if angles is None else
+                    np.array([angles[2] / 1000.0, 0.0, angles[1] / 1000.0]))
         return T, T
 
     def base_yaw_axis_xy(self):
