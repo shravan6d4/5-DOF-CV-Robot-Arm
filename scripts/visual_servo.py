@@ -133,7 +133,7 @@ from vision_pipeline.planning.visual_servo import (
     step_command,
     step_ticks,
 )
-from vision_pipeline.robot_interface import poses
+from vision_pipeline.robot_interface import gripper, poses
 from vision_pipeline.robot_interface.matlab_client import IKUnreachableError, MatlabIKClient
 from vision_pipeline.robot_interface.servo_calibration import dir_sign_report
 from vision_pipeline.robot_interface.servo_driver import ServoBus, ServoSafetyError
@@ -671,6 +671,81 @@ class CartesianActuator:
         return f"tip ({tip[0] * 1000:+.0f},{tip[1] * 1000:+.0f},{tip[2] * 1000:+.0f})"
 
 
+def offer_grasp(ctx):
+    """Offer to close the claw, now that the descent has put it in place.
+
+    THE ONE THING THE RUN EXISTED TO DO, and until now it stopped one step
+    short: a descent that ends with the claw at grasp height and nothing in the
+    jaws has done all the work and none of the point. The operator then had to
+    start a second script, by which time the brick has usually been nudged.
+
+    Still an explicit, separate act, and asked rather than assumed. The claw is
+    at grasp height because FK says so, and FK's ABSOLUTE height on this arm is
+    the number least worth trusting -- the operator can see whether the jaws are
+    actually around the brick, and this function's whole job is to ask them.
+
+    Every jog inside is approved separately too (robot_interface.gripper). That
+    is not belt-and-braces: the gripper is the only joint whose job is to STALL,
+    and where it stalls depends on where the brick really is, which is precisely
+    what the vision chain is still bad at.
+
+    Returns the GripResult, or None if nothing was attempted.
+    """
+    if getattr(ctx.args, "no_grasp", False):
+        print("\n  --grasp is off; the claw was not touched.")
+        return None
+
+    try:
+        current = ctx.bus.read_position(gripper.GRIPPER_JOINT)
+    except Exception as e:                                        # noqa: BLE001
+        print(f"\n  Could not read the gripper (J6): {e}")
+        print("  Close it by hand, or with: python scripts/close_claw.py")
+        return None
+
+    target = config.SERVO_GRIPPER_GRIP_TICKS
+    print(f"\n--- CLOSE THE CLAW? ---")
+    print(f"  J6 is at {current} ({gripper.describe(current)}); the grip position "
+          f"is {target}.")
+    if current <= target + gripper.STALL_TICKS:
+        print("  It is already at or past the grip position, so there is nothing")
+        print("  to close. Open it first: python scripts/close_claw.py --open")
+        return None
+    print(f"  {config.SERVO_GRIPPER_JOG_TICKS} ticks per jog, each one approved "
+          f"separately. It stops by itself")
+    print(f"  when the jaws meet the brick -- that is the wanted outcome, not a "
+          f"fault.")
+    print(f"  Saying no here leaves the arm exactly where it is; you can still run")
+    print(f"  scripts/close_claw.py afterwards.")
+
+    try:
+        if input("\n  Close the claw now? [y/N] ").strip().lower() not in ("y", "yes"):
+            print("  Not closing. The arm is holding at grasp height.")
+            return None
+    except (EOFError, KeyboardInterrupt):
+        print("\n  Not closing. The arm is holding at grasp height.")
+        return None
+
+    def approve(prompt):
+        try:
+            return input(prompt).strip().lower() in ("", "y", "yes")
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return False
+
+    print()
+    result = gripper.close_in_jogs(ctx.bus, target,
+                                   config.SERVO_GRIPPER_JOG_TICKS, approve, print)
+    print(f"\n  {result.message}")
+    if result.holding:
+        print("  Lift by hand or with goto_pose; releasing is "
+              "scripts/close_claw.py --open.")
+    elif result.outcome == gripper.REACHED:
+        print("  It met nothing on the way, so the jaws shut on air. The claw is")
+        print("  not where the brick is -- and the last-seen pixel error above")
+        print("  says in which direction.")
+    return result
+
+
 def wait_for_go(ctx):
     """Hold before touching anything, so the operator can position the arm.
 
@@ -1149,7 +1224,8 @@ def descend_blind(ctx, target_z, floor_z, last_seen, why):
         if tip[2] - target_z <= 0.001:
             print(f"\n  AT TARGET HEIGHT — tip z {tip[2] * 1000:+.1f} mm, reached "
                   f"blind.")
-            print("  Nothing has been grasped: closing the gripper is a separate act.")
+            print("  Nothing has been grasped yet -- closing the claw is still a")
+            print("  separate, asked-for act. The offer comes next.")
             return True
 
         next_z = max(tip[2] - ctx.args.descend_step / 1000.0, target_z, floor_z)
@@ -1316,7 +1392,8 @@ def descend(ctx, estimates):
         if tip[2] - target_z <= 0.001:
             print(f"\n  AT TARGET HEIGHT — tip z {tip[2] * 1000:+.1f} mm.")
             print("  The claw is over the brick at grasp height. Nothing has been")
-            print("  grasped: closing the gripper is still a separate act.")
+            print("  grasped yet -- closing the claw is still a separate, asked-for")
+            print("  act. The offer comes next.")
             return True
 
         centroid, frame = detect_centroid(ctx)
@@ -1642,6 +1719,12 @@ def main() -> None:
                          "starts from wherever the arm happens to be, which is "
                          "not reproducible and makes probe gains from different "
                          "runs incomparable.")
+    ap.add_argument("--no-grasp", action="store_true",
+                    help="do not offer to close the claw when the descent "
+                         "reaches grasp height. The offer is already opt-in "
+                         "(it asks, and every jog inside it asks again); this "
+                         "suppresses the question entirely, for runs that are "
+                         "measuring the descent rather than picking anything.")
     ap.add_argument("--no-sideways", action="store_true",
                     help="do not correct sideways error during the descent. The "
                          "descent's own IK solve handles height and reach; this "
@@ -1935,7 +2018,12 @@ def main() -> None:
                 estimates = [((a, act), probe_axis(ctx, a, act)) for a, act in axes]
                 centre(ctx, estimates)
                 if args.descend and confirm_descend(ctx):
-                    descend(ctx, estimates)
+                    # ONLY on a descent that reached grasp height. A run that
+                    # was refused by the floor guard, stalled, or was stopped by
+                    # the progress monitor has the claw somewhere nobody chose,
+                    # and offering to close there invites a grab at the table.
+                    if descend(ctx, estimates):
+                        offer_grasp(ctx)
             except (KeyboardInterrupt, ViewAborted) as e:
                 held = bus.freeze(IK_JOINTS)
                 how = "q in the live window" if isinstance(e, ViewAborted) else "Ctrl-C"

@@ -1724,3 +1724,47 @@ def test_an_older_server_without_the_field_is_not_treated_as_a_failure(caplog):
     with caplog.at_level(logging.WARNING):
         Wire().request_ik(0.1, 0.0, 0.1, seed_rad=[0.0] * 5, lock=[5])
     assert caplog.text == ""
+
+
+# --- the run ends by offering to close the claw ------------------------------
+#
+# A descent that reaches grasp height and stops has done all the work and none
+# of the point. Until 2026-08-07 the operator had to start a second script,
+# by which time the brick has usually been nudged.
+
+def test_the_grasp_is_offered_only_when_the_descent_SUCCEEDED():
+    """A descent refused by the floor guard, stalled, or stopped by the progress
+    monitor has left the claw somewhere nobody chose. Offering to close there
+    invites a grab at the table."""
+    src = _source_of(vs.main)
+    assert "if descend(ctx, estimates):" in src, (
+        "descend's return value must gate the offer -- calling it and then "
+        "offering unconditionally is the bug this pins")
+    guard = src.index("if descend(ctx, estimates):")
+    offer = src.index("offer_grasp(ctx)")
+    assert guard < offer
+
+
+def test_the_offer_is_asked_for_never_assumed():
+    """The claw is at grasp height because FK says so, and FK's ABSOLUTE height
+    on this arm is the number least worth trusting. The operator can see whether
+    the jaws are around the brick; this function's job is to ask them."""
+    src = _source_of(vs.offer_grasp)
+    assert "input(" in src
+    assert "no_grasp" in src, "there must be a way to suppress the question"
+
+
+def test_the_offer_targets_the_measured_grip_position_not_the_full_close():
+    src = _source_of(vs.offer_grasp)
+    assert "SERVO_GRIPPER_GRIP_TICKS" in src
+    assert "FULL_CLOSE" not in src, (
+        "closing to the full-close stop with a brick in the jaws stalls the "
+        "servo against it")
+
+
+def test_the_offer_and_close_claw_share_one_implementation():
+    """Two copies of a loop that decides when to stop pushing on a servo is one
+    copy too many."""
+    import close_claw
+    assert "gripper.close_in_jogs" in _source_of(close_claw.main)
+    assert "gripper.close_in_jogs" in _source_of(vs.offer_grasp)
