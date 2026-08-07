@@ -822,6 +822,16 @@ The flat path self-corrects because it re-measures pixel error every step. The r
 - The model may commit the target **deeper, never shallower**. A model that mid-descent says "further than you thought" is disagreeing with itself; keep the deeper commitment and let the log show the argument.
 - Unfitted ⇒ never consulted, so the raised path falls back to `drop_mm` exactly as before.
 
+##### The arm strikes two poses for it (2026-08-07)
+
+`two_view_survey` runs **after centring and before the descent** — the only window worth anything: the brick is centred and in view, the claw is still high enough that a sideways swing is free, and no height has been committed to. It captures, swings the base `SERVO_VISUAL_TWO_VIEW_BASELINE_MM` (24 mm) **tangentially**, captures again, and comes back. The in-descent pairs give the same measurement for free afterwards, but only in arrears.
+
+**The baseline must be tangential.** Parallax needs camera translation *across* the line of sight, and on this arm that is base yaw and nothing else — J2/J3/J4 are parallel pitches confined to one vertical plane, so they move the camera mostly *along* its own view, the direction triangulation learns least from. 24 mm at the working radius (~205 mm) is ~6.7°, clearing the 5° gate, and needing 6.7° of yaw against a tangential budget of 8° so it passes whole rather than being halved.
+
+**It always returns**, including on every failure path — a descent starting from a swung base is a descent whose probe gains describe a different posture, which is the 2026-08-05 runaway in miniature. If the return move fails, the run aborts rather than descending from a posture nobody chose.
+
+**This calls `PickPipeline.locate_brick_two_view` for real**, which was widened to accept a raw 4×4 as well as a `Pose`. That widening is not cosmetic: `Pose` is (xyz, roll/pitch/yaw), so passing one forces matrix → RPY → matrix, and `geometry.transform_to_pose` pins `roll = 0` near pitch = ±90° — exactly where a top-down tool sits. That destroys the camera's orientation about its own axis, which is precisely what a back-projected ray needs. Same gimbal-lock trap that poisoned the hand-eye solve. Every existing caller still passes a `Pose` and is unaffected.
+
 ##### Triangulation is the referee, not the answer
 
 The descent is already a stereo rig: a frame per step with the arm's pose for each. Adjacent 8 mm steps give only 2.3° of parallax at 200 mm — under the 5° gate — but **three steps apart is 24 mm and 6.8°**, which passes, hence `min_step_gap` rather than consecutive pairs. `triangulate_sightings` runs once after the arm has stopped, wrapped, and **never feeds control**: it needs FK @ hand-eye and `data/hand_eye.json` is known wrong.

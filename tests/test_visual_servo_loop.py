@@ -2322,3 +2322,105 @@ def test_an_unfitted_model_leaves_the_raised_path_as_it_was():
     vs.descend(ctx, estimates)
     assert ctx.journey.drop_mm == pytest.approx(config.SERVO_VISUAL_BLIND_DROP_MM,
                                                 abs=2.0)
+
+
+# --- the two-view survey: two struck poses, between centring and descent -----
+
+class SurveyIK(FakeIK):
+    """FakeIK that also answers request_fk_tip with a moving wrist."""
+
+
+def _survey_ctx(no_two_view=False):
+    bus = CartesianBus()
+    world = FakeWorld(bus)
+    args = Namespace(settle=0.0, deadband=12.0, view=False, max_iterations=10,
+                     no_two_view=no_two_view)
+    ctx = vs.Context(bus, FakeCamera(world), FakeDetector(world), args, None,
+                     ik=FakeIK(bus))
+    return ctx, bus
+
+
+def test_the_survey_strikes_two_poses_and_comes_back():
+    """It must return to the centred pose: a descent that starts from a swung
+    base is a descent whose probe gains describe a different posture, which is
+    the 2026-08-05 runaway in miniature."""
+    ctx, bus = _survey_ctx()
+    before = dict(bus.ticks)
+    vs.two_view_survey(ctx)
+
+    assert len(bus.stepped) >= 2, "the arm must actually move between views"
+    for j in (1, 2, 3, 4, 5):
+        assert abs(bus.ticks[j] - before[j]) <= 2, (
+            f"J{j} did not return to where centring left it")
+
+
+def test_the_survey_baseline_is_tangential():
+    """Parallax needs camera translation ACROSS the line of sight, and on this
+    arm that is base yaw and nothing else -- the pitch chain moves the camera
+    mostly ALONG its own view, which is what triangulation learns least from."""
+    src = _source_of(vs.two_view_survey)
+    assert 'CartesianActuator("tangential")' in src
+    assert "SERVO_VISUAL_TWO_VIEW_BASELINE_MM" in src
+
+
+def test_the_baseline_clears_the_parallax_gate_at_the_working_radius():
+    """24 mm at ~205 mm is 6.7 deg against a 5 deg gate, and needs 6.7 deg of
+    base yaw against a tangential budget of 8 -- so it passes whole rather than
+    being halved."""
+    import numpy as np
+    parallax = np.degrees(config.SERVO_VISUAL_TWO_VIEW_BASELINE_MM / 205.0)
+    assert parallax > config.TWO_VIEW_MIN_PARALLAX_DEG
+    assert parallax < config.SERVO_VISUAL_MAX_TANGENTIAL_PAN_DEG
+
+
+def test_the_survey_runs_between_centring_and_the_descent():
+    """The only window it is worth anything in: brick centred, claw still high,
+    no height committed to."""
+    src = _source_of(vs.main)
+    centred = src.index("centre(ctx, estimates)")
+    survey = src.index("two_view_survey(ctx)")
+    descend = src.index("if descend(ctx, estimates):")
+    assert centred < survey < descend
+
+
+def test_no_two_view_skips_it_without_moving_anything():
+    ctx, bus = _survey_ctx(no_two_view=True)
+    assert vs.two_view_survey(ctx) is None
+    assert bus.stepped == []
+
+
+def test_the_survey_never_becomes_the_descent_target():
+    """Triangulation needs FK @ hand-eye and hand_eye.json is known wrong by
+    52 mm. Using its z would trade a bad assumption for a bad calibration."""
+    src = _source_of(vs.descend)
+    assert "two_view" not in src, (
+        "the descent must not read the survey's answer -- it is a cross-check")
+
+
+def test_the_survey_answer_is_scored_against_the_grip():
+    src = _source_of(vs.record_journey)
+    assert "ctx.two_view" in src
+    assert "vs_grip_mm" in src
+
+
+def test_locate_brick_two_view_accepts_a_raw_matrix_as_well_as_a_pose():
+    """Callers with an FK matrix must be able to pass it. Routing through Pose
+    forces matrix -> RPY -> matrix, and transform_to_pose pins roll = 0 near
+    pitch = +-90 deg, which is exactly where a top-down tool sits."""
+    import numpy as np
+    import inspect
+    from vision_pipeline.pipeline import PickPipeline
+
+    src = inspect.getsource(PickPipeline.locate_brick_two_view)
+    assert 'hasattr(ee_pose, "to_matrix")' in src
+
+    captures = [(np.zeros((10, 10, 3), np.uint8), np.eye(4)),
+                (np.zeros((10, 10, 3), np.uint8), np.eye(4))]
+
+    class NoBricks:
+        def detect(self, frame):
+            return []
+
+    # No brick, so it returns None -- but it must reach that point without
+    # tripping over the matrix where it expected a Pose.
+    assert PickPipeline(detector=NoBricks()).locate_brick_two_view(captures) is None

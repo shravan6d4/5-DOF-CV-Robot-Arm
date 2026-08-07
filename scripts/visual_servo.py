@@ -302,6 +302,7 @@ class Context:
         # and an unfitted model is never consulted, so a fresh checkout behaves
         # exactly as it did before any of this existed.
         self.height_model = blind_travel.HeightModel()
+        self.two_view = None             # PickTarget from the survey, if any
 
     def slow_down(self, why):
         """Switch to the near-the-table pace. Idempotent; announces once."""
@@ -790,6 +791,111 @@ def ask_flat_on_board(ctx):
     return ctx.flat_on_board
 
 
+def two_view_survey(ctx):
+    """Strike two poses, triangulate the brick, report. MOVES THE ARM.
+
+    RUNS AFTER CENTRING AND BEFORE THE DESCENT, which is the only window where
+    it is worth anything: the brick is centred and in view, the claw is still
+    high enough that a sideways swing is free, and nothing has yet committed to
+    a height. During the descent the same measurement is available for free from
+    the step-to-step frames (blind_travel.triangulate_sightings), but only in
+    arrears -- this one happens while there is still a decision to inform.
+
+    THE BASELINE IS DELIBERATE AND TANGENTIAL. Triangulation is conditioned on
+    parallax, and parallax needs camera translation ACROSS the line of sight,
+    which on this arm is base yaw and nothing else -- J2/J3/J4 are parallel
+    pitches confined to one vertical plane, so they move the camera mostly along
+    its own view. At the working radius ~205 mm, config's 5 deg gate needs about
+    18 mm of baseline; SERVO_VISUAL_TWO_VIEW_BASELINE_MM is 24, which gives
+    ~6.7 deg with margin and still fits the tangential pan budget.
+
+    It goes out and comes back, so the descent starts from the pose centring
+    left, not from a swung one. If the return move fails the run stops rather
+    than descending from an unknown posture.
+
+    THE ANSWER IS RECORDED, NOT ACTED ON. Triangulation needs FK @ hand-eye and
+    data/hand_eye.json is known wrong by 52 mm and 91 deg, so using its z as a
+    descent target would be trading a bad assumption for a bad calibration. What
+    it is FOR is the cross-check: this z, logged beside where the claw actually
+    grips, is the held-out measurement the hand-eye solve has never had. Enough
+    of them and the transform gets promoted or refuted on evidence.
+
+    Returns the PickTarget triangulation produced, or None.
+    """
+    if getattr(ctx.args, "no_two_view", False):
+        print("\n  --no-two-view: skipping the triangulation survey.")
+        return None
+
+    from vision_pipeline.calibration.pixel_to_world import PixelToWorldCalibrator
+    from vision_pipeline.pipeline import PickPipeline
+
+    baseline_mm = config.SERVO_VISUAL_TWO_VIEW_BASELINE_MM
+    print(f"\n--- TWO-VIEW SURVEY ---")
+    print(f"  Two poses {baseline_mm:.0f} mm apart, tangentially, then back. "
+          f"The brick must")
+    print(f"  stay visible in BOTH -- triangulation needs the same point twice.")
+
+    actuator = CartesianActuator("tangential")
+    captures = []
+    moved = 0.0
+
+    def capture(label):
+        detection, frame = detect_brick(ctx)
+        if detection is None:
+            print(f"    {label}: NO BRICK. Cannot triangulate from one view.")
+            return False
+        _a, wrist, tip = fk_frames(ctx)
+        captures.append((frame, wrist))
+        print(f"    {label}: brick at {detection.centroid_px[0]:.0f},"
+              f"{detection.centroid_px[1]:.0f} px, tip z {tip[2] * 1000:+.1f} mm")
+        return True
+
+    try:
+        if not capture("view 1"):
+            return None
+        moved = actuator.apply(ctx, baseline_mm)
+        wait_watching(max(ctx.args.settle, 0.3), ctx, ["two-view: second pose"])
+        ok = capture("view 2")
+    except (ServoAbort, ServoSafetyError) as e:
+        print(f"    survey move refused: {e}")
+        ok = False
+    finally:
+        # ALWAYS GO BACK, including on the failure paths. A descent that starts
+        # from a swung base is a descent whose probe gains describe a different
+        # posture, which is the 2026-08-05 runaway in miniature.
+        if moved:
+            try:
+                actuator.apply(ctx, -moved)
+                wait_watching(max(ctx.args.settle, 0.3), ctx, ["two-view: back"])
+            except Exception as e:                                # noqa: BLE001
+                raise ServoAbort(
+                    f"the two-view survey could not return to the centred pose "
+                    f"({e}). Refusing to descend from a posture nobody chose.")
+
+    if not ok or len(captures) < 2:
+        print("    Survey incomplete; the descent is unaffected and continues.")
+        return None
+
+    target = PickPipeline(calibrator=PixelToWorldCalibrator()).locate_brick_two_view(
+        captures)
+    if target is None:
+        print(f"    Rays too weak to trust (gates: "
+              f"{config.TWO_VIEW_MIN_PARALLAX_DEG:.0f} deg parallax, "
+              f"{config.TWO_VIEW_MAX_RESIDUAL_M * 1000:.0f} mm residual).")
+        print("    Recorded as a failed survey; nothing downstream changes.")
+        return None
+
+    _a, tip = tip_position(ctx)
+    print(f"    TRIANGULATED brick at ({target.x * 1000:+.1f}, "
+          f"{target.y * 1000:+.1f}, {target.z * 1000:+.1f}) mm")
+    print(f"    -> {(tip[2] - target.z) * 1000:+.1f} mm below the claw; the table "
+          f"plane says {(tip[2] - (config.TABLE_Z_IN_BASE + config.PICK_Z_OFFSET)) * 1000:+.1f}")
+    print("    NOT used as the descent target: this needs FK @ hand-eye and")
+    print("    data/hand_eye.json is known wrong. It is logged against where the")
+    print("    claw actually grips, which is the check that can settle that.")
+    return target
+
+
 def record_sighting(ctx, step_n, detection, tip, target_z, floor_z):
     """Log this frame, and on the RAISED path let it move the target.
 
@@ -861,6 +967,24 @@ def record_journey(ctx, result):
 
     ctx.journey.finish(outcome, tip, contact, past,
                        note=result.message if result is not None else "")
+
+    # The SURVEY's answer, taken before the descent with a deliberate baseline,
+    # scored against the grip the same way the in-descent pairs are. This is the
+    # better-conditioned of the two: 24 mm of tangential travel chosen for the
+    # purpose, against 8 mm descent steps that happen to be there.
+    if ctx.two_view is not None:
+        entry = {"steps": ["survey", "survey"],
+                 "z_mm": float(ctx.two_view.z) * 1000.0,
+                 "parallax_deg": float("nan"),
+                 "residual_mm": float("nan"),
+                 "accepted": True}
+        if ctx.journey.grip_tip is not None:
+            entry["vs_grip_mm"] = entry["z_mm"] - ctx.journey.grip_tip[2] * 1000.0
+            print(f"\n  SURVEY vs GRIP: triangulation said "
+                  f"{entry['z_mm']:+.1f} mm, the claw gripped at "
+                  f"{ctx.journey.grip_tip[2] * 1000:+.1f} mm "
+                  f"({entry['vs_grip_mm']:+.1f} mm out)")
+        ctx.journey.triangulated.append(entry)
 
     # THE CROSS-CHECK, run once, after the arm has stopped, and never fed back
     # into anything. Triangulation needs FK @ hand-eye and data/hand_eye.json is
@@ -2181,6 +2305,12 @@ def main() -> None:
                          "starts from wherever the arm happens to be, which is "
                          "not reproducible and makes probe gains from different "
                          "runs incomparable.")
+    ap.add_argument("--no-two-view", action="store_true",
+                    help="skip the two-pose triangulation survey between "
+                         "centring and the descent. The survey swings the base "
+                         "24 mm and back and never changes the descent target; "
+                         "it exists to log a triangulated height against where "
+                         "the claw actually grips.")
     ap.add_argument("--flat", action="store_true",
                     help="the brick IS flat on the board; do not ask. The "
                          "descent then targets the table plane, which is what "
@@ -2484,6 +2614,12 @@ def main() -> None:
 
                 estimates = [((a, act), probe_axis(ctx, a, act)) for a, act in axes]
                 centre(ctx, estimates)
+                # BETWEEN CENTRING AND THE DESCENT, and only here: the brick is
+                # centred, the claw is high enough that a sideways swing costs
+                # nothing, and no height has been committed to. It goes out and
+                # comes back, so the descent still starts from the centred pose.
+                if args.descend:
+                    ctx.two_view = two_view_survey(ctx)
                 if args.descend and confirm_descend(ctx):
                     # ONLY on a descent that reached grasp height. A run that
                     # was refused by the floor guard, stalled, or was stopped by

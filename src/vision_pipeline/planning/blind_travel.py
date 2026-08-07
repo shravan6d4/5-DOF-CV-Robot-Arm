@@ -364,9 +364,24 @@ def fit_height_model(journeys, flat_on_board=None) -> HeightModel:
 # --- the cross-check ---------------------------------------------------------
 
 def triangulate_sightings(journey, calibrator, min_step_gap: int = 3,
-                          min_parallax_deg: float = 5.0,
-                          max_residual_m: float = 0.010) -> list:
+                          min_parallax_deg: float = None,
+                          max_residual_m: float = None) -> list:
     """Two-view depth from the descent's own frames. NEVER feeds control.
+
+    THE SAME ENGINE PickPipeline.locate_brick_two_view USES -- both end at
+    PixelToWorldCalibrator.triangulate_pixels -- and the same acceptance gates,
+    taken from config so the two cannot drift into disagreeing about what
+    "trustworthy" means. What this does NOT do is go through
+    locate_brick_two_view itself, for two reasons:
+
+      * it re-runs the DETECTOR on stored frames, and storing frames would put
+        megabytes of image into a JSON log. Detection already happened live.
+      * IT TAKES `Pose`, NOT A 4x4. Routing an FK matrix through Pose means
+        matrix -> RPY -> matrix, and geometry.transform_to_pose forces roll = 0
+        near pitch = +-90 deg -- which is exactly where a top-down tool sits.
+        That is the gimbal-lock bug that poisoned calibrate_hand_eye.py, and
+        corrupting the pose would corrupt the very thing being cross-checked.
+        triangulate_pixels takes the 4x4 directly.
 
     THE DESCENT IS ALREADY A STEREO RIG. It takes a frame at every step and
     knows the arm's pose for each, so a baseline is free -- but only between
@@ -388,6 +403,12 @@ def triangulate_sightings(journey, calibrator, min_step_gap: int = 3,
 
     Returns a list of dicts, JSON-safe, one per usable pair.
     """
+    from vision_pipeline import config
+    if min_parallax_deg is None:
+        min_parallax_deg = config.TWO_VIEW_MIN_PARALLAX_DEG
+    if max_residual_m is None:
+        max_residual_m = config.TWO_VIEW_MAX_RESIDUAL_M
+
     out = []
     sightings = list(journey.sightings)
     for i in range(len(sightings)):

@@ -129,7 +129,18 @@ class PickPipeline:
                 return None  # brick must be visible in EVERY view to triangulate
             brick = bricks[0]  # largest / most confident (detector-sorted)
             num_studs = max(num_studs, brick.num_studs)
-            views.append((brick.centroid_px, ee_pose.to_matrix()))
+            # ACCEPTS A RAW 4x4 AS WELL AS A Pose, and callers with a matrix
+            # should pass it. Pose is (xyz, roll/pitch/yaw), so handing one in
+            # forces matrix -> RPY -> matrix, and geometry.transform_to_pose
+            # pins roll = 0 near pitch = +-90 deg -- which is exactly where a
+            # top-down tool sits. That destroys the camera's orientation about
+            # its own axis, which is precisely what a back-projected ray needs;
+            # it is the same gimbal-lock trap that poisoned the hand-eye solve
+            # (see CLAUDE.md). Widened rather than replaced: every existing
+            # caller still passes a Pose and gets exactly what it got before.
+            views.append((brick.centroid_px,
+                          ee_pose.to_matrix() if hasattr(ee_pose, "to_matrix")
+                          else np.asarray(ee_pose, dtype=float)))
 
         result = self.calibrator.triangulate_pixels(views)
         if result is None:

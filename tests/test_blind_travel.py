@@ -344,3 +344,37 @@ def test_the_verdict_says_so_when_triangulation_agrees():
 
 def test_the_verdict_is_honest_about_having_nothing():
     assert "no accepted pairs" in bt.triangulation_verdict([])[0]
+
+
+def test_the_gates_come_from_config_not_from_hardcoded_twins():
+    """The cross-check and PickPipeline.locate_brick_two_view must not drift
+    into disagreeing about what 'trustworthy' means -- they end at the same
+    triangulate_pixels call and should accept the same pairs."""
+    from vision_pipeline import config
+
+    j = training_journey(sightings=synthetic(n=5))
+    just_under = bt.triangulate_sightings(
+        j, FakeCalibrator(parallax=config.TWO_VIEW_MIN_PARALLAX_DEG - 0.1),
+        min_step_gap=3)
+    just_over = bt.triangulate_sightings(
+        j, FakeCalibrator(parallax=config.TWO_VIEW_MIN_PARALLAX_DEG + 0.1),
+        min_step_gap=3)
+
+    assert not any(e["accepted"] for e in just_under)
+    assert all(e["accepted"] for e in just_over)
+
+    too_far = bt.triangulate_sightings(
+        j, FakeCalibrator(residual=config.TWO_VIEW_MAX_RESIDUAL_M * 2),
+        min_step_gap=3)
+    assert not any(e["accepted"] for e in too_far)
+
+
+def test_both_triangulation_paths_end_at_the_same_call():
+    """One engine, two callers. If this ever stops being true, the cross-check
+    is checking something other than what the pick would use."""
+    import inspect
+    from vision_pipeline import pipeline
+
+    assert "triangulate_pixels" in inspect.getsource(
+        pipeline.PickPipeline.locate_brick_two_view)
+    assert "triangulate_pixels" in inspect.getsource(bt.triangulate_sightings)

@@ -986,6 +986,28 @@ SERVO_VISUAL_BLIND_DROP_MM = 25.0
 # bounds the case where a single freak journey drags the median, since a blind
 # descent is by definition running with nothing reading the image.
 SERVO_VISUAL_BLIND_DROP_MAX_MM = 60.0
+#
+# --- the two-view survey: two struck poses between centring and descent ------
+#
+# The arm strikes two poses a fixed distance apart, with the brick in view from
+# both, and triangulates. It runs AFTER centring and BEFORE the descent, which
+# is the only window worth anything: the brick is centred, the claw is still
+# high enough that a sideways swing is free, and nothing has committed to a
+# height yet. The descent's step-to-step frames give the same measurement for
+# free afterwards, but only in arrears.
+#
+# THE BASELINE MUST BE TANGENTIAL. Parallax needs camera translation ACROSS the
+# line of sight, and on this arm that is base yaw and nothing else: J2/J3/J4 are
+# parallel pitches confined to one vertical plane, so they move the camera
+# mostly ALONG its own view, which is the direction triangulation learns least
+# from.
+#
+# 24 mm at the working radius (~205 mm) is ~6.7 deg of parallax against
+# TWO_VIEW_MIN_PARALLAX_DEG of 5, so it clears the gate with margin. It also has
+# to fit the tangential pan budget: 24 mm needs 6.7 deg of base yaw and
+# SERVO_VISUAL_MAX_TANGENTIAL_PAN_DEG is 8, so it passes whole rather than being
+# halved. Going much larger fails that budget before it fails anything else.
+SERVO_VISUAL_TWO_VIEW_BASELINE_MM = 24.0
 
 # Sideways companion to AIM_OFFSET_Y, and the same kind of quantity: the claw
 # does not sit under the pixel the camera calls centre, so the aim point is the
